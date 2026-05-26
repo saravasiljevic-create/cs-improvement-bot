@@ -1,10 +1,17 @@
 from jira import JIRA
 from config import JIRA_SERVER_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN
 
-jira_client = JIRA(
-    server=JIRA_SERVER_URL,
-    basic_auth=(JIRA_USER_EMAIL, JIRA_API_TOKEN),
-)
+_jira_client = None
+
+
+def _get_client():
+    global _jira_client
+    if _jira_client is None:
+        _jira_client = JIRA(
+            server=JIRA_SERVER_URL,
+            basic_auth=(JIRA_USER_EMAIL, JIRA_API_TOKEN),
+        )
+    return _jira_client
 
 
 def search_similar_tickets(query_text):
@@ -12,7 +19,7 @@ def search_similar_tickets(query_text):
     try:
         safe_query = query_text.replace('"', '\\"')
         jql = f'text ~ "{safe_query}" AND resolution = Unresolved ORDER BY created DESC'
-        issues = jira_client.search_issues(jql, maxResults=5)
+        issues = _get_client().search_issues(jql, maxResults=5)
 
         results = []
         for issue in issues:
@@ -51,7 +58,7 @@ def create_ticket(slack_user_id, original_text, summary=None):
             'issuetype': {'name': 'Task'},
         }
 
-        new_issue = jira_client.create_issue(fields=issue_dict)
+        new_issue = _get_client().create_issue(fields=issue_dict)
 
         return {
             'key': new_issue.key,
