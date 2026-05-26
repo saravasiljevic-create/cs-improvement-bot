@@ -6,7 +6,9 @@ SLACK_SIGNING_SECRET = os.environ.get('SLACK_SIGNING_SECRET')
 SLACK_APP_TOKEN = os.environ.get('SLACK_APP_TOKEN')
 SLACK_CHANNEL_ID = os.environ.get('SLACK_CHANNEL_ID')
 SLACK_CHANNEL_NAME = os.environ.get('SLACK_CHANNEL_NAME')
-JIRA_SERVER_URL = os.environ.get('JIRA_SERVER_URL')
+JIRA_SERVER_URL = os.environ.get('JIRA_SERVER_URL', '')
+if JIRA_SERVER_URL and not JIRA_SERVER_URL.startswith('http'):
+    JIRA_SERVER_URL = 'https://' + JIRA_SERVER_URL
 JIRA_USER_EMAIL = os.environ.get('JIRA_USER_EMAIL')
 JIRA_API_TOKEN = os.environ.get('JIRA_API_TOKEN')
 
