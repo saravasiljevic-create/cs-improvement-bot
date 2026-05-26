@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV SLACK_BOT_TOKEN=""
+ENV SLACK_SIGNING_SECRET=""
+ENV SLACK_APP_TOKEN=""
+ENV SLACK_CHANNEL_ID=""
+ENV SLACK_CHANNEL_NAME=""
+ENV JIRA_SERVER_URL=""
+ENV JIRA_USER_EMAIL=""
+ENV JIRA_API_TOKEN=""
+
+CMD ["python3", "bot.py"]
