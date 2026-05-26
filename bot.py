@@ -3,6 +3,25 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            pass
+
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+
+# Start health server FIRST so Cloud Run's port check passes immediately
+threading.Thread(target=_start_health_server, daemon=True).start()
+
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -25,101 +44,57 @@ logger = logging.getLogger(__name__)
 
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 
-# In-memory store: maps (channel, ts) -> original message text for button context
 _message_store: dict[tuple[str, str], str] = {}
 
 
 @app.event("message")
 def handle_message(event, say, client):
-    """Handle incoming messages in the monitored channel."""
-    # Ignore bot messages and messages outside the target channel
     if event.get('bot_id'):
         return
     if event.get('channel') != SLACK_CHANNEL_ID:
         return
-    # Ignore message_changed / message_deleted subtypes
     if event.get('subtype'):
         return
 
     user_info = extract_user_info(event)
     text = user_info['text']
-
     if not text:
         return
 
-    # Cache original text so the button handler can access it later
     key = (user_info['channel'], user_info['ts'])
     _message_store[key] = text
 
     try:
         similar_tickets = search_similar_tickets(text)
         blocks = format_search_results(similar_tickets, user_info)
-        say(
-            blocks=blocks,
-            text="Jira ticket search results",
-            thread_ts=user_info['ts'],
-        )
+        say(blocks=blocks, text="Jira ticket search results", thread_ts=user_info['ts'])
     except Exception as e:
         logger.exception("Error handling message")
-        say(
-            blocks=format_error(f"An error occurred while searching tickets: {str(e)}"),
-            text="Error",
-            thread_ts=user_info['ts'],
-        )
+        say(blocks=format_error(f"An error occurred while searching tickets: {str(e)}"),
+            text="Error", thread_ts=user_info['ts'])
 
 
 @app.action("create_ticket_button")
 def handle_create_ticket(ack, body, say):
-    """Handle 'Create Ticket' button clicks."""
     ack()
-
     slack_user_id = body['user']['id']
     message = body.get('message', {})
     channel = body.get('channel', {}).get('id', '')
     thread_ts = message.get('thread_ts') or message.get('ts', '')
-
-    # Recover original message text from the thread root
     original_text = _message_store.get((channel, thread_ts), '')
 
     try:
-        ticket = create_ticket(
-            slack_user_id=slack_user_id,
-            original_text=original_text,
-        )
-        say(
-            blocks=format_ticket_created(ticket),
-            text=f"Ticket {ticket['key']} created",
-            thread_ts=thread_ts,
-        )
-        # Clean up cached entry
+        ticket = create_ticket(slack_user_id=slack_user_id, original_text=original_text)
+        say(blocks=format_ticket_created(ticket), text=f"Ticket {ticket['key']} created",
+            thread_ts=thread_ts)
         _message_store.pop((channel, thread_ts), None)
     except Exception as e:
         logger.exception("Error creating ticket")
-        say(
-            blocks=format_error(f"Failed to create ticket: {str(e)}"),
-            text="Error creating ticket",
-            thread_ts=thread_ts,
-        )
-
-
-def _start_health_server():
-    port = int(os.environ.get("PORT", 8080))
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-
-        def log_message(self, format, *args):
-            pass  # suppress access logs
-
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
+        say(blocks=format_error(f"Failed to create ticket: {str(e)}"),
+            text="Error creating ticket", thread_ts=thread_ts)
 
 
 if __name__ == "__main__":
     logger.info("Starting CS Improvement Bot with Socket Mode...")
-    threading.Thread(target=_start_health_server, daemon=True).start()
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()
