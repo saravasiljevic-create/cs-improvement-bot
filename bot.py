@@ -1,4 +1,7 @@
 import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -99,7 +102,24 @@ def handle_create_ticket(ack, body, say):
         )
 
 
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            pass  # suppress access logs
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
+
+
 if __name__ == "__main__":
     logger.info("Starting CS Improvement Bot with Socket Mode...")
+    threading.Thread(target=_start_health_server, daemon=True).start()
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()
