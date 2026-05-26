@@ -43,3 +43,6 @@ steps:
 
 images:
   - 'gcr.io/cs-admin-bot-497509/cs-improvement-bot:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
