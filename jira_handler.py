@@ -14,32 +14,46 @@ def _get_client():
     return _jira_client
 
 
-def search_similar_tickets(query_text):
-    """Search for similar unresolved Jira tickets matching query_text."""
-    try:
-        safe_query = query_text.replace('"', '\\"')
-        jql = f'project = CS AND text ~ "{safe_query}" AND resolution = Unresolved ORDER BY created DESC'
-        issues = _get_client().search_issues(jql, maxResults=5)
+def search_similar_tickets(title: str, use_case: str = ''):
+    """Search for similar unresolved Jira tickets in the CS project."""
+    safe_title = title.replace('"', '\\"').replace('\\', '\\\\')
+    safe_uc = use_case.replace('"', '\\"').replace('\\', '\\\\')
 
-        results = []
-        for issue in issues:
-            results.append({
-                'key': issue.key,
-                'summary': issue.fields.summary,
-                'status': issue.fields.status.name,
-                'assignee': (
-                    issue.fields.assignee.displayName
-                    if issue.fields.assignee
-                    else 'Unassigned'
-                ),
-                'created': issue.fields.created,
-                'url': f'{JIRA_SERVER_URL}/browse/{issue.key}',
-            })
+    # Use summary ~ for title (reliable) and optionally description ~ for use case
+    if safe_uc:
+        jql = (
+            f'project = CS AND '
+            f'(summary ~ "{safe_title}" OR description ~ "{safe_title}" OR description ~ "{safe_uc[:50]}") '
+            f'AND resolution = Unresolved ORDER BY created DESC'
+        )
+    else:
+        jql = (
+            f'project = CS AND '
+            f'summary ~ "{safe_title}" '
+            f'AND resolution = Unresolved ORDER BY created DESC'
+        )
 
-        return results
-    except Exception as e:
-        print(f"Error searching tickets: {str(e)}")
-        return []
+    print(f"Jira JQL: {jql}")
+
+    issues = _get_client().search_issues(jql, maxResults=5)
+    print(f"Jira results: {len(issues)} tickets found")
+
+    results = []
+    for issue in issues:
+        results.append({
+            'key': issue.key,
+            'summary': issue.fields.summary,
+            'status': issue.fields.status.name,
+            'assignee': (
+                issue.fields.assignee.displayName
+                if issue.fields.assignee
+                else 'Unassigned'
+            ),
+            'created': issue.fields.created,
+            'url': f'{JIRA_SERVER_URL}/browse/{issue.key}',
+        })
+
+    return results
 
 
 def create_ticket(slack_user_id, original_text, summary=None):

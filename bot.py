@@ -226,30 +226,40 @@ def handle_message(event, say, client):
 def _process_request(say, channel, thread_ts, user_id, title, use_case):
     """Search Jira CS board and respond appropriately."""
     try:
-        similar = search_similar_tickets(f"{title} {use_case}")
-
-        if similar:
-            say(
-                blocks=found_ticket_blocks(similar),
-                text="Ähnliche Tickets gefunden",
-                thread_ts=thread_ts,
-            )
-        else:
-            # Create new ticket
-            ticket = create_ticket(
-                slack_user_id=user_id,
-                original_text=use_case,
-                summary=title,
-            )
-            say(
-                blocks=format_ticket_created(ticket),
-                text=f"Ticket {ticket['key']} erstellt",
-                thread_ts=thread_ts,
-            )
+        similar = search_similar_tickets(title=title, use_case=use_case)
     except Exception as e:
-        logger.exception("Error processing request")
+        logger.exception("Jira search failed")
         say(
-            blocks=format_error(f"Fehler: {str(e)}"),
+            blocks=format_error(f"Fehler bei der Jira-Suche: {str(e)}"),
+            text="Jira-Fehler",
+            thread_ts=thread_ts,
+        )
+        return
+
+    if similar:
+        say(
+            blocks=found_ticket_blocks(similar),
+            text="Ähnliche Tickets gefunden",
+            thread_ts=thread_ts,
+        )
+        return
+
+    # No similar tickets — create new one
+    try:
+        ticket = create_ticket(
+            slack_user_id=user_id,
+            original_text=use_case,
+            summary=title,
+        )
+        say(
+            blocks=format_ticket_created(ticket),
+            text=f"Ticket {ticket['key']} erstellt",
+            thread_ts=thread_ts,
+        )
+    except Exception as e:
+        logger.exception("Ticket creation failed")
+        say(
+            blocks=format_error(f"Fehler beim Erstellen des Tickets: {str(e)}"),
             text="Fehler",
             thread_ts=thread_ts,
         )
