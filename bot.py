@@ -1,32 +1,11 @@
 import logging
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-
-def _start_health_server():
-    port = int(os.environ.get("PORT", 8080))
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-
-        def log_message(self, format, *args):
-            pass
-
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
-
-# Start health server FIRST so Cloud Run's port check passes immediately
-threading.Thread(target=_start_health_server, daemon=True).start()
-
+from flask import Flask, request
 from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_bolt.adapter.flask import SlackRequestHandler
 
 from config import (
-    SLACK_APP_TOKEN,
     SLACK_BOT_TOKEN,
     SLACK_CHANNEL_ID,
     SLACK_SIGNING_SECRET,
@@ -43,15 +22,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
+flask_app = Flask(__name__)
+handler = SlackRequestHandler(app)
 
 _message_store: dict[tuple[str, str], str] = {}
 
 
 @app.event("message")
-def handle_message(event, say, client):
+def handle_message(event, say):
+    logger.info(f"Message received: channel={event.get('channel')}, subtype={event.get('subtype')}")
+
     if event.get('bot_id'):
         return
     if event.get('channel') != SLACK_CHANNEL_ID:
+        logger.info(f"Ignoring: channel {event.get('channel')} != {SLACK_CHANNEL_ID}")
         return
     if event.get('subtype'):
         return
@@ -70,7 +54,7 @@ def handle_message(event, say, client):
         say(blocks=blocks, text="Jira ticket search results", thread_ts=user_info['ts'])
     except Exception as e:
         logger.exception("Error handling message")
-        say(blocks=format_error(f"An error occurred while searching tickets: {str(e)}"),
+        say(blocks=format_error(f"An error occurred: {str(e)}"),
             text="Error", thread_ts=user_info['ts'])
 
 
@@ -94,7 +78,17 @@ def handle_create_ticket(ack, body, say):
             text="Error creating ticket", thread_ts=thread_ts)
 
 
+@flask_app.route("/slack/events", methods=["POST"])
+def slack_events():
+    return handler.handle(request)
+
+
+@flask_app.route("/health", methods=["GET"])
+def health():
+    return "OK", 200
+
+
 if __name__ == "__main__":
-    logger.info("Starting CS Improvement Bot with Socket Mode...")
-    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-    handler.start()
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"Starting CS Improvement Bot (HTTP mode) on port {port}...")
+    flask_app.run(host="0.0.0.0", port=port)
