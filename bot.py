@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 
 from flask import Flask, request
 from slack_bolt import App
@@ -11,12 +12,7 @@ from config import (
     SLACK_SIGNING_SECRET,
 )
 from jira_handler import create_ticket, search_similar_tickets
-from slack_utils import (
-    extract_user_info,
-    format_error,
-    format_search_results,
-    format_ticket_created,
-)
+from slack_utils import format_error, format_ticket_created
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,89 +21,250 @@ app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
 
-# Stores original message text: (channel, thread_ts) -> text
-_message_store: dict[tuple[str, str], str] = {}
-# Tracks threads where bot asked clarification question: (channel, thread_ts) -> True
-_waiting_for_detail: dict[tuple[str, str], bool] = {}
+# (channel, thread_ts) -> {'user_id': str, 'title': str|None, 'use_case': str|None}
+_pending: dict[tuple[str, str], dict] = {}
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def parse_request(text: str) -> tuple[str | None, str | None]:
+    """Extract title and use case from a message.
+
+    Supports explicit labels (Titel:, Use Case:, Beschreibung:, Problem:)
+    or falls back to first-line = title, rest = use case.
+    """
+    clean = re.sub(r'#improvement-request', '', text, flags=re.IGNORECASE).strip()
+    # Remove Slack user mentions for parsing
+    clean = re.sub(r'<@[A-Z0-9]+>', '', clean).strip()
+
+    title: str | None = None
+    use_case: str | None = None
+
+    title_match = re.search(
+        r'(?:titel|title)\s*[:\-]\s*(.+?)(?:\n|$)', clean, re.IGNORECASE
+    )
+    uc_match = re.search(
+        r'(?:use\s*case|beschreibung|problem|warum|grund|why|description)\s*[:\-]\s*(.+)',
+        clean, re.IGNORECASE | re.DOTALL
+    )
+
+    if title_match:
+        title = title_match.group(1).strip()
+    if uc_match:
+        use_case = uc_match.group(1).strip()
+
+    # Fallback: first non-empty line = title, rest = use case
+    if not title and not use_case:
+        lines = [l.strip() for l in clean.split('\n') if l.strip()]
+        if lines:
+            title = lines[0]
+        if len(lines) > 1:
+            use_case = '\n'.join(lines[1:]).strip()
+
+    return title or None, use_case or None
+
+
+def missing_info(title, use_case) -> list[str]:
+    missing = []
+    if not title:
+        missing.append('*Titel* (was soll sich verbessern?)')
+    if not use_case:
+        missing.append('*Use Case / Beschreibung* (warum ist das wichtig und wie wird es genutzt?)')
+    return missing
+
+
+def ask_for_info_blocks(user_id: str, missing: list[str]) -> list[dict]:
+    items = '\n'.join(f'• {m}' for m in missing)
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"Hey <@{user_id}> :wave: Danke für dein Improvement-Request!\n\n"
+                    f"Mir fehlen noch folgende Angaben:\n{items}\n\n"
+                    "Bitte ergänze diese Informationen hier im Thread."
+                ),
+            },
+        }
+    ]
+
+
+def found_ticket_blocks(tickets: list[dict]) -> list[dict]:
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": ":mag: Es gibt bereits ähnliche Ticket(s) im CS Admin Board:",
+            },
+        }
+    ]
+    for t in tickets:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*<{t['url']}|{t['key']}>*: {t['summary']}\n"
+                    f"Status: `{t['status']}` | Assignee: {t['assignee']}"
+                ),
+            },
+        })
+    blocks.append({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": (
+                ":point_up: Bitte schau dir die Tickets an.\n"
+                "Wenn dein Request bereits abgedeckt ist, kannst du das Ticket "
+                "*upvoten* — füge einfach einen :thumbsup: Reaktion hinzu "
+                "oder hinterlasse einen Kommentar mit deinem Use Case."
+            ),
+        },
+    })
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# Event handlers
+# ---------------------------------------------------------------------------
 
 @app.event("message")
-def handle_message(event, say):
-    logger.info(f"Message received: channel={event.get('channel')}, subtype={event.get('subtype')}, thread_ts={event.get('thread_ts')}")
-
+def handle_message(event, say, client):
     if event.get('bot_id'):
         return
     if event.get('channel') != SLACK_CHANNEL_ID:
-        logger.info(f"Ignoring: channel {event.get('channel')} != {SLACK_CHANNEL_ID}")
         return
     if event.get('subtype'):
         return
 
-    user_info = extract_user_info(event)
-    text = user_info['text']
-    if not text:
-        return
-
-    channel = user_info['channel']
-    ts = user_info['ts']
+    text = event.get('text', '') or ''
+    channel = event.get('channel')
+    ts = event.get('ts')
     thread_ts = event.get('thread_ts')
+    user_id = event.get('user')
 
-    # STEP 2: User replied in a thread where we asked for details
-    if thread_ts and _waiting_for_detail.get((channel, thread_ts)):
-        _waiting_for_detail.pop((channel, thread_ts), None)
-        _message_store[(channel, thread_ts)] = text
-        try:
-            similar_tickets = search_similar_tickets(text)
-            blocks = format_search_results(similar_tickets, user_info)
-            say(blocks=blocks, text="Jira ticket search results", thread_ts=thread_ts)
-        except Exception as e:
-            logger.exception("Error searching tickets")
-            say(blocks=format_error(f"Fehler bei der Suche: {str(e)}"),
-                text="Error", thread_ts=thread_ts)
+    logger.info(f"Message: channel={channel}, thread={thread_ts}, user={user_id}")
+
+    # -----------------------------------------------------------------------
+    # THREAD REPLY — bot is waiting for more info from this user
+    # -----------------------------------------------------------------------
+    if thread_ts:
+        state = _pending.get((channel, thread_ts))
+        if not state or state.get('user_id') != user_id:
+            return  # not our thread or wrong user
+
+        # Merge new text with what we already have
+        title, use_case = parse_request(text)
+        if not state.get('title') and title:
+            state['title'] = title
+        if not state.get('use_case') and use_case:
+            state['use_case'] = use_case
+
+        still_missing = missing_info(state.get('title'), state.get('use_case'))
+
+        if still_missing:
+            say(
+                blocks=ask_for_info_blocks(user_id, still_missing),
+                text="Bitte ergänze die fehlenden Infos",
+                thread_ts=thread_ts,
+            )
+            return
+
+        # All info available — search Jira
+        _pending.pop((channel, thread_ts), None)
+        _process_request(
+            say=say,
+            channel=channel,
+            thread_ts=thread_ts,
+            user_id=user_id,
+            title=state['title'],
+            use_case=state['use_case'],
+        )
         return
 
-    # STEP 1: New message (not in a thread) — ask for details first
-    if not thread_ts:
-        _waiting_for_detail[(channel, ts)] = True
+    # -----------------------------------------------------------------------
+    # NEW MESSAGE — only react to #improvement-request
+    # -----------------------------------------------------------------------
+    if '#improvement-request' not in text.lower():
+        return
+
+    title, use_case = parse_request(text)
+    still_missing = missing_info(title, use_case)
+
+    if still_missing:
+        # Ask for missing info and store pending state
+        _pending[(channel, ts)] = {
+            'user_id': user_id,
+            'title': title,
+            'use_case': use_case,
+        }
         say(
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": (
-                            f"Hey <@{user_info['user_id']}> :wave: Danke für deine Nachricht!\n\n"
-                            "Beschreib kurz deinen Verbesserungswunsch — "
-                            "*was soll sich verbessern und warum?*\n"
-                            "Je mehr Details, desto besser kann ich passende Tickets finden."
-                        ),
-                    },
-                }
-            ],
-            text="Bitte beschreib deinen Verbesserungswunsch",
+            blocks=ask_for_info_blocks(user_id, still_missing),
+            text="Fehlende Informationen",
             thread_ts=ts,
+        )
+        return
+
+    # All info present immediately
+    _process_request(
+        say=say,
+        channel=channel,
+        thread_ts=ts,
+        user_id=user_id,
+        title=title,
+        use_case=use_case,
+    )
+
+
+def _process_request(say, channel, thread_ts, user_id, title, use_case):
+    """Search Jira CS board and respond appropriately."""
+    try:
+        similar = search_similar_tickets(f"{title} {use_case}")
+
+        if similar:
+            say(
+                blocks=found_ticket_blocks(similar),
+                text="Ähnliche Tickets gefunden",
+                thread_ts=thread_ts,
+            )
+        else:
+            # Create new ticket
+            ticket = create_ticket(
+                slack_user_id=user_id,
+                original_text=use_case,
+                summary=title,
+            )
+            say(
+                blocks=format_ticket_created(ticket),
+                text=f"Ticket {ticket['key']} erstellt",
+                thread_ts=thread_ts,
+            )
+    except Exception as e:
+        logger.exception("Error processing request")
+        say(
+            blocks=format_error(f"Fehler: {str(e)}"),
+            text="Fehler",
+            thread_ts=thread_ts,
         )
 
 
 @app.action("create_ticket_button")
 def handle_create_ticket(ack, body, say):
     ack()
-    slack_user_id = body['user']['id']
-    message = body.get('message', {})
-    channel = body.get('channel', {}).get('id', '')
-    thread_ts = message.get('thread_ts') or message.get('ts', '')
-    original_text = _message_store.get((channel, thread_ts), '')
+    # kept for backwards compatibility — no longer used in new flow
+    say(
+        text="Bitte nutze den neuen Flow: Schreib #improvement-request mit Titel und Use Case.",
+        thread_ts=body.get('message', {}).get('ts'),
+    )
 
-    try:
-        ticket = create_ticket(slack_user_id=slack_user_id, original_text=original_text)
-        say(blocks=format_ticket_created(ticket), text=f"Ticket {ticket['key']} created",
-            thread_ts=thread_ts)
-        _message_store.pop((channel, thread_ts), None)
-    except Exception as e:
-        logger.exception("Error creating ticket")
-        say(blocks=format_error(f"Failed to create ticket: {str(e)}"),
-            text="Error creating ticket", thread_ts=thread_ts)
 
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
 
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
@@ -121,5 +278,5 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Starting CS Improvement Bot (HTTP mode) on port {port}...")
+    logger.info(f"Starting CS Improvement Bot on port {port}...")
     flask_app.run(host="0.0.0.0", port=port)

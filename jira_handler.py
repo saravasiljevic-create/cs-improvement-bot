@@ -18,7 +18,7 @@ def search_similar_tickets(query_text):
     """Search for similar unresolved Jira tickets matching query_text."""
     try:
         safe_query = query_text.replace('"', '\\"')
-        jql = f'text ~ "{safe_query}" AND resolution = Unresolved ORDER BY created DESC'
+        jql = f'project = CS AND text ~ "{safe_query}" AND resolution = Unresolved ORDER BY created DESC'
         issues = _get_client().search_issues(jql, maxResults=5)
 
         results = []
