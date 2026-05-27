@@ -25,12 +25,15 @@ app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
 
+# Stores original message text: (channel, thread_ts) -> text
 _message_store: dict[tuple[str, str], str] = {}
+# Tracks threads where bot asked clarification question: (channel, thread_ts) -> True
+_waiting_for_detail: dict[tuple[str, str], bool] = {}
 
 
 @app.event("message")
 def handle_message(event, say):
-    logger.info(f"Message received: channel={event.get('channel')}, subtype={event.get('subtype')}")
+    logger.info(f"Message received: channel={event.get('channel')}, subtype={event.get('subtype')}, thread_ts={event.get('thread_ts')}")
 
     if event.get('bot_id'):
         return
@@ -45,17 +48,45 @@ def handle_message(event, say):
     if not text:
         return
 
-    key = (user_info['channel'], user_info['ts'])
-    _message_store[key] = text
+    channel = user_info['channel']
+    ts = user_info['ts']
+    thread_ts = event.get('thread_ts')
 
-    try:
-        similar_tickets = search_similar_tickets(text)
-        blocks = format_search_results(similar_tickets, user_info)
-        say(blocks=blocks, text="Jira ticket search results", thread_ts=user_info['ts'])
-    except Exception as e:
-        logger.exception("Error handling message")
-        say(blocks=format_error(f"An error occurred: {str(e)}"),
-            text="Error", thread_ts=user_info['ts'])
+    # STEP 2: User replied in a thread where we asked for details
+    if thread_ts and _waiting_for_detail.get((channel, thread_ts)):
+        _waiting_for_detail.pop((channel, thread_ts), None)
+        _message_store[(channel, thread_ts)] = text
+        try:
+            similar_tickets = search_similar_tickets(text)
+            blocks = format_search_results(similar_tickets, user_info)
+            say(blocks=blocks, text="Jira ticket search results", thread_ts=thread_ts)
+        except Exception as e:
+            logger.exception("Error searching tickets")
+            say(blocks=format_error(f"Fehler bei der Suche: {str(e)}"),
+                text="Error", thread_ts=thread_ts)
+        return
+
+    # STEP 1: New message (not in a thread) — ask for details first
+    if not thread_ts:
+        _waiting_for_detail[(channel, ts)] = True
+        say(
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"Hey <@{user_info['user_id']}> :wave: Danke für deine Nachricht!\n\n"
+                            "Beschreib kurz deinen Verbesserungswunsch — "
+                            "*was soll sich verbessern und warum?*\n"
+                            "Je mehr Details, desto besser kann ich passende Tickets finden."
+                        ),
+                    },
+                }
+            ],
+            text="Bitte beschreib deinen Verbesserungswunsch",
+            thread_ts=ts,
+        )
 
 
 @app.action("create_ticket_button")
