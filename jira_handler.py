@@ -15,26 +15,33 @@ def _get_client():
 
 
 def search_similar_tickets(title: str, use_case: str = ''):
-    """Search for similar unresolved Jira tickets in the CS project."""
-    safe_title = title.replace('"', '\\"').replace('\\', '\\\\')
-    safe_uc = use_case.replace('"', '\\"').replace('\\', '\\\\')
+    """Search for similar unresolved Jira tickets in the CS project.
 
-    # Use summary ~ for title (reliable) and optionally description ~ for use case
-    if safe_uc:
-        jql = (
-            f'project = CS AND '
-            f'(summary ~ "{safe_title}" OR description ~ "{safe_title}" OR description ~ "{safe_uc[:50]}") '
-            f'AND resolution = Unresolved ORDER BY created DESC'
-        )
-    else:
-        jql = (
-            f'project = CS AND '
-            f'summary ~ "{safe_title}" '
-            f'AND resolution = Unresolved ORDER BY created DESC'
-        )
+    Searches by individual keywords from title and use_case to maximize recall.
+    """
+    import re
+
+    # Extract meaningful keywords (min 3 chars, skip stopwords)
+    stopwords = {'und', 'der', 'die', 'das', 'ist', 'in', 'an', 'auf', 'zu',
+                 'mit', 'für', 'von', 'den', 'dem', 'ein', 'eine', 'the',
+                 'and', 'for', 'with', 'from', 'that', 'this', 'are', 'not'}
+    words = re.findall(r'\b\w{3,}\b', f"{title} {use_case}".lower())
+    keywords = [w for w in words if w not in stopwords][:5]  # top 5 keywords
+
+    if not keywords:
+        return []
+
+    # Build OR conditions for each keyword
+    conditions = ' OR '.join(
+        f'summary ~ "{kw}" OR description ~ "{kw}"'
+        for kw in keywords
+    )
+    jql = (
+        f'project = CS AND ({conditions}) '
+        f'AND resolution = Unresolved ORDER BY created DESC'
+    )
 
     print(f"Jira JQL: {jql}")
-
     issues = _get_client().search_issues(jql, maxResults=5)
     print(f"Jira results: {len(issues)} tickets found")
 

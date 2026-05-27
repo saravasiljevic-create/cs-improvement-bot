@@ -244,13 +244,57 @@ def _process_request(say, channel, thread_ts, user_id, title, use_case):
         )
         return
 
-    # No similar tickets — create new one
+    # No similar tickets — ask user to confirm before creating
+    say(
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":mag: Ich habe keine ähnlichen Tickets im CS Admin Board gefunden.\n\n"
+                        f"*Titel:* {title}\n"
+                        f"*Use Case:* {use_case}\n\n"
+                        "Soll ich ein neues Jira-Ticket anlegen?"
+                    ),
+                },
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✅ Ja, Ticket erstellen"},
+                        "style": "primary",
+                        "action_id": "confirm_create_ticket",
+                        "value": f"{user_id}|||{title}|||{use_case}|||{thread_ts}",
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "❌ Nein, abbrechen"},
+                        "action_id": "cancel_create_ticket",
+                        "value": "cancel",
+                    },
+                ],
+            },
+        ],
+        text="Neues Ticket erstellen?",
+        thread_ts=thread_ts,
+    )
+
+
+@app.action("confirm_create_ticket")
+def handle_confirm_create(ack, body, say):
+    ack()
+    value = body['actions'][0]['value']
     try:
-        ticket = create_ticket(
-            slack_user_id=user_id,
-            original_text=use_case,
-            summary=title,
-        )
+        user_id, title, use_case, thread_ts = value.split('|||')
+    except ValueError:
+        say(text="Fehler beim Verarbeiten der Anfrage.", thread_ts=body.get('message', {}).get('thread_ts'))
+        return
+
+    try:
+        ticket = create_ticket(slack_user_id=user_id, original_text=use_case, summary=title)
         say(
             blocks=format_ticket_created(ticket),
             text=f"Ticket {ticket['key']} erstellt",
@@ -265,14 +309,16 @@ def _process_request(say, channel, thread_ts, user_id, title, use_case):
         )
 
 
+@app.action("cancel_create_ticket")
+def handle_cancel(ack, body, say):
+    ack()
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    say(text=":ok: Kein Problem — kein Ticket wurde erstellt.", thread_ts=thread_ts)
+
+
 @app.action("create_ticket_button")
 def handle_create_ticket(ack, body, say):
     ack()
-    # kept for backwards compatibility — no longer used in new flow
-    say(
-        text="Bitte nutze den neuen Flow: Schreib #improvement-request mit Titel und Use Case.",
-        thread_ts=body.get('message', {}).get('ts'),
-    )
 
 
 # ---------------------------------------------------------------------------
