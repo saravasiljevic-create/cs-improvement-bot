@@ -157,12 +157,15 @@ def handle_message(event, say, client):
         if not state or state.get('user_id') != user_id:
             return  # not our thread or wrong user
 
-        # Merge new text with what we already have
-        title, use_case = parse_request(text)
-        if not state.get('title') and title:
-            state['title'] = title
-        if not state.get('use_case') and use_case:
-            state['use_case'] = use_case
+        # Try to parse explicit labels first
+        title_parsed, uc_parsed = parse_request(text)
+
+        # Fill in what's still missing — treat full reply as the missing field
+        if not state.get('title'):
+            state['title'] = title_parsed or text.split('\n')[0].strip()
+        if not state.get('use_case'):
+            # If title was just set from first line and there's more text, use rest as use_case
+            state['use_case'] = uc_parsed or text.strip()
 
         still_missing = missing_info(state.get('title'), state.get('use_case'))
 
