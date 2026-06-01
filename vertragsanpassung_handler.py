@@ -3,7 +3,7 @@ Vertragsanpassungs-Flow: Intent-Erkennung, Parsing, Chargebee-Lookup (read-only)
 und Zusammenfassungs-Builder.
 
 Der Bot schreibt NICHTS in Chargebee — er erstellt nur eine strukturierte Zusammenfassung
-mit Link zur Subscription.
+mit Link zur Subscription und kontextuellen Hinweisen basierend auf dem IST-Zustand.
 """
 import logging
 import re
@@ -23,8 +23,8 @@ _STRONG = [
     r'vertrags\s*[äa]nderung',
     r'vertragswechsel',
     r'unterschriebene[snm]?\s+angebot',
-    r'angebot.{0,60}unterschrieben',   # "Angebot für Pro 25 unterschrieben"
-    r'unterschrieben.{0,60}angebot',   # auch umgekehrte Reihenfolge
+    r'angebot.{0,60}unterschrieben',
+    r'unterschrieben.{0,60}angebot',
     r'signed\s+(?:offer|contract|proposal)',
 ]
 
@@ -36,7 +36,6 @@ _MEDIUM = [
     r'(?:jährlich|monatlich|annual|monthly).{0,30}(?:wechsel|umstell|zahlung)',
     r'\bramp\b',
     r'abo[\s\-](?:wechsel|änder|anpass)',
-    # Interne Formulierungen aus dem CS-Admin-Alltag
     r'anpassung\s+(?:vornehmen|vorgenommen|gemacht|rückgängig|zurück)',
     r'rückgängig\s+machen',
     r'(?:monatlich|jährlich)\w*\s+(?:miete|gebühr|preis|beitrag)',
@@ -46,11 +45,7 @@ _MEDIUM = [
 
 
 def detect_vertragsanpassung(text: str) -> bool:
-    """Gibt True zurück wenn der Text mit hoher Konfidenz eine Vertragsanpassungs-Anfrage ist.
-
-    Schwellwert: Score >= 3 (ein starkes Keyword genügt, oder mehrere mittlere).
-    #improvement-Nachrichten werden explizit ausgeschlossen.
-    """
+    """Gibt True zurück wenn der Text mit hoher Konfidenz eine Vertragsanpassungs-Anfrage ist."""
     if '#improvement' in text.lower():
         return False
     t = text.lower()
@@ -106,7 +101,6 @@ def parse_vertragsanpassung(text: str) -> dict:
     """Extrahiert strukturierte Felder aus einer Vertragsanpassungs-Anfrage im Freitext."""
     result: dict = {}
 
-    # Kundenname — explizit gelabelter Wert hat Priorität
     m = _CUSTOMER_LABELED_RE.search(text)
     if m:
         result['customer_name'] = m.group(1).strip()
@@ -115,17 +109,14 @@ def parse_vertragsanpassung(text: str) -> dict:
         if m:
             result['customer_name'] = m.group(1).strip()
 
-    # Angebots-Link (erste URL im Text)
     urls = _URL_RE.findall(text)
     if urls:
         result['offer_link'] = urls[0]
 
-    # Effective Date (erstes Datum)
     m = _DATE_RE.search(text)
     if m:
         result['effective_date'] = (m.group(1) or m.group(2) or '').strip()
 
-    # Zahlweise
     m = _PAYMENT_RE.search(text)
     if m:
         raw = m.group(1).lower()
@@ -136,21 +127,18 @@ def parse_vertragsanpassung(text: str) -> dict:
         else:
             result['payment_type'] = 'quartalsweise'
 
-    # Plan-Name
     m = _PLAN_RE.search(text)
     if m:
         result['new_plan'] = m.group(0).strip()
 
-    # Berichtswesen-Tier mit Auto-Korrektur
     m = _BERICHTSWESEN_RE.search(text)
     if m:
         raw_tier = int(m.group(1))
         corrected = _TIER_CORRECTIONS.get(raw_tier, raw_tier)
         result['berichtswesen_tier'] = corrected if corrected in _VALID_TIERS else raw_tier
         if corrected != raw_tier and corrected in _VALID_TIERS:
-            result['berichtswesen_tier_original'] = raw_tier  # für Hinweis in Summary
+            result['berichtswesen_tier_original'] = raw_tier
 
-    # Add-Ons
     m = _ADDON_ADD_RE.search(text)
     if m:
         result['addons_add'] = m.group(1).strip()
@@ -158,7 +146,6 @@ def parse_vertragsanpassung(text: str) -> dict:
     if m:
         result['addons_remove'] = m.group(1).strip()
 
-    # Discount / Rabatt erwähnt
     if re.search(r'\bdiscount\b|\brabatt\b|\bnachlass\b|\bgutschrift\b', text, re.IGNORECASE):
         result['has_discount'] = True
 
@@ -166,7 +153,6 @@ def parse_vertragsanpassung(text: str) -> dict:
 
 
 def missing_va_fields(parsed: dict) -> list[str]:
-    """Gibt Liste der Labels fehlender Pflichtfelder zurück."""
     out = []
     if not parsed.get('customer_name'):
         out.append('*Kundenname* — welches Unternehmen?')
@@ -181,16 +167,127 @@ def missing_va_fields(parsed: dict) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Chargebee Lookup (read-only)
+# ---------------------------------------------------------------------------
+
+def _ts_to_date(ts: int | None) -> str:
+    if not ts:
+        return ''
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%d.%m.%Y')
+
+
+def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str) -> dict | None:
+    """Sucht die aktive Chargebee-Subscription und lädt relevante Details. Kein Schreibzugriff."""
+    base = f"https://{site}.chargebee.com/api/v2"
+    auth = (api_key, '')
+
+    try:
+        # Kundensuche
+        resp = requests.get(
+            f"{base}/customers",
+            params={'company[contains]': customer_name, 'limit': 5},
+            auth=auth, timeout=10,
+        )
+        customers = resp.json().get('list', []) if resp.ok else []
+
+        if not customers:
+            first_word = customer_name.split()[0] if customer_name else customer_name
+            resp = requests.get(
+                f"{base}/customers",
+                params={'first_name[contains]': first_word, 'limit': 5},
+                auth=auth, timeout=10,
+            )
+            customers = resp.json().get('list', []) if resp.ok else []
+
+        if not customers:
+            logger.info(f"Kein Chargebee-Kunde gefunden für '{customer_name}'")
+            return None
+
+        customer = customers[0]['customer']
+        customer_id = customer['id']
+        company = (
+            customer.get('company')
+            or f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
+        )
+
+        # Subscription laden
+        resp = requests.get(
+            f"{base}/subscriptions",
+            params={'customer_id': customer_id, 'limit': 10},
+            auth=auth, timeout=10,
+        )
+        subs = resp.json().get('list', []) if resp.ok else []
+
+        active = [s['subscription'] for s in subs if s['subscription'].get('status') == 'active']
+        sub = (active or [s['subscription'] for s in subs if 'subscription' in s])[0] if subs else None
+        if not sub:
+            return None
+
+        sub_id = sub['id']
+
+        # Add-Ons mit Details
+        addons_raw = sub.get('addons', [])
+        addons = [a.get('id', '') for a in addons_raw if a.get('id')]
+
+        # Billing-Zyklus lesbar machen
+        period = sub.get('billing_period', 1)
+        period_unit = sub.get('billing_period_unit', '')
+        if period_unit == 'month':
+            billing_cycle = f"monatlich" if period == 1 else f"alle {period} Monate"
+        elif period_unit == 'year':
+            billing_cycle = 'jährlich' if period == 1 else f"alle {period} Jahre"
+        else:
+            billing_cycle = period_unit or ''
+
+        # Gutscheine / Discounts
+        coupons = [c.get('coupon_id', '') for c in sub.get('coupons', []) if c.get('coupon_id')]
+        if not coupons and sub.get('coupon'):
+            coupons = [sub['coupon']]
+
+        return {
+            'subscription_id': sub_id,
+            'customer_id': customer_id,
+            'company': company,
+            'plan_id': sub.get('plan_id', ''),
+            'addons': addons,
+            'status': sub.get('status', ''),
+            'billing_cycle': billing_cycle,
+            'billing_period_unit': period_unit,
+            'next_billing_at': _ts_to_date(sub.get('next_billing_at')),
+            'current_term_end': _ts_to_date(sub.get('current_term_end')),
+            'trial_end': _ts_to_date(sub.get('trial_end')),
+            'coupons': coupons,
+            'url': f"https://{site}.chargebee.com/d/subscriptions/{sub_id}",
+        }
+
+    except Exception as e:
+        logger.warning(f"Chargebee-Lookup Fehler für '{customer_name}': {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# IST-Zustand formatieren (für Nachfrage-Nachricht)
+# ---------------------------------------------------------------------------
+
 def _format_found_fields(parsed: dict, subscription: dict | None = None) -> str:
-    """Formatiert die bereits erkannten Felder für die Slack-Nachricht."""
     lines = []
     if parsed.get('customer_name'):
         lines.append(f"• *Kunde:* {parsed['customer_name']}")
     if subscription:
-        lines.append(
-            f"• *Chargebee:* <{subscription['url']}|{subscription['subscription_id']}>"
-            f"  (`{subscription.get('plan_id') or '–'}`)"
-        )
+        cb_info = f"<{subscription['url']}|{subscription['subscription_id']}>"
+        if subscription.get('plan_id'):
+            cb_info += f"  (`{subscription['plan_id']}`"
+            if subscription.get('billing_cycle'):
+                cb_info += f", {subscription['billing_cycle']}"
+            cb_info += ")"
+        lines.append(f"• *Chargebee:* {cb_info}")
+        if subscription.get('addons'):
+            lines.append(f"• *Aktive Add-Ons:* {', '.join(subscription['addons'])}")
+        if subscription.get('coupons'):
+            lines.append(f"• *Aktiver Rabatt:* {', '.join(subscription['coupons'])}")
+        if subscription.get('next_billing_at'):
+            lines.append(f"• *Nächste Rechnung:* {subscription['next_billing_at']}")
     if parsed.get('new_plan'):
         lines.append(f"• *Neuer Plan:* {parsed['new_plan']}")
     if parsed.get('payment_type'):
@@ -227,82 +324,79 @@ def ask_for_va_info_blocks(
 
 
 # ---------------------------------------------------------------------------
-# Chargebee Lookup (read-only)
-# ---------------------------------------------------------------------------
-
-def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str) -> dict | None:
-    """Sucht die aktive Chargebee-Subscription eines Kunden anhand des Unternehmensnamens.
-
-    Gibt None zurück wenn nichts gefunden oder API-Fehler. Kein Schreibzugriff.
-    """
-    base = f"https://{site}.chargebee.com/api/v2"
-    auth = (api_key, '')
-
-    try:
-        # Suche nach Unternehmensname
-        resp = requests.get(
-            f"{base}/customers",
-            params={'company[contains]': customer_name, 'limit': 5},
-            auth=auth, timeout=10,
-        )
-        customers = resp.json().get('list', []) if resp.ok else []
-
-        # Fallback: Suche nach erstem Wort des Namens
-        if not customers:
-            first_word = customer_name.split()[0] if customer_name else customer_name
-            resp = requests.get(
-                f"{base}/customers",
-                params={'first_name[contains]': first_word, 'limit': 5},
-                auth=auth, timeout=10,
-            )
-            customers = resp.json().get('list', []) if resp.ok else []
-
-        if not customers:
-            logger.info(f"Kein Chargebee-Kunde gefunden für '{customer_name}'")
-            return None
-
-        customer = customers[0]['customer']
-        customer_id = customer['id']
-        company = (
-            customer.get('company')
-            or f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
-        )
-
-        # Subscriptions laden
-        resp = requests.get(
-            f"{base}/subscriptions",
-            params={'customer_id': customer_id, 'limit': 10},
-            auth=auth, timeout=10,
-        )
-        subs = resp.json().get('list', []) if resp.ok else []
-
-        # Bevorzuge aktive Subscription
-        active = [s['subscription'] for s in subs if s['subscription'].get('status') == 'active']
-        sub = (active or [s['subscription'] for s in subs if 'subscription' in s])[0] if subs else None
-        if not sub:
-            return None
-
-        sub_id = sub['id']
-        addons = [a.get('id', '') for a in sub.get('addons', [])]
-
-        return {
-            'subscription_id': sub_id,
-            'customer_id': customer_id,
-            'company': company,
-            'plan_id': sub.get('plan_id', ''),
-            'addons': addons,
-            'status': sub.get('status', ''),
-            'url': f"https://{site}.chargebee.com/d/subscriptions/{sub_id}",
-        }
-
-    except Exception as e:
-        logger.warning(f"Chargebee-Lookup Fehler für '{customer_name}': {e}")
-        return None
-
-
-# ---------------------------------------------------------------------------
 # Summary Builder
 # ---------------------------------------------------------------------------
+
+def _try_parse_date(date_str: str) -> datetime | None:
+    for fmt in ('%d.%m.%Y', '%d.%m.%y', '%d-%m-%Y', '%d/%m/%Y'):
+        try:
+            return datetime.strptime(date_str.replace(' ', '').split('(')[0], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _build_suggestions(parsed: dict, subscription: dict) -> list[str]:
+    """Generiert kontextuelle Hinweise basierend auf IST-Zustand vs. gewünschten Änderungen."""
+    hints = []
+
+    # Billing-Zyklus-Wechsel
+    current_unit = subscription.get('billing_period_unit', '')
+    requested = parsed.get('payment_type', '')
+    if current_unit and requested:
+        current_is_annual = current_unit == 'year'
+        requested_is_annual = requested == 'jährlich'
+        if current_is_annual and not requested_is_annual:
+            hints.append(
+                "💡 *Zyklus-Wechsel:* Aktuell jährlich → wechselt auf monatlich. "
+                "Bitte prüfe ob eine Prorata-Gutschrift für den Restbetrag nötig ist."
+            )
+        elif not current_is_annual and requested_is_annual:
+            hints.append(
+                "💡 *Zyklus-Wechsel:* Aktuell monatlich → wechselt auf jährlich. "
+                "Prorata-Abrechnung für den laufenden Monat möglich."
+            )
+
+    # Aktive Add-Ons die im Request nicht erwähnt werden
+    current_addons = set(subscription.get('addons', []))
+    mentioned_remove = parsed.get('addons_remove', '').lower()
+    mentioned_add = parsed.get('addons_add', '').lower()
+    if current_addons:
+        unmentioned = [
+            a for a in current_addons
+            if a.lower() not in mentioned_remove and a.lower() not in mentioned_add
+        ]
+        if unmentioned:
+            hints.append(
+                f"💡 *Aktive Add-Ons nicht erwähnt:* `{'`, `'.join(unmentioned)}` — "
+                "bitte prüfe ob sie nach der Anpassung weiter gelten sollen "
+                "_(laut SOP: alte Add-Ons explizit entfernen wenn nicht mehr gewünscht)_."
+            )
+
+    # Bestehender Rabatt
+    if subscription.get('coupons'):
+        coupon_list = ', '.join(subscription['coupons'])
+        hints.append(
+            f"💡 *Aktiver Rabatt gefunden:* `{coupon_list}` — "
+            "bitte klären ob er nach der Vertragsanpassung weiterhin gelten soll."
+        )
+
+    # Nächstes Billing-Datum
+    if subscription.get('next_billing_at') and parsed.get('effective_date'):
+        hints.append(
+            f"💡 *Nächste Rechnung:* {subscription['next_billing_at']} — "
+            "Änderungen vor diesem Datum können eine Prorata-Abrechnung auslösen."
+        )
+
+    # Trial läuft noch
+    if subscription.get('trial_end'):
+        hints.append(
+            f"💡 *Trial läuft bis:* {subscription['trial_end']} — "
+            "prüfe ob die Anpassung vor oder nach Trial-Ende greifen soll."
+        )
+
+    return hints
+
 
 def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: str) -> list[dict]:
     """Erstellt Slack Block Kit Blocks für die Vertragsanpassungs-Zusammenfassung."""
@@ -313,20 +407,30 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
     ist_lines = []
     if subscription:
         ist_lines.append(f"*Subscription:* <{subscription['url']}|{subscription['subscription_id']}>")
-        ist_lines.append(f"*Aktueller Plan:* `{subscription.get('plan_id') or '–'}`")
+        plan_info = f"`{subscription.get('plan_id') or '–'}`"
+        if subscription.get('billing_cycle'):
+            plan_info += f"  ·  {subscription['billing_cycle']}"
+        ist_lines.append(f"*Aktueller Plan:* {plan_info}")
         if subscription.get('addons'):
             ist_lines.append(f"*Aktive Add-Ons:* {', '.join(subscription['addons'])}")
+        if subscription.get('coupons'):
+            ist_lines.append(f"*Aktiver Rabatt:* {', '.join(subscription['coupons'])}")
+        if subscription.get('next_billing_at'):
+            ist_lines.append(f"*Nächste Rechnung:* {subscription['next_billing_at']}")
+        if subscription.get('current_term_end'):
+            ist_lines.append(f"*Vertragsende:* {subscription['current_term_end']}")
         ist_lines.append(f"*Status:* `{subscription.get('status', '–')}`")
     else:
         ist_lines.append(
-            "⚠️ Subscription nicht automatisch gefunden — "
-            "bitte in Chargebee manuell suchen."
+            "⚠️ Subscription nicht automatisch gefunden — bitte in Chargebee manuell suchen."
         )
 
     # SOLL-Zustand
     soll_lines = []
     if parsed.get('new_plan'):
-        soll_lines.append(f"• Neuer Plan: `{parsed['new_plan']}`")
+        old = subscription.get('plan_id', '') if subscription else ''
+        arrow = f" _(war: `{old}`)_" if old and old.lower() != parsed['new_plan'].lower() else ''
+        soll_lines.append(f"• Neuer Plan: `{parsed['new_plan']}`{arrow}")
     if parsed.get('payment_type'):
         soll_lines.append(f"• Zahlweise: {parsed['payment_type']}")
     if parsed.get('effective_date'):
@@ -340,37 +444,29 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
     if parsed.get('offer_link'):
         soll_lines.append(f"• Angebot: {parsed['offer_link']}")
 
-    # Hinweise / Warnungen
+    # Warnungen
     warnings = []
     if parsed.get('berichtswesen_tier_original') is not None:
         orig = parsed['berichtswesen_tier_original']
         corr = parsed['berichtswesen_tier']
         warnings.append(
-            f"⚠️ *Berichtswesen-Tier korrigiert:* `{orig}` → `{corr}` "
-            f"(gültige Werte: 1, 31, 251, 501)"
+            f"⚠️ *Berichtswesen-Tier korrigiert:* `{orig}` → `{corr}` (gültige Werte: 1, 31, 251, 501)"
         )
-
-    # Ramp-Hinweis falls Datum in der Zukunft
     if parsed.get('effective_date'):
-        for fmt in ('%d.%m.%Y', '%d.%m.%y', '%d-%m-%Y', '%d/%m/%Y'):
-            try:
-                dt = datetime.strptime(
-                    parsed['effective_date'].replace(' ', '').split('(')[0], fmt
-                )
-                if dt.date() > datetime.now(timezone.utc).date():
-                    warnings.append(
-                        f"⚠️ *Ramp nötig:* Vertragsbeginn ({parsed['effective_date']}) liegt in der Zukunft "
-                        "→ in Chargebee über Tab \"Ramps\" → \"Add Ramp\" anlegen"
-                    )
-                break
-            except ValueError:
-                continue
-
+        dt = _try_parse_date(parsed['effective_date'])
+        if dt and dt.date() > datetime.now(timezone.utc).date():
+            warnings.append(
+                f"⚠️ *Ramp nötig:* Vertragsbeginn ({parsed['effective_date']}) liegt in der Zukunft "
+                "→ in Chargebee über Tab \"Ramps\" → \"Add Ramp\" anlegen"
+            )
     if parsed.get('has_discount'):
         warnings.append(
             "⚠️ *Discount erkannt:* Manuell eintragen — erst Approval aus "
             "*#approval-discount-refunds* einholen. *Nie als Price Override!*"
         )
+
+    # Kontextuelle Hinweise aus Chargebee-Daten
+    suggestions = _build_suggestions(parsed, subscription) if subscription else []
 
     next_steps = (
         "1. Subscription in Chargebee öffnen (Link oben)\n"
@@ -395,9 +491,12 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
         },
     ]
     if warnings:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(warnings)}})
+    if suggestions:
+        blocks.append({"type": "divider"})
         blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": "\n".join(warnings)},
+            "text": {"type": "mrkdwn", "text": "*Hinweise aus dem IST-Zustand:*\n" + "\n".join(suggestions)},
         })
     blocks += [
         {"type": "divider"},
@@ -406,10 +505,7 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
             "type": "context",
             "elements": [{
                 "type": "mrkdwn",
-                "text": (
-                    f"Anfrage erkannt von {requester} · "
-                    "Automatische Zusammenfassung · Kein Chargebee-Schreibzugriff"
-                ),
+                "text": f"Anfrage erkannt von {requester} · Automatische Zusammenfassung · Kein Chargebee-Schreibzugriff",
             }],
         },
     ]
