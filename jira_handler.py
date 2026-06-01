@@ -1,5 +1,9 @@
+import io
+
+import requests as rq
 from jira import JIRA
-from config import JIRA_SERVER_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN
+
+from config import JIRA_API_TOKEN, JIRA_SERVER_URL, JIRA_USER_EMAIL
 
 _jira_client = None
 
@@ -21,17 +25,15 @@ def search_similar_tickets(title: str, use_case: str = ''):
     """
     import re
 
-    # Extract meaningful keywords (min 3 chars, skip stopwords)
     stopwords = {'und', 'der', 'die', 'das', 'ist', 'in', 'an', 'auf', 'zu',
                  'mit', 'für', 'von', 'den', 'dem', 'ein', 'eine', 'the',
                  'and', 'for', 'with', 'from', 'that', 'this', 'are', 'not'}
     words = re.findall(r'\b\w{3,}\b', f"{title} {use_case}".lower())
-    keywords = [w for w in words if w not in stopwords][:5]  # top 5 keywords
+    keywords = [w for w in words if w not in stopwords][:5]
 
     if not keywords:
         return []
 
-    # Build OR conditions for each keyword
     conditions = ' OR '.join(
         f'summary ~ "{kw}" OR description ~ "{kw}"'
         for kw in keywords
@@ -67,7 +69,6 @@ def add_vote(issue_key: str) -> dict:
     """Add the bot user's vote to a Jira issue and return basic issue info."""
     client = _get_client()
     url = f"{JIRA_SERVER_URL}/rest/api/2/issue/{issue_key}/votes"
-    # Use the underlying authenticated session from the jira library
     response = client._session.post(url)
     response.raise_for_status()
     issue = client.issue(issue_key, fields='summary')
@@ -78,25 +79,74 @@ def add_vote(issue_key: str) -> dict:
     }
 
 
-def create_ticket(summary: str, use_case: str, user_name: str, request_date: str, slack_link: str = ''):
+def _attach_images(issue_key: str, images: list, slack_token: str):
+    """Download images from Slack and attach them to the Jira issue.
+
+    Best-effort: failures are logged but do not raise.
+    """
+    client = _get_client()
+    for f in images:
+        name = f.get('name', 'attachment')
+        try:
+            url = f.get('url_private_download') or f.get('url_private')
+            if not url:
+                print(f"No download URL for {name}, skipping attachment")
+                continue
+
+            resp = rq.get(
+                url,
+                headers={"Authorization": f"Bearer {slack_token}"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+
+            content = io.BytesIO(resp.content)
+            client.add_attachment(issue=issue_key, attachment=content, filename=name)
+            print(f"Attached {name} to {issue_key}")
+        except Exception as e:
+            print(f"Failed to attach {name} to {issue_key}: {e}")
+
+
+def create_ticket(summary: str, use_case: str, user_name: str, request_date: str,
+                  slack_link: str = '', images: list = None, slack_token: str = ''):
     """Create a new Jira task ticket from a Slack improvement request."""
-    try:
-        slack_ref = f"\n*Slack-Post:* {slack_link}" if slack_link else ""
-        description = (
-            f"*Beschreibung:*\n{use_case}\n\n"
-            f"*Anfrage von:* {user_name}\n"
-            f"*Datum der Anfrage:* {request_date}{slack_ref}\n\n"
-            f"This ticket was created automatically via the CS Improvement Bot.\n"
-            f"*Autor:* {user_name}"
+    images = images or []
+
+    # Build optional image section for the description
+    if images:
+        image_lines = '\n'.join(
+            f"- [{f.get('name', 'Bild')}|{f.get('permalink', f.get('url_private', ''))}]"
+            for f in images
+            if f.get('permalink') or f.get('url_private')
         )
+        image_section = f"\n\n*Anhänge (Slack):*\n{image_lines}" if image_lines else ''
+    else:
+        image_section = ''
+
+    slack_ref = f"\n*Slack-Post:* {slack_link}" if slack_link else ""
+
+    description = (
+        f"*Beschreibung:*\n{use_case}\n\n"
+        f"*Anfrage von:* {user_name}\n"
+        f"*Datum der Anfrage:* {request_date}{slack_ref}"
+        f"{image_section}\n\n"
+        f"This ticket was created automatically via the CS Improvement Bot.\n"
+        f"*Autor:* {user_name}"
+    )
+
+    try:
         issue_dict = {
             'project': {'key': 'CS'},
             'summary': summary,
             'description': description,
             'issuetype': {'name': 'Task'},
         }
-
         new_issue = _get_client().create_issue(fields=issue_dict)
+        print(f"Created Jira ticket {new_issue.key}")
+
+        # Attach images as actual Jira attachments (best-effort)
+        if images and slack_token:
+            _attach_images(new_issue.key, images, slack_token)
 
         return {
             'key': new_issue.key,

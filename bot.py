@@ -23,7 +23,8 @@ app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
 
-# (channel, thread_ts) -> {'user_id', 'user_name', 'request_date', 'title', 'use_case', 'slack_link', 'created_at'}
+# (channel, thread_ts) -> {'user_id', 'user_name', 'request_date', 'title', 'use_case',
+#                          'slack_link', 'images', 'created_at'}
 _pending: dict[tuple[str, str], dict] = {}
 # (channel, thread_ts) -> ticket data stored after similar-ticket flow or no-match flow
 _ticket_data: dict[tuple[str, str], dict] = {}
@@ -74,6 +75,14 @@ def slack_message_link(channel: str, ts: str) -> str:
     return f"https://slack.com/archives/{channel}/p{ts.replace('.', '')}"
 
 
+def extract_images(files) -> list[dict]:
+    """Return only image-type file objects from a Slack files list."""
+    return [
+        f for f in (files or [])
+        if f.get('mimetype', '').startswith('image/')
+    ]
+
+
 def parse_request(text: str) -> tuple[str | None, str | None]:
     """Extract title and use case from a message.
 
@@ -120,13 +129,7 @@ def missing_info(title, use_case) -> list[str]:
 
 
 def validate_use_case(title: str | None, use_case: str | None) -> str | None:
-    """Return an error message if the use case lacks substance, None if it's OK.
-
-    Checks:
-    - Minimum word count (< 4 words → too short)
-    - Minimum character length (< 20 chars → too short)
-    - Not identical to the title (copy-paste)
-    """
+    """Return an error message if the use case lacks substance, None if OK."""
     if not use_case:
         return None  # handled separately by missing_info
 
@@ -210,41 +213,6 @@ def found_ticket_blocks(tickets: list[dict], channel: str, thread_ts: str) -> li
     return blocks
 
 
-def confirm_create_blocks(title: str, use_case: str) -> list[dict]:
-    return [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f":mag: Ich habe keine ähnlichen Tickets im CS Admin Board gefunden.\n\n"
-                    f"*Titel:* {title}\n"
-                    f"*Use Case:* {use_case}\n\n"
-                    "Soll ich ein neues Jira-Ticket anlegen?"
-                ),
-            },
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "✅ Ja, Ticket erstellen"},
-                    "style": "primary",
-                    "action_id": "confirm_create_ticket",
-                    "value": "PLACEHOLDER",  # filled in before sending
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "❌ Nein, abbrechen"},
-                    "action_id": "cancel_create_ticket",
-                    "value": "cancel",
-                },
-            ],
-        },
-    ]
-
-
 # ---------------------------------------------------------------------------
 # Reaction helpers
 # ---------------------------------------------------------------------------
@@ -297,6 +265,11 @@ def _cleanup_expired_pending(client):
 def _show_confirm_create(say, channel: str, thread_ts: str, data: dict):
     """Show the ✅/❌ confirmation buttons, storing data for the action handler."""
     _ticket_data[(channel, thread_ts)] = data
+    image_note = ''
+    images = data.get('images') or []
+    if images:
+        names = ', '.join(f.get('name', 'Bild') for f in images)
+        image_note = f"\n\n:frame_with_picture: Anhänge: {names}"
     blocks = [
         {
             "type": "section",
@@ -306,6 +279,7 @@ def _show_confirm_create(say, channel: str, thread_ts: str, data: dict):
                     f":pencil: Kein passendes Ticket gefunden — soll ich ein neues anlegen?\n\n"
                     f"*Titel:* {data['title']}\n"
                     f"*Use Case:* {data['use_case']}"
+                    f"{image_note}"
                 ),
             },
         },
@@ -331,8 +305,10 @@ def _show_confirm_create(say, channel: str, thread_ts: str, data: dict):
     say(blocks=blocks, text="Neues Ticket erstellen?", thread_ts=thread_ts)
 
 
-def _process_request(say, client, channel, thread_ts, user_id, user_name, request_date, title, use_case):
+def _process_request(say, client, channel, thread_ts, user_id, user_name, request_date,
+                     title, use_case, images=None):
     """Search Jira CS board and respond appropriately."""
+    images = images or []
     slack_link = slack_message_link(channel, thread_ts)
 
     try:
@@ -346,16 +322,18 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
         )
         return
 
+    ctx_data = {
+        'user_id': user_id,
+        'user_name': user_name,
+        'request_date': request_date,
+        'title': title,
+        'use_case': use_case,
+        'slack_link': slack_link,
+        'images': images,
+    }
+
     if similar:
         # Store context in BOTH dicts so rejection handler finds it even after restart
-        ctx_data = {
-            'user_id': user_id,
-            'user_name': user_name,
-            'request_date': request_date,
-            'title': title,
-            'use_case': use_case,
-            'slack_link': slack_link,
-        }
         _similar_shown[(channel, thread_ts)] = ctx_data
         _ticket_data[(channel, thread_ts)] = ctx_data  # backup for rejection flow
         say(
@@ -366,14 +344,7 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
         return
 
     # No similar tickets — ask user to confirm before creating
-    _show_confirm_create(say, channel, thread_ts, {
-        'user_id': user_id,
-        'user_name': user_name,
-        'request_date': request_date,
-        'title': title,
-        'use_case': use_case,
-        'slack_link': slack_link,
-    })
+    _show_confirm_create(say, channel, thread_ts, ctx_data)
 
 
 # ---------------------------------------------------------------------------
@@ -425,10 +396,9 @@ def handle_message(event, say, client):
                 )
                 return
 
-            # Validate use case quality
             uc_error = validate_use_case(state.get('title'), state.get('use_case'))
             if uc_error:
-                state['use_case'] = None  # reset so user re-provides it
+                state['use_case'] = None
                 say(text=uc_error, thread_ts=thread_ts)
                 return
 
@@ -443,6 +413,7 @@ def handle_message(event, say, client):
                 request_date=state.get('request_date', request_date),
                 title=state['title'],
                 use_case=state['use_case'],
+                images=state.get('images', []),
             )
             return
 
@@ -470,37 +441,36 @@ def handle_message(event, say, client):
                 )
             return
 
-        # --- User rejects similar tickets → offer to create new ticket ---
+        # --- User rejects similar tickets via text → offer to create new ticket ---
         rejection_match = REJECTION_RE.search(text)
         logger.info(
             f"Thread reply: rejection_match={bool(rejection_match)}, "
-            f"similar_shown={( channel, thread_ts) in _similar_shown}, "
+            f"similar_shown={(channel, thread_ts) in _similar_shown}, "
             f"ticket_data={(channel, thread_ts) in _ticket_data}, "
             f"text={text!r}"
         )
         if rejection_match:
-            # Check in-memory caches first (fast path, works without API call)
             ctx = _similar_shown.pop((channel, thread_ts), None)
             if not ctx:
-                ctx = _ticket_data.pop((channel, thread_ts), None)
+                ctx = _ticket_data.get((channel, thread_ts))
 
             if not ctx:
-                # Both caches empty (e.g. after restart) — try to reconstruct from Slack thread
-                logger.warning(f"Rejection in {channel}/{thread_ts} but no context in memory — fetching thread root")
+                logger.warning(f"Rejection in {channel}/{thread_ts} — no context, fetching thread root")
                 try:
                     result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
                     messages = result.get('messages', [])
                     root_msg = messages[0] if messages else {}
                     root_text = root_msg.get('text', '')
                     root_user = root_msg.get('user', user_id)
-                    logger.info(f"Thread root fetched: user={root_user}, text={root_text[:80]!r}")
+                    root_images = extract_images(root_msg.get('files'))
+                    logger.info(f"Thread root: user={root_user}, text={root_text[:60]!r}")
                 except Exception as e:
                     logger.warning(f"conversations_replies failed: {e}")
                     root_text = ''
                     root_user = user_id
+                    root_images = []
 
                 if '#improvement' not in root_text.lower():
-                    logger.info("Thread root has no #improvement — ignoring rejection")
                     return
 
                 title, use_case = parse_request(root_text)
@@ -523,6 +493,7 @@ def handle_message(event, say, client):
                     'title': title,
                     'use_case': use_case,
                     'slack_link': slack_message_link(channel, thread_ts),
+                    'images': root_images,
                 }
 
             _show_confirm_create(say, channel, thread_ts, ctx)
@@ -533,10 +504,13 @@ def handle_message(event, say, client):
             try:
                 result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
                 messages = result.get('messages', [])
-                original_text = messages[0].get('text', '') if messages else ''
+                root_msg = messages[0] if messages else {}
+                original_text = root_msg.get('text', '')
+                original_images = extract_images(root_msg.get('files'))
             except Exception:
                 logger.exception("Could not fetch original thread message")
                 original_text = ''
+                original_images = []
 
             original_request_date = ts_to_date(thread_ts)
             title, use_case = parse_request(original_text or text)
@@ -551,6 +525,7 @@ def handle_message(event, say, client):
                     'request_date': original_request_date,
                     'title': title,
                     'use_case': use_case,
+                    'images': original_images,
                     'created_at': time.time(),
                 }
                 say(
@@ -568,6 +543,7 @@ def handle_message(event, say, client):
                     'request_date': original_request_date,
                     'title': title,
                     'use_case': None,
+                    'images': original_images,
                     'created_at': time.time(),
                 }
                 say(text=uc_error, thread_ts=thread_ts)
@@ -583,6 +559,7 @@ def handle_message(event, say, client):
                 request_date=original_request_date,
                 title=title,
                 use_case=use_case,
+                images=original_images,
             )
         return
 
@@ -592,6 +569,7 @@ def handle_message(event, say, client):
     if '#improvement' not in text.lower():
         return
 
+    images = extract_images(event.get('files'))
     title, use_case = parse_request(text)
     still_missing = missing_info(title, use_case)
 
@@ -604,6 +582,7 @@ def handle_message(event, say, client):
             'request_date': request_date,
             'title': title,
             'use_case': use_case,
+            'images': images,
             'created_at': time.time(),
         }
         say(
@@ -613,7 +592,6 @@ def handle_message(event, say, client):
         )
         return
 
-    # Validate use case quality
     uc_error = validate_use_case(title, use_case)
     if uc_error:
         _pending[(channel, ts)] = {
@@ -622,6 +600,7 @@ def handle_message(event, say, client):
             'request_date': request_date,
             'title': title,
             'use_case': None,
+            'images': images,
             'created_at': time.time(),
         }
         say(text=uc_error, thread_ts=ts)
@@ -637,6 +616,7 @@ def handle_message(event, say, client):
         request_date=request_date,
         title=title,
         use_case=use_case,
+        images=images,
     )
 
 
@@ -651,22 +631,22 @@ def handle_reject_similar(ack, body, say, client):
         say(text="Fehler beim Verarbeiten der Anfrage.", thread_ts=body.get('message', {}).get('thread_ts'))
         return
 
-    # Try in-memory caches first
     ctx = _similar_shown.pop((channel, thread_ts), None) or _ticket_data.get((channel, thread_ts))
 
     if not ctx:
-        # Reconstruct from thread root via Slack API
-        logger.info(f"reject_similar: no in-memory context for {channel}/{thread_ts} — fetching thread root")
+        logger.info(f"reject_similar button: no in-memory context for {channel}/{thread_ts} — fetching thread root")
         try:
             result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
             messages = result.get('messages', [])
             root_msg = messages[0] if messages else {}
             root_text = root_msg.get('text', '')
             root_user = root_msg.get('user', '')
+            root_images = extract_images(root_msg.get('files'))
         except Exception as e:
             logger.warning(f"conversations_replies failed in reject_similar: {e}")
             root_text = ''
             root_user = ''
+            root_images = []
 
         title, use_case = parse_request(root_text) if root_text else (None, None)
 
@@ -688,6 +668,7 @@ def handle_reject_similar(ack, body, say, client):
             'title': title,
             'use_case': use_case,
             'slack_link': slack_message_link(channel, thread_ts),
+            'images': root_images,
         }
 
     _show_confirm_create(say, channel, thread_ts, ctx)
@@ -715,6 +696,8 @@ def handle_confirm_create(ack, body, say, client):
             user_name=data['user_name'],
             request_date=data['request_date'],
             slack_link=data.get('slack_link', ''),
+            images=data.get('images', []),
+            slack_token=SLACK_BOT_TOKEN,
         )
         say(
             blocks=format_ticket_created(ticket),
