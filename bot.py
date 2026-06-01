@@ -9,13 +9,25 @@ from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 
 from config import (
+    CHARGEBEE_API_KEY,
+    CHARGEBEE_SITE,
+    CS_ADMIN_USER_IDS,
     SLACK_BOT_TOKEN,
     SLACK_CHANNEL_ID,
     SLACK_SIGNING_SECRET,
+    VERTRAGSANPASSUNG_CHANNEL_ID,
 )
 from jira_handler import add_vote, create_ticket, search_similar_tickets
 from optimizer import optimize_ticket
 from slack_utils import format_error, format_ticket_created
+from vertragsanpassung_handler import (
+    ask_for_va_info_blocks,
+    build_va_summary_blocks,
+    detect_vertragsanpassung,
+    lookup_chargebee_subscription,
+    missing_va_fields,
+    parse_vertragsanpassung,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,6 +42,10 @@ _pending: dict[tuple[str, str], dict] = {}
 # (channel, thread_ts) -> context stored when similar tickets were shown (for rejection flow)
 _ticket_data: dict[tuple[str, str], dict] = {}
 _similar_shown: dict[tuple[str, str], dict] = {}
+
+# Vertragsanpassungs-Flow state
+# (channel, thread_ts) -> {'parsed': dict, 'user_id', 'user_name', 'created_at'}
+_pending_vertragsanpassung: dict[tuple[str, str], dict] = {}
 
 JIRA_KEY_RE = re.compile(r'\b([A-Z]+-\d+)\b')
 PENDING_TTL = 72 * 3600  # 72 hours in seconds
@@ -333,6 +349,24 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
 
 
 # ---------------------------------------------------------------------------
+# Vertragsanpassungs-Flow helpers
+# ---------------------------------------------------------------------------
+
+def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
+                                user_name: str, parsed: dict):
+    """Chargebee-Lookup (read-only) + Zusammenfassung in Slack posten."""
+    subscription = None
+    if parsed.get('customer_name') and CHARGEBEE_API_KEY:
+        subscription = lookup_chargebee_subscription(
+            parsed['customer_name'], CHARGEBEE_API_KEY, CHARGEBEE_SITE
+        )
+    blocks = build_va_summary_blocks(parsed, subscription, user_name)
+    say(blocks=blocks, text="📋 Vertragsanpassung — Zusammenfassung", thread_ts=thread_ts)
+    _set_done(client, channel, thread_ts)
+    _pending_vertragsanpassung.pop((channel, thread_ts), None)
+
+
+# ---------------------------------------------------------------------------
 # Event handlers
 # ---------------------------------------------------------------------------
 
@@ -346,7 +380,10 @@ def _handle_message_core(event, say, client):
 
     if event.get('bot_id'):
         return
-    if event.get('channel') != SLACK_CHANNEL_ID:
+    # Allow messages from the improvement channel OR the vertragsanpassung channel
+    _in_improvement = (event.get('channel') == SLACK_CHANNEL_ID)
+    _in_va = (VERTRAGSANPASSUNG_CHANNEL_ID and event.get('channel') == VERTRAGSANPASSUNG_CHANNEL_ID)
+    if not _in_improvement and not _in_va:
         return
     # Skip system subtypes (edits, deletes, joins, …) but allow file_share through
     if subtype and subtype != 'file_share':
@@ -368,6 +405,62 @@ def _handle_message_core(event, say, client):
     # THREAD REPLY
     # -----------------------------------------------------------------------
     if thread_ts:
+        # --- Vertragsanpassung: follow-up to pending state ---
+        va_state = _pending_vertragsanpassung.get((channel, thread_ts))
+        if va_state and va_state.get('user_id') == user_id:
+            new_parsed = parse_vertragsanpassung(text)
+            # Merge: only fill empty fields from the follow-up reply
+            for k, v in new_parsed.items():
+                if v and not va_state['parsed'].get(k):
+                    va_state['parsed'][k] = v
+            missing = missing_va_fields(va_state['parsed'])
+            if missing:
+                say(
+                    blocks=ask_for_va_info_blocks(user_id, missing),
+                    text="Fehlende Informationen",
+                    thread_ts=thread_ts,
+                )
+            else:
+                _process_vertragsanpassung(
+                    say, client, channel, thread_ts,
+                    va_state['user_name'], va_state['parsed'],
+                )
+            return
+
+        # --- Vertragsanpassung: manual thread trigger (CS Admin only) ---
+        if '#vertragsanpassung' in text.lower():
+            if user_id not in CS_ADMIN_USER_IDS:
+                say(
+                    text=":no_entry: `#vertragsanpassung` kann nur vom CS Admin Team genutzt werden.",
+                    thread_ts=thread_ts,
+                )
+                return
+            # Read root message of the thread for context
+            try:
+                result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
+                root_text = result.get('messages', [{}])[0].get('text', '')
+            except Exception as e:
+                logger.warning(f"conversations_replies failed in VA trigger: {e}")
+                root_text = ''
+            _set_eyes(client, channel, thread_ts)
+            parsed = parse_vertragsanpassung(root_text or text)
+            missing = missing_va_fields(parsed)
+            if missing:
+                _pending_vertragsanpassung[(channel, thread_ts)] = {
+                    'parsed': parsed,
+                    'user_id': user_id,
+                    'user_name': user_name,
+                    'created_at': time.time(),
+                }
+                say(
+                    blocks=ask_for_va_info_blocks(user_id, missing),
+                    text="Vertragsanpassung — fehlende Informationen",
+                    thread_ts=thread_ts,
+                )
+            else:
+                _process_vertragsanpassung(say, client, channel, thread_ts, user_name, parsed)
+            return
+
         state = _pending.get((channel, thread_ts))
 
         # --- Follow-up reply to our info request ---
@@ -566,8 +659,31 @@ def _handle_message_core(event, say, client):
         return
 
     # -----------------------------------------------------------------------
-    # NEW MESSAGE — only react to #improvement
+    # NEW MESSAGE
     # -----------------------------------------------------------------------
+
+    # --- Vertragsanpassung: auto-detection (only in VA channel) ---
+    if _in_va and detect_vertragsanpassung(text):
+        _set_eyes(client, channel, ts)
+        parsed = parse_vertragsanpassung(text)
+        missing = missing_va_fields(parsed)
+        if missing:
+            _pending_vertragsanpassung[(channel, ts)] = {
+                'parsed': parsed,
+                'user_id': user_id,
+                'user_name': user_name,
+                'created_at': time.time(),
+            }
+            say(
+                blocks=ask_for_va_info_blocks(user_id, missing),
+                text="Vertragsanpassung erkannt — fehlende Informationen",
+                thread_ts=ts,
+            )
+        else:
+            _process_vertragsanpassung(say, client, channel, ts, user_name, parsed)
+        return
+
+    # --- Improvement: only react to #improvement tag ---
     if '#improvement' not in text.lower():
         return
 
