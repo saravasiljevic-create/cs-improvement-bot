@@ -84,7 +84,9 @@ _PLAN_RE = re.compile(
     re.IGNORECASE,
 )
 _CUSTOMER_LABELED_RE = re.compile(
-    r'(?:kunde|kundschaft|customer|company|firma|unternehmen|kund)\s*[:\-]\s*'
+    # Colon/dash optional: matches both "Kunde: X" and "Kunde X"
+    r'\b(?:kunde[n]?|kundschaft|customer|company|firma|unternehmen)\b'
+    r'\s*[:\-]?\s*'
     r'(.+?)(?=\s+(?:soll|hat|möchte|will|kann|wünscht|bittet|muss|ist|wurde|werden)|\n|,|$)',
     re.IGNORECASE,
 )
