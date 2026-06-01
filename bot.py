@@ -374,11 +374,17 @@ def _handle_message_core(event, say, client):
         if state and state.get('user_id') == user_id:
             title_parsed, uc_parsed = parse_request(text)
 
-            # Always respect an explicitly labelled title from the reply
-            if title_parsed:
+            # Only replace the stored title when the user explicitly wrote "Titel: …"
+            # A plain reply without that label must NOT overwrite the original title —
+            # parse_request() would return the first line as a fallback title, making
+            # title == use_case and triggering the "entspricht dem Titel" error.
+            has_explicit_title = bool(
+                re.search(r'(?:titel|title)\s*[:\-]', text, re.IGNORECASE)
+            )
+            if has_explicit_title and title_parsed:
                 state['title'] = title_parsed
             elif not state.get('title'):
-                state['title'] = text.split('\n')[0].strip()
+                state['title'] = title_parsed or text.split('\n')[0].strip()
 
             if not state.get('use_case'):
                 state['use_case'] = uc_parsed or text.strip()
