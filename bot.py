@@ -401,8 +401,13 @@ def _handle_message_core(event, say, client):
         if state and state.get('user_id') == user_id:
             title_parsed, uc_parsed = parse_request(text)
 
-            if not state.get('title'):
-                state['title'] = title_parsed or text.split('\n')[0].strip()
+            # If the user explicitly labels a title in their reply, always use it
+            # (the stored title might be a raw, unlabelled fallback from the original msg)
+            if title_parsed:
+                state['title'] = title_parsed
+            elif not state.get('title'):
+                state['title'] = text.split('\n')[0].strip()
+
             if not state.get('use_case'):
                 state['use_case'] = uc_parsed or text.strip()
 
