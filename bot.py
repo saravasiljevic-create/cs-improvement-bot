@@ -369,7 +369,10 @@ def handle_message(event, say, client):
         return
     if event.get('channel') != SLACK_CHANNEL_ID:
         return
-    if event.get('subtype'):
+    # Allow file_share (user message with image/attachment) through;
+    # skip everything else that carries a subtype (edits, deletes, joins, …)
+    subtype = event.get('subtype')
+    if subtype and subtype != 'file_share':
         return
 
     _cleanup_expired_pending(client)
