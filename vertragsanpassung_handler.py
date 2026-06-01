@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 _STRONG = [
     r'vertrags\s*anpassung',
     r'vertrags\s*[äa]nderung',
+    r'vertrags\s*verlängerung',   # Vertragsverlängerung
     r'vertragswechsel',
     r'unterschriebene[snm]?\s+angebot',
     r'angebot.{0,60}unterschrieben',
@@ -41,6 +42,13 @@ _MEDIUM = [
     r'(?:monatlich|jährlich)\w*\s+(?:miete|gebühr|preis|beitrag)',
     r'(?:subscription|abo|vertrag|konditionen)\s+(?:ändern|anpassen|wechseln|korrigieren)',
     r'könnt?\s+(?:ihr|sie).{0,30}(?:ändern|anpassen|korrigieren|umstellen)',
+    # Verlängerungs-Signale
+    r'verlängerung.{0,50}vertrags?',        # "Verlängerung seines Vertrags"
+    r'vertrags?.{0,30}verlänger\w*',        # "Vertrag verlängert / verlängern"
+    r'\d+[\s\-]?jahres?[\s\-]?umstellung',  # "2-Jahres-Umstellung"
+    r'\d+\s*(?:monats?|jahres?)\s*verlängerung',  # "24-Monats-Verlängerung"
+    r'um\s+\d+\s+(?:jahre?|monate?)\s+verlänger',  # "um 24 Monate verlängern"
+    r'verlänger\w*\s+um\s+\d+',             # "verlängert um 24"
 ]
 
 
