@@ -160,15 +160,19 @@ def found_ticket_blocks(tickets: list[dict]) -> list[dict]:
 def _add_reaction(client, channel: str, ts: str, emoji: str):
     try:
         client.reactions_add(channel=channel, name=emoji, timestamp=ts)
-    except Exception:
-        pass  # already reacted or permission issue — not critical
+    except Exception as e:
+        err = str(e)
+        if 'already_reacted' not in err:
+            logger.warning(f"reactions_add :{emoji}: failed on {channel}/{ts}: {err}")
 
 
 def _remove_reaction(client, channel: str, ts: str, emoji: str):
     try:
         client.reactions_remove(channel=channel, name=emoji, timestamp=ts)
-    except Exception:
-        pass  # not reacted or already removed — not critical
+    except Exception as e:
+        err = str(e)
+        if 'no_reaction' not in err:
+            logger.warning(f"reactions_remove :{emoji}: failed on {channel}/{ts}: {err}")
 
 
 def _set_eyes(client, channel: str, ts: str):
