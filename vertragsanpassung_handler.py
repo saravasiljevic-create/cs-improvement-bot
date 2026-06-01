@@ -23,7 +23,8 @@ _STRONG = [
     r'vertrags\s*[äa]nderung',
     r'vertragswechsel',
     r'unterschriebene[snm]?\s+angebot',
-    r'angebot\s+(?:\w+\s+){0,2}unterschrieben',
+    r'angebot.{0,60}unterschrieben',   # "Angebot für Pro 25 unterschrieben"
+    r'unterschrieben.{0,60}angebot',   # auch umgekehrte Reihenfolge
     r'signed\s+(?:offer|contract|proposal)',
 ]
 
@@ -35,6 +36,12 @@ _MEDIUM = [
     r'(?:jährlich|monatlich|annual|monthly).{0,30}(?:wechsel|umstell|zahlung)',
     r'\bramp\b',
     r'abo[\s\-](?:wechsel|änder|anpass)',
+    # Interne Formulierungen aus dem CS-Admin-Alltag
+    r'anpassung\s+(?:vornehmen|vorgenommen|gemacht|rückgängig|zurück)',
+    r'rückgängig\s+machen',
+    r'(?:monatlich|jährlich)\w*\s+(?:miete|gebühr|preis|beitrag)',
+    r'(?:subscription|abo|vertrag|konditionen)\s+(?:ändern|anpassen|wechseln|korrigieren)',
+    r'könnt?\s+(?:ihr|sie).{0,30}(?:ändern|anpassen|korrigieren|umstellen)',
 ]
 
 
