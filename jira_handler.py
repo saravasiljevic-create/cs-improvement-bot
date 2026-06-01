@@ -66,11 +66,30 @@ def search_similar_tickets(title: str, use_case: str = ''):
 
 
 def add_vote(issue_key: str) -> dict:
-    """Add the bot user's vote to a Jira issue and return basic issue info."""
+    """Record a CS-team upvote on a Jira issue.
+
+    Attempts a real Jira vote first (works for tickets the bot didn't create).
+    Always adds a comment as a reliable, visible record — the Jira vote API
+    silently ignores self-votes (reporter == voter) and may also be disabled
+    at the project level.
+    """
+    from datetime import datetime, timezone as _tz
     client = _get_client()
-    url = f"{JIRA_SERVER_URL}/rest/api/2/issue/{issue_key}/votes"
-    response = client._session.post(url)
-    response.raise_for_status()
+
+    # Try the real vote (best-effort — self-vote is silently rejected by Jira)
+    try:
+        client.vote_issue(issue_key)
+        print(f"Voted on {issue_key}")
+    except Exception as e:
+        print(f"vote_issue({issue_key}) skipped: {e}")
+
+    # Always add a comment so the upvote is visible regardless of vote settings
+    date_str = datetime.now(tz=_tz.utc).strftime('%d.%m.%Y')
+    try:
+        client.add_comment(issue_key, f"👍 *Upvote vom CS Team* ({date_str})")
+    except Exception as e:
+        print(f"add_comment({issue_key}) failed: {e}")
+
     issue = client.issue(issue_key, fields='summary')
     return {
         'key': issue_key,
