@@ -125,8 +125,16 @@ def create_ticket(summary: str, use_case: str, user_name: str, request_date: str
 
     slack_ref = f"\n*Slack-Post:* {slack_link}" if slack_link else ""
 
+    # When the use_case already carries structured sections (Problem / Auswirkung / …),
+    # use it directly so we don't nest "*Beschreibung:* → *Problem:*".
+    _is_structured = '*Problem:*' in use_case or '*Auswirkung:*' in use_case
+    if _is_structured:
+        desc_body = use_case
+    else:
+        desc_body = f"*Beschreibung:*\n{use_case}"
+
     description = (
-        f"*Beschreibung:*\n{use_case}\n\n"
+        f"{desc_body}\n\n"
         f"*Anfrage von:* {user_name}\n"
         f"*Datum der Anfrage:* {request_date}{slack_ref}"
         f"{image_section}\n\n"

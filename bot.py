@@ -14,6 +14,7 @@ from config import (
     SLACK_SIGNING_SECRET,
 )
 from jira_handler import add_vote, create_ticket, search_similar_tickets
+from optimizer import optimize_ticket
 from slack_utils import format_error, format_ticket_created
 
 logging.basicConfig(level=logging.INFO)
@@ -265,11 +266,15 @@ def _cleanup_expired_pending(client):
 def _show_confirm_create(say, channel: str, thread_ts: str, data: dict):
     """Show the ✅/❌ confirmation buttons, storing data for the action handler."""
     _ticket_data[(channel, thread_ts)] = data
-    image_note = ''
     images = data.get('images') or []
+    image_note = ''
     if images:
         names = ', '.join(f.get('name', 'Bild') for f in images)
-        image_note = f"\n\n:frame_with_picture: Anhänge: {names}"
+        image_note = f"\n\n:frame_with_picture: Anhänge werden mitgeschickt: _{names}_"
+    optimized_note = '\n\n✨ _Für Jira formatiert._' if data.get('optimized') else ''
+    # If use_case already carries structured sections, show them directly
+    _structured = '*Problem:*' in data['use_case'] or '*Auswirkung:*' in data['use_case']
+    desc_display = data['use_case'] if _structured else f"*Beschreibung:*\n{data['use_case']}"
     blocks = [
         {
             "type": "section",
@@ -277,9 +282,10 @@ def _show_confirm_create(say, channel: str, thread_ts: str, data: dict):
                 "type": "mrkdwn",
                 "text": (
                     f":pencil: Kein passendes Ticket gefunden — soll ich ein neues anlegen?\n\n"
-                    f"*Titel:* {data['title']}\n"
-                    f"*Use Case:* {data['use_case']}"
+                    f"*Titel:* {data['title']}\n\n"
+                    f"{desc_display}"
                     f"{image_note}"
+                    f"{optimized_note}"
                 ),
             },
         },
@@ -343,7 +349,13 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
         )
         return
 
-    # No similar tickets — ask user to confirm before creating
+    # No similar tickets — optimize title + description, then ask to confirm
+    opt_title, opt_description = optimize_ticket(title, use_case)
+    was_optimized = (opt_title != title or opt_description != use_case)
+    ctx_data['title'] = opt_title
+    ctx_data['use_case'] = opt_description
+    ctx_data['optimized'] = was_optimized
+
     _show_confirm_create(say, channel, thread_ts, ctx_data)
 
 
