@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 from flask import Flask, request
@@ -12,7 +13,7 @@ from config import (
     SLACK_CHANNEL_ID,
     SLACK_SIGNING_SECRET,
 )
-from jira_handler import create_ticket, search_similar_tickets
+from jira_handler import add_vote, create_ticket, search_similar_tickets
 from slack_utils import format_error, format_ticket_created
 
 logging.basicConfig(level=logging.INFO)
@@ -22,10 +23,13 @@ app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
 
-# (channel, thread_ts) -> {'user_id', 'user_name', 'request_date', 'title', 'use_case'}
+# (channel, thread_ts) -> {'user_id', 'user_name', 'request_date', 'title', 'use_case', 'created_at'}
 _pending: dict[tuple[str, str], dict] = {}
 # (channel, thread_ts) -> ticket data for confirm button
 _ticket_data: dict[tuple[str, str], dict] = {}
+
+JIRA_KEY_RE = re.compile(r'\b([A-Z]+-\d+)\b')
+PENDING_TTL = 72 * 3600  # 72 hours in seconds
 
 
 # ---------------------------------------------------------------------------
@@ -140,14 +144,56 @@ def found_ticket_blocks(tickets: list[dict]) -> list[dict]:
         "text": {
             "type": "mrkdwn",
             "text": (
-                ":point_up: Bitte schau dir die Tickets an.\n"
-                "Wenn dein Request bereits abgedeckt ist, kannst du das Ticket "
-                "*upvoten* — füge einfach einen :thumbsup: Reaktion hinzu "
-                "oder hinterlasse einen Kommentar mit deinem Use Case."
+                ":point_up: Wenn dein Request bereits durch eines dieser Tickets abgedeckt ist, "
+                "schreibe einfach die *Ticket-Nummer* (z.B. `CS-123`) hier in den Thread — "
+                "ich erledige das Upvoting automatisch für dich! :thumbsup:"
             ),
         },
     })
     return blocks
+
+
+# ---------------------------------------------------------------------------
+# Reaction helpers
+# ---------------------------------------------------------------------------
+
+def _add_reaction(client, channel: str, ts: str, emoji: str):
+    try:
+        client.reactions_add(channel=channel, name=emoji, timestamp=ts)
+    except Exception:
+        pass  # already reacted or permission issue — not critical
+
+
+def _remove_reaction(client, channel: str, ts: str, emoji: str):
+    try:
+        client.reactions_remove(channel=channel, name=emoji, timestamp=ts)
+    except Exception:
+        pass  # not reacted or already removed — not critical
+
+
+def _set_eyes(client, channel: str, ts: str):
+    """Add 👀 to the root message to signal the bot is working on it."""
+    _add_reaction(client, channel, ts, 'eyes')
+
+
+def _set_done(client, channel: str, ts: str):
+    """Replace 👀 with ✅ to signal the request has been handled."""
+    _remove_reaction(client, channel, ts, 'eyes')
+    _add_reaction(client, channel, ts, 'white_check_mark')
+
+
+def _cleanup_expired_pending(client):
+    """Remove pending states older than 72h and mark their root messages as done."""
+    now = time.time()
+    expired = [
+        key for key, state in list(_pending.items())
+        if now - state.get('created_at', now) > PENDING_TTL
+    ]
+    for key in expired:
+        _pending.pop(key, None)
+        channel, thread_ts = key
+        logger.info(f"Pending state expired for {channel}/{thread_ts} — marking done")
+        _set_done(client, channel, thread_ts)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +208,9 @@ def handle_message(event, say, client):
         return
     if event.get('subtype'):
         return
+
+    # Lazily expire pending states older than 72h
+    _cleanup_expired_pending(client)
 
     text = event.get('text', '') or ''
     channel = event.get('channel')
@@ -201,6 +250,7 @@ def handle_message(event, say, client):
             _pending.pop((channel, thread_ts), None)
             _process_request(
                 say=say,
+                client=client,
                 channel=channel,
                 thread_ts=thread_ts,
                 user_id=state['user_id'],
@@ -209,6 +259,29 @@ def handle_message(event, say, client):
                 title=state['title'],
                 use_case=state['use_case'],
             )
+            return
+
+        # --- Jira ticket number posted → auto-upvote ---
+        jira_match = JIRA_KEY_RE.search(text.upper())
+        if jira_match:
+            issue_key = jira_match.group(1)
+            try:
+                issue = add_vote(issue_key)
+                say(
+                    text=(
+                        f":thumbsup: Ich habe dein Upvote auf "
+                        f"*<{issue['url']}|{issue_key}>* eingetragen!\n"
+                        f"_{issue['summary']}_"
+                    ),
+                    thread_ts=thread_ts,
+                )
+                _set_done(client, channel, thread_ts)
+            except Exception as e:
+                logger.exception("Jira vote failed")
+                say(
+                    text=f":x: Upvote für `{issue_key}` fehlgeschlagen: {str(e)}",
+                    thread_ts=thread_ts,
+                )
             return
 
         # --- #improvement trigger inside a thread → read from original message ---
@@ -221,11 +294,12 @@ def handle_message(event, say, client):
                 logger.exception("Could not fetch original thread message")
                 original_text = ''
 
-            # Use date of the original message as request date
             original_request_date = ts_to_date(thread_ts)
 
             title, use_case = parse_request(original_text or text)
             still_missing = missing_info(title, use_case)
+
+            _set_eyes(client, channel, thread_ts)
 
             if still_missing:
                 _pending[(channel, thread_ts)] = {
@@ -234,6 +308,7 @@ def handle_message(event, say, client):
                     'request_date': original_request_date,
                     'title': title,
                     'use_case': use_case,
+                    'created_at': time.time(),
                 }
                 say(
                     blocks=ask_for_info_blocks(user_id, still_missing),
@@ -244,6 +319,7 @@ def handle_message(event, say, client):
 
             _process_request(
                 say=say,
+                client=client,
                 channel=channel,
                 thread_ts=thread_ts,
                 user_id=user_id,
@@ -263,6 +339,8 @@ def handle_message(event, say, client):
     title, use_case = parse_request(text)
     still_missing = missing_info(title, use_case)
 
+    _set_eyes(client, channel, ts)
+
     if still_missing:
         _pending[(channel, ts)] = {
             'user_id': user_id,
@@ -270,6 +348,7 @@ def handle_message(event, say, client):
             'request_date': request_date,
             'title': title,
             'use_case': use_case,
+            'created_at': time.time(),
         }
         say(
             blocks=ask_for_info_blocks(user_id, still_missing),
@@ -281,6 +360,7 @@ def handle_message(event, say, client):
     # All info present immediately
     _process_request(
         say=say,
+        client=client,
         channel=channel,
         thread_ts=ts,
         user_id=user_id,
@@ -291,7 +371,7 @@ def handle_message(event, say, client):
     )
 
 
-def _process_request(say, channel, thread_ts, user_id, user_name, request_date, title, use_case):
+def _process_request(say, client, channel, thread_ts, user_id, user_name, request_date, title, use_case):
     """Search Jira CS board and respond appropriately."""
     try:
         similar = search_similar_tickets(title=title, use_case=use_case)
@@ -305,6 +385,7 @@ def _process_request(say, channel, thread_ts, user_id, user_name, request_date, 
         return
 
     if similar:
+        # 👀 stays — waiting for user to reply with a ticket number or let it expire
         say(
             blocks=found_ticket_blocks(similar),
             text="Ähnliche Tickets gefunden",
@@ -360,7 +441,7 @@ def _process_request(say, channel, thread_ts, user_id, user_name, request_date, 
 
 
 @app.action("confirm_create_ticket")
-def handle_confirm_create(ack, body, say):
+def handle_confirm_create(ack, body, say, client):
     ack()
     value = body['actions'][0]['value']
     try:
@@ -386,6 +467,7 @@ def handle_confirm_create(ack, body, say):
             text=f"Ticket {ticket['key']} erstellt",
             thread_ts=thread_ts,
         )
+        _set_done(client, channel, thread_ts)
     except Exception as e:
         logger.exception("Ticket creation failed")
         say(

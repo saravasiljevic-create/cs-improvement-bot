@@ -63,6 +63,21 @@ def search_similar_tickets(title: str, use_case: str = ''):
     return results
 
 
+def add_vote(issue_key: str) -> dict:
+    """Add the bot user's vote to a Jira issue and return basic issue info."""
+    client = _get_client()
+    url = f"{JIRA_SERVER_URL}/rest/api/2/issue/{issue_key}/votes"
+    # Use the underlying authenticated session from the jira library
+    response = client._session.post(url)
+    response.raise_for_status()
+    issue = client.issue(issue_key, fields='summary')
+    return {
+        'key': issue_key,
+        'summary': issue.fields.summary,
+        'url': f'{JIRA_SERVER_URL}/browse/{issue_key}',
+    }
+
+
 def create_ticket(summary: str, use_case: str, user_name: str, request_date: str):
     """Create a new Jira task ticket from a Slack improvement request."""
     try:
