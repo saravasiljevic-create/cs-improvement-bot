@@ -12,6 +12,7 @@ from config import (
     CHARGEBEE_API_KEY,
     CHARGEBEE_SITE,
     CS_ADMIN_USER_IDS,
+    PLANHAT_API_TOKEN,
     SLACK_BOT_TOKEN,
     SLACK_CHANNEL_ID,
     SLACK_SIGNING_SECRET,
@@ -353,9 +354,12 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
 # ---------------------------------------------------------------------------
 
 def _cb_lookup(customer_name: str) -> dict | None:
-    """Chargebee-Lookup wenn API-Key konfiguriert, sonst None."""
+    """Chargebee-Lookup (mit Planhat-Fallback) wenn API-Keys konfiguriert, sonst None."""
     if customer_name and CHARGEBEE_API_KEY:
-        return lookup_chargebee_subscription(customer_name, CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+        return lookup_chargebee_subscription(
+            customer_name, CHARGEBEE_API_KEY, CHARGEBEE_SITE,
+            planhat_token=PLANHAT_API_TOKEN,
+        )
     return None
 
 

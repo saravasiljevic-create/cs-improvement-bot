@@ -186,7 +186,7 @@ def missing_va_fields(parsed: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Chargebee Lookup (read-only)
+# Chargebee + Planhat Lookup (read-only)
 # ---------------------------------------------------------------------------
 
 def _ts_to_date(ts: int | None) -> str:
@@ -239,84 +239,166 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
     return []
 
 
-def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str) -> dict | None:
-    """Sucht die aktive Chargebee-Subscription und lädt relevante Details. Kein Schreibzugriff."""
+def _planhat_company_search(customer_name: str, api_token: str) -> dict | None:
+    """Sucht einen Kunden in Planhat und gibt Subscription-ID + Planhat-Link zurück.
+
+    Planhat speichert die Chargebee-Subscription-ID im Feld 'externalId' (serial).
+    Mit dieser ID kann die Chargebee-Subscription direkt geladen werden.
+    """
+    headers = {'Authorization': f'Bearer {api_token}'}
+    name_no_suffix = re.sub(
+        r'\s*(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?\s*$',
+        '', customer_name, flags=re.IGNORECASE,
+    ).strip()
+    first_word = customer_name.split()[0] if customer_name else ''
+
+    for search_term in [customer_name, name_no_suffix, first_word]:
+        if not search_term:
+            continue
+        try:
+            resp = requests.get(
+                'https://api.planhat.com/companies',
+                params={'companyName': search_term, 'limit': 5},
+                headers=headers,
+                timeout=10,
+            )
+            logger.info(
+                f"Planhat search [companyName={search_term!r}]: "
+                f"status={resp.status_code}, "
+                f"results={len(resp.json()) if resp.ok else 'error'}"
+            )
+            if resp.ok:
+                companies = resp.json()
+                if companies:
+                    company = companies[0]
+                    ph_id = company.get('_id', '')
+                    # 'externalId' in Planhat = Chargebee subscription ID (serial)
+                    subscription_id = company.get('externalId', '')
+                    return {
+                        'planhat_id': ph_id,
+                        'name': company.get('name', customer_name),
+                        'subscription_id': subscription_id,
+                        'planhat_url': f"https://app.planhat.com/customer/{ph_id}",
+                    }
+        except Exception as e:
+            logger.warning(f"Planhat search [{search_term!r}] failed: {e}")
+    return None
+
+
+def _fetch_subscription_by_id(subscription_id: str, api_key: str, site: str) -> dict | None:
+    """Lädt eine Chargebee-Subscription direkt per Subscription-ID."""
+    base = f"https://{site}.chargebee.com/api/v2"
+    auth = (api_key, '')
+    try:
+        resp = requests.get(f"{base}/subscriptions/{subscription_id}", auth=auth, timeout=10)
+        logger.info(f"Chargebee subscription/{subscription_id}: status={resp.status_code}")
+        if not resp.ok:
+            return None
+        sub = resp.json().get('subscription', {})
+        if not sub:
+            return None
+        return _build_subscription_result(sub, site)
+    except Exception as e:
+        logger.warning(f"Chargebee subscription/{subscription_id} fetch failed: {e}")
+        return None
+
+
+def _build_subscription_result(sub: dict, site: str) -> dict:
+    """Wandelt ein Chargebee-Subscription-Objekt in unser einheitliches Format um."""
+    sub_id = sub['id']
+    if sub.get('subscription_items'):
+        addons = [
+            item['item_price_id']
+            for item in sub['subscription_items']
+            if item.get('item_type') == 'addon' and item.get('unit_price', 0) > 0
+        ]
+    else:
+        addons = [a.get('id', '') for a in sub.get('addons', []) if a.get('id')]
+
+    period = sub.get('billing_period', 1)
+    period_unit = sub.get('billing_period_unit', '')
+    if period_unit == 'month':
+        billing_cycle = 'monatlich' if period == 1 else f'alle {period} Monate'
+    elif period_unit == 'year':
+        billing_cycle = 'jährlich' if period == 1 else f'alle {period} Jahre'
+    else:
+        billing_cycle = period_unit or ''
+
+    coupons = [c.get('coupon_id', '') for c in sub.get('coupons', []) if c.get('coupon_id')]
+    if not coupons and sub.get('coupon'):
+        coupons = [sub['coupon']]
+
+    return {
+        'subscription_id': sub_id,
+        'customer_id': sub.get('customer_id', ''),
+        'plan_id': sub.get('plan_id', ''),
+        'addons': addons,
+        'status': sub.get('status', ''),
+        'billing_cycle': billing_cycle,
+        'billing_period_unit': period_unit,
+        'next_billing_at': _ts_to_date(sub.get('next_billing_at')),
+        'current_term_end': _ts_to_date(sub.get('current_term_end')),
+        'trial_end': _ts_to_date(sub.get('trial_end')),
+        'coupons': coupons,
+        'url': f"https://{site}.chargebee.com/d/subscriptions/{sub_id}",
+    }
+
+
+def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str,
+                                   planhat_token: str = '') -> dict | None:
+    """Sucht Chargebee-Subscription.
+
+    Reihenfolge:
+    1. Chargebee-Namenssuche (company[is] / company[starts_with])
+    2. Planhat-Fallback: Suche in Planhat → Subscription-ID → Chargebee direkt laden
+    """
     base = f"https://{site}.chargebee.com/api/v2"
     auth = (api_key, '')
 
+    # --- Versuch 1: Chargebee-Namenssuche ---
     try:
         customers = _chargebee_customer_search(base, auth, customer_name)
-
-        if not customers:
-            logger.info(f"Kein Chargebee-Kunde gefunden für '{customer_name}' (alle Strategien erschöpft)")
-            return None
-
-        customer = customers[0]['customer']
-        customer_id = customer['id']
-        company = (
-            customer.get('company')
-            or f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
-        )
-
-        # Subscription laden
-        resp = requests.get(
-            f"{base}/subscriptions",
-            params={'customer_id': customer_id, 'limit': 10},
-            auth=auth, timeout=10,
-        )
-        subs = resp.json().get('list', []) if resp.ok else []
-
-        active = [s['subscription'] for s in subs if s['subscription'].get('status') == 'active']
-        sub = (active or [s['subscription'] for s in subs if 'subscription' in s])[0] if subs else None
-        if not sub:
-            return None
-
-        sub_id = sub['id']
-
-        # Add-Ons: neues Item-Model (subscription_items) hat Vorrang, Fallback auf altes addons-Feld
-        if sub.get('subscription_items'):
-            addons = [
-                item['item_price_id']
-                for item in sub['subscription_items']
-                if item.get('item_type') == 'addon' and item.get('unit_price', 0) > 0
-            ]
+        if customers:
+            customer = customers[0]['customer']
+            customer_id = customer['id']
+            company_name = (
+                customer.get('company')
+                or f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
+            )
+            resp = requests.get(
+                f"{base}/subscriptions",
+                params={'customer_id': customer_id, 'limit': 10},
+                auth=auth, timeout=10,
+            )
+            subs = resp.json().get('list', []) if resp.ok else []
+            active = [s['subscription'] for s in subs if s['subscription'].get('status') == 'active']
+            sub = (active or [s['subscription'] for s in subs if 'subscription' in s])[0] if subs else None
+            if sub:
+                result = _build_subscription_result(sub, site)
+                result['company'] = company_name
+                return result
         else:
-            addons = [a.get('id', '') for a in sub.get('addons', []) if a.get('id')]
-
-        # Billing-Zyklus lesbar machen
-        period = sub.get('billing_period', 1)
-        period_unit = sub.get('billing_period_unit', '')
-        if period_unit == 'month':
-            billing_cycle = f"monatlich" if period == 1 else f"alle {period} Monate"
-        elif period_unit == 'year':
-            billing_cycle = 'jährlich' if period == 1 else f"alle {period} Jahre"
-        else:
-            billing_cycle = period_unit or ''
-
-        # Gutscheine / Discounts
-        coupons = [c.get('coupon_id', '') for c in sub.get('coupons', []) if c.get('coupon_id')]
-        if not coupons and sub.get('coupon'):
-            coupons = [sub['coupon']]
-
-        return {
-            'subscription_id': sub_id,
-            'customer_id': customer_id,
-            'company': company,
-            'plan_id': sub.get('plan_id', ''),
-            'addons': addons,
-            'status': sub.get('status', ''),
-            'billing_cycle': billing_cycle,
-            'billing_period_unit': period_unit,
-            'next_billing_at': _ts_to_date(sub.get('next_billing_at')),
-            'current_term_end': _ts_to_date(sub.get('current_term_end')),
-            'trial_end': _ts_to_date(sub.get('trial_end')),
-            'coupons': coupons,
-            'url': f"https://{site}.chargebee.com/d/subscriptions/{sub_id}",
-        }
-
+            logger.info(f"Chargebee: kein Treffer für '{customer_name}' — versuche Planhat-Fallback")
     except Exception as e:
-        logger.warning(f"Chargebee-Lookup Fehler für '{customer_name}': {e}")
+        logger.warning(f"Chargebee-Namenssuche Fehler für '{customer_name}': {e}")
+
+    # --- Versuch 2: Planhat-Fallback ---
+    if not planhat_token:
+        logger.info("Kein PLANHAT_API_TOKEN konfiguriert — Fallback nicht möglich")
         return None
+
+    logger.info(f"Starte Planhat-Fallback für '{customer_name}'")
+    ph = _planhat_company_search(customer_name, planhat_token)
+    if not ph or not ph.get('subscription_id'):
+        logger.info(f"Planhat: kein Treffer oder keine Subscription-ID für '{customer_name}'")
+        return None
+
+    sub_id = ph['subscription_id']
+    logger.info(f"Planhat: '{ph['name']}' → Subscription '{sub_id}' — lade aus Chargebee")
+    result = _fetch_subscription_by_id(sub_id, api_key, site)
+    if result:
+        result['company'] = ph['name']
+    return result
 
 
 # ---------------------------------------------------------------------------
