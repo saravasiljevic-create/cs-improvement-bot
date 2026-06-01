@@ -187,31 +187,56 @@ def _ts_to_date(ts: int | None) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%d.%m.%Y')
 
 
+def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> list:
+    """Versucht mehrere Suchstrategien um einen Chargebee-Kunden zu finden."""
+    # Suffix (GmbH, AG, …) entfernen für breitere Suche
+    name_no_suffix = re.sub(
+        r'\s*(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?\s*$',
+        '', customer_name, flags=re.IGNORECASE,
+    ).strip()
+    first_word = customer_name.split()[0] if customer_name else ''
+
+    strategies = [
+        ('company[contains]', customer_name),
+        ('company[contains]', name_no_suffix),
+        ('company[starts_with]', name_no_suffix),
+        ('company[contains]', first_word),
+    ]
+    seen = set()
+    for param_key, param_val in strategies:
+        if not param_val or param_val in seen:
+            continue
+        seen.add(param_val)
+        try:
+            resp = requests.get(
+                f"{base}/customers",
+                params={param_key: param_val, 'limit': 5},
+                auth=auth, timeout=10,
+            )
+            logger.info(
+                f"Chargebee search [{param_key}={param_val!r}]: "
+                f"status={resp.status_code}, "
+                f"results={len(resp.json().get('list', [])) if resp.ok else 'error'}"
+            )
+            if resp.ok:
+                customers = resp.json().get('list', [])
+                if customers:
+                    return customers
+        except Exception as e:
+            logger.warning(f"Chargebee search [{param_key}={param_val!r}] failed: {e}")
+    return []
+
+
 def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str) -> dict | None:
     """Sucht die aktive Chargebee-Subscription und lädt relevante Details. Kein Schreibzugriff."""
     base = f"https://{site}.chargebee.com/api/v2"
     auth = (api_key, '')
 
     try:
-        # Kundensuche
-        resp = requests.get(
-            f"{base}/customers",
-            params={'company[contains]': customer_name, 'limit': 5},
-            auth=auth, timeout=10,
-        )
-        customers = resp.json().get('list', []) if resp.ok else []
+        customers = _chargebee_customer_search(base, auth, customer_name)
 
         if not customers:
-            first_word = customer_name.split()[0] if customer_name else customer_name
-            resp = requests.get(
-                f"{base}/customers",
-                params={'first_name[contains]': first_word, 'limit': 5},
-                auth=auth, timeout=10,
-            )
-            customers = resp.json().get('list', []) if resp.ok else []
-
-        if not customers:
-            logger.info(f"Kein Chargebee-Kunde gefunden für '{customer_name}'")
+            logger.info(f"Kein Chargebee-Kunde gefunden für '{customer_name}' (alle Strategien erschöpft)")
             return None
 
         customer = customers[0]['customer']
