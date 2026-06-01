@@ -57,7 +57,7 @@ def parse_request(text: str) -> tuple[str | None, str | None]:
     Supports explicit labels (Titel:, Use Case:, Beschreibung:, Problem:)
     or falls back to first-line = title, rest = use case.
     """
-    clean = re.sub(r'#improvement-request', '', text, flags=re.IGNORECASE).strip()
+    clean = re.sub(r'#improvement', '', text, flags=re.IGNORECASE).strip()
     # Remove Slack user mentions for parsing
     clean = re.sub(r'<@[A-Z0-9]+>', '', clean).strip()
 
@@ -174,51 +174,90 @@ def handle_message(event, say, client):
     logger.info(f"Message: channel={channel}, thread={thread_ts}, user={user_id} ({user_name})")
 
     # -----------------------------------------------------------------------
-    # THREAD REPLY — bot is waiting for more info from this user
+    # THREAD REPLY
     # -----------------------------------------------------------------------
     if thread_ts:
         state = _pending.get((channel, thread_ts))
-        if not state or state.get('user_id') != user_id:
-            return  # not our thread or wrong user
 
-        # Try to parse explicit labels first
-        title_parsed, uc_parsed = parse_request(text)
+        # --- Follow-up reply to our info request ---
+        if state and state.get('user_id') == user_id:
+            title_parsed, uc_parsed = parse_request(text)
 
-        # Fill in what's still missing — treat full reply as the missing field
-        if not state.get('title'):
-            state['title'] = title_parsed or text.split('\n')[0].strip()
-        if not state.get('use_case'):
-            # If title was just set from first line and there's more text, use rest as use_case
-            state['use_case'] = uc_parsed or text.strip()
+            if not state.get('title'):
+                state['title'] = title_parsed or text.split('\n')[0].strip()
+            if not state.get('use_case'):
+                state['use_case'] = uc_parsed or text.strip()
 
-        still_missing = missing_info(state.get('title'), state.get('use_case'))
+            still_missing = missing_info(state.get('title'), state.get('use_case'))
 
-        if still_missing:
-            say(
-                blocks=ask_for_info_blocks(user_id, still_missing),
-                text="Bitte ergänze die fehlenden Infos",
+            if still_missing:
+                say(
+                    blocks=ask_for_info_blocks(user_id, still_missing),
+                    text="Bitte ergänze die fehlenden Infos",
+                    thread_ts=thread_ts,
+                )
+                return
+
+            _pending.pop((channel, thread_ts), None)
+            _process_request(
+                say=say,
+                channel=channel,
                 thread_ts=thread_ts,
+                user_id=state['user_id'],
+                user_name=state.get('user_name', user_name),
+                request_date=state.get('request_date', request_date),
+                title=state['title'],
+                use_case=state['use_case'],
             )
             return
 
-        # All info available — search Jira
-        _pending.pop((channel, thread_ts), None)
-        _process_request(
-            say=say,
-            channel=channel,
-            thread_ts=thread_ts,
-            user_id=state['user_id'],
-            user_name=state.get('user_name', user_name),
-            request_date=state.get('request_date', request_date),
-            title=state['title'],
-            use_case=state['use_case'],
-        )
+        # --- #improvement trigger inside a thread → read from original message ---
+        if '#improvement' in text.lower():
+            try:
+                result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
+                messages = result.get('messages', [])
+                original_text = messages[0].get('text', '') if messages else ''
+            except Exception:
+                logger.exception("Could not fetch original thread message")
+                original_text = ''
+
+            # Use date of the original message as request date
+            original_request_date = ts_to_date(thread_ts)
+
+            title, use_case = parse_request(original_text or text)
+            still_missing = missing_info(title, use_case)
+
+            if still_missing:
+                _pending[(channel, thread_ts)] = {
+                    'user_id': user_id,
+                    'user_name': user_name,
+                    'request_date': original_request_date,
+                    'title': title,
+                    'use_case': use_case,
+                }
+                say(
+                    blocks=ask_for_info_blocks(user_id, still_missing),
+                    text="Fehlende Informationen",
+                    thread_ts=thread_ts,
+                )
+                return
+
+            _process_request(
+                say=say,
+                channel=channel,
+                thread_ts=thread_ts,
+                user_id=user_id,
+                user_name=user_name,
+                request_date=original_request_date,
+                title=title,
+                use_case=use_case,
+            )
         return
 
     # -----------------------------------------------------------------------
-    # NEW MESSAGE — only react to #improvement-request
+    # NEW MESSAGE — only react to #improvement
     # -----------------------------------------------------------------------
-    if '#improvement-request' not in text.lower():
+    if '#improvement' not in text.lower():
         return
 
     title, use_case = parse_request(text)
