@@ -460,10 +460,47 @@ def handle_message(event, say, client):
             return
 
         # --- User rejects similar tickets → offer to create new ticket ---
-        similar_ctx = _similar_shown.get((channel, thread_ts))
-        if similar_ctx and REJECTION_RE.search(text):
-            _similar_shown.pop((channel, thread_ts), None)
-            _show_confirm_create(say, channel, thread_ts, similar_ctx)
+        if REJECTION_RE.search(text):
+            ctx = _similar_shown.pop((channel, thread_ts), None)
+
+            if not ctx:
+                # In-memory context lost (e.g. after restart) — reconstruct from thread root
+                try:
+                    result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
+                    messages = result.get('messages', [])
+                    root_msg = messages[0] if messages else {}
+                    root_text = root_msg.get('text', '')
+                    root_user = root_msg.get('user', user_id)
+                except Exception:
+                    logger.exception("Could not fetch thread root for rejection fallback")
+                    root_text = ''
+                    root_user = user_id
+
+                if '#improvement' not in root_text.lower():
+                    return  # not an improvement thread — ignore
+
+                title, use_case = parse_request(root_text)
+                if not title or not use_case:
+                    say(
+                        text=(
+                            ":thinking_face: Ich konnte die ursprüngliche Anfrage nicht "
+                            "vollständig rekonstruieren. Bitte ergänze Titel und Use Case "
+                            "hier im Thread, damit ich das Ticket anlegen kann."
+                        ),
+                        thread_ts=thread_ts,
+                    )
+                    return
+
+                ctx = {
+                    'user_id': root_user,
+                    'user_name': get_user_name(client, root_user),
+                    'request_date': ts_to_date(thread_ts),
+                    'title': title,
+                    'use_case': use_case,
+                    'slack_link': slack_message_link(channel, thread_ts),
+                }
+
+            _show_confirm_create(say, channel, thread_ts, ctx)
             return
 
         # --- #improvement trigger inside a thread → read from original message ---
