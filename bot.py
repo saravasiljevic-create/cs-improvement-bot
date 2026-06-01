@@ -460,7 +460,13 @@ def handle_message(event, say, client):
             return
 
         # --- User rejects similar tickets → offer to create new ticket ---
-        if REJECTION_RE.search(text):
+        rejection_match = REJECTION_RE.search(text)
+        logger.info(
+            f"Thread reply: rejection_match={bool(rejection_match)}, "
+            f"similar_shown_key_exists={(channel, thread_ts) in _similar_shown}, "
+            f"text={text!r}"
+        )
+        if rejection_match:
             ctx = _similar_shown.pop((channel, thread_ts), None)
 
             if not ctx:
