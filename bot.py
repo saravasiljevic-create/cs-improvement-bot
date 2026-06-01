@@ -27,15 +27,13 @@ handler = SlackRequestHandler(app)
 # (channel, thread_ts) -> {'user_id', 'user_name', 'request_date', 'title', 'use_case',
 #                          'slack_link', 'images', 'created_at'}
 _pending: dict[tuple[str, str], dict] = {}
-# (channel, thread_ts) -> ticket data stored after similar-ticket flow or no-match flow
+# (channel, thread_ts) -> context stored when similar tickets were shown (for rejection flow)
 _ticket_data: dict[tuple[str, str], dict] = {}
-# (channel, thread_ts) -> context stored when similar tickets were shown (for rejection re-trigger)
 _similar_shown: dict[tuple[str, str], dict] = {}
 
 JIRA_KEY_RE = re.compile(r'\b([A-Z]+-\d+)\b')
 PENDING_TTL = 72 * 3600  # 72 hours in seconds
 
-# Phrases that signal the user thinks the suggested tickets don't match their request
 REJECTION_RE = re.compile(
     r'passen?\s+nicht|passt?\s+nicht|nicht\s+passend|'
     r'trifft?\s+nicht\s+zu|stimmt?\s+nicht|'
@@ -53,7 +51,6 @@ REJECTION_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def get_user_name(client, user_id: str) -> str:
-    """Return the Slack display name or real name for a user."""
     try:
         info = client.users_info(user=user_id)
         profile = info['user']['profile']
@@ -63,7 +60,6 @@ def get_user_name(client, user_id: str) -> str:
 
 
 def ts_to_date(ts: str) -> str:
-    """Convert Slack timestamp to readable date string (DD.MM.YYYY)."""
     try:
         dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
         return dt.strftime('%d.%m.%Y')
@@ -72,12 +68,10 @@ def ts_to_date(ts: str) -> str:
 
 
 def slack_message_link(channel: str, ts: str) -> str:
-    """Build a deep link to a Slack message."""
     return f"https://slack.com/archives/{channel}/p{ts.replace('.', '')}"
 
 
 def extract_images(files) -> list[dict]:
-    """Return only image-type file objects from a Slack files list."""
     return [
         f for f in (files or [])
         if f.get('mimetype', '').startswith('image/')
@@ -85,11 +79,7 @@ def extract_images(files) -> list[dict]:
 
 
 def parse_request(text: str) -> tuple[str | None, str | None]:
-    """Extract title and use case from a message.
-
-    Supports explicit labels (Titel:, Use Case:, Beschreibung:, Problem:)
-    or falls back to first-line = title, rest = use case.
-    """
+    """Extract title and use case from a message."""
     clean = re.sub(r'#improvement', '', text, flags=re.IGNORECASE).strip()
     clean = re.sub(r'<@[A-Z0-9]+>', '', clean).strip()
 
@@ -109,7 +99,6 @@ def parse_request(text: str) -> tuple[str | None, str | None]:
     if uc_match:
         use_case = uc_match.group(1).strip()
 
-    # Fallback: first non-empty line = title, rest = use case
     if not title and not use_case:
         lines = [l.strip() for l in clean.split('\n') if l.strip()]
         if lines:
@@ -130,9 +119,8 @@ def missing_info(title, use_case) -> list[str]:
 
 
 def validate_use_case(title: str | None, use_case: str | None) -> str | None:
-    """Return an error message if the use case lacks substance, None if OK."""
     if not use_case:
-        return None  # handled separately by missing_info
+        return None
 
     uc = use_case.strip()
     if len(uc.split()) < 4 or len(uc) < 20:
@@ -206,9 +194,16 @@ def found_ticket_blocks(tickets: list[dict], channel: str, thread_ts: str) -> li
             {
                 "type": "button",
                 "text": {"type": "plain_text", "text": "➕ Kein Ticket passt — neues anlegen"},
+                "style": "primary",
                 "action_id": "reject_similar_create_ticket",
                 "value": f"{channel}|||{thread_ts}",
-            }
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "❌ Kein Ticket nötig"},
+                "action_id": "cancel_create_ticket",
+                "value": f"{channel}|||{thread_ts}",
+            },
         ],
     })
     return blocks
@@ -245,8 +240,12 @@ def _set_done(client, channel: str, ts: str):
     _add_reaction(client, channel, ts, 'white_check_mark')
 
 
+def _set_cancelled(client, channel: str, ts: str):
+    _remove_reaction(client, channel, ts, 'eyes')
+    _add_reaction(client, channel, ts, 'x')
+
+
 def _cleanup_expired_pending(client):
-    """Remove pending states older than 72h and mark their root messages as done."""
     now = time.time()
     expired = [
         key for key, state in list(_pending.items())
@@ -263,57 +262,37 @@ def _cleanup_expired_pending(client):
 # Core processing
 # ---------------------------------------------------------------------------
 
-def _show_confirm_create(say, channel: str, thread_ts: str, data: dict):
-    """Show the ✅/❌ confirmation buttons, storing data for the action handler."""
-    _ticket_data[(channel, thread_ts)] = data
-    images = data.get('images') or []
-    image_note = ''
-    if images:
-        names = ', '.join(f.get('name', 'Bild') for f in images)
-        image_note = f"\n\n:frame_with_picture: Anhänge werden mitgeschickt: _{names}_"
-    optimized_note = '\n\n✨ _Für Jira formatiert._' if data.get('optimized') else ''
-    # If use_case already carries structured sections, show them directly
-    _structured = '*Problem:*' in data['use_case'] or '*Auswirkung:*' in data['use_case']
-    desc_display = data['use_case'] if _structured else f"*Beschreibung:*\n{data['use_case']}"
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f":pencil: Kein passendes Ticket gefunden — soll ich ein neues anlegen?\n\n"
-                    f"*Titel:* {data['title']}\n\n"
-                    f"{desc_display}"
-                    f"{image_note}"
-                    f"{optimized_note}"
-                ),
-            },
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "✅ Ja, Ticket erstellen"},
-                    "style": "primary",
-                    "action_id": "confirm_create_ticket",
-                    "value": f"{channel}|||{thread_ts}",
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "❌ Nein, abbrechen"},
-                    "action_id": "cancel_create_ticket",
-                    "value": "cancel",
-                },
-            ],
-        },
-    ]
-    say(blocks=blocks, text="Neues Ticket erstellen?", thread_ts=thread_ts)
+def _do_create_ticket(say, client, channel: str, thread_ts: str, ctx: dict):
+    """Optimize and create a Jira ticket, then post the result in Slack."""
+    opt_title, opt_description = optimize_ticket(ctx['title'], ctx['use_case'])
+    try:
+        ticket = create_ticket(
+            summary=opt_title,
+            use_case=opt_description,
+            user_name=ctx['user_name'],
+            request_date=ctx['request_date'],
+            slack_link=ctx.get('slack_link', ''),
+            images=ctx.get('images', []),
+            slack_token=SLACK_BOT_TOKEN,
+        )
+        say(
+            blocks=format_ticket_created(ticket),
+            text=f"Ticket {ticket['key']} erstellt",
+            thread_ts=thread_ts,
+        )
+        _set_done(client, channel, thread_ts)
+    except Exception as e:
+        logger.exception("Ticket creation failed")
+        say(
+            blocks=format_error(f"Fehler beim Erstellen des Tickets: {str(e)}"),
+            text="Fehler",
+            thread_ts=thread_ts,
+        )
 
 
 def _process_request(say, client, channel, thread_ts, user_id, user_name, request_date,
                      title, use_case, images=None):
-    """Search Jira CS board and respond appropriately."""
+    """Search Jira CS board — show similar tickets or create one directly."""
     images = images or []
     slack_link = slack_message_link(channel, thread_ts)
 
@@ -339,9 +318,9 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
     }
 
     if similar:
-        # Store context in BOTH dicts so rejection handler finds it even after restart
+        # Store context so the rejection button handler can find it
         _similar_shown[(channel, thread_ts)] = ctx_data
-        _ticket_data[(channel, thread_ts)] = ctx_data  # backup for rejection flow
+        _ticket_data[(channel, thread_ts)] = ctx_data
         say(
             blocks=found_ticket_blocks(similar, channel, thread_ts),
             text="Ähnliche Tickets gefunden",
@@ -349,14 +328,8 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
         )
         return
 
-    # No similar tickets — optimize title + description, then ask to confirm
-    opt_title, opt_description = optimize_ticket(title, use_case)
-    was_optimized = (opt_title != title or opt_description != use_case)
-    ctx_data['title'] = opt_title
-    ctx_data['use_case'] = opt_description
-    ctx_data['optimized'] = was_optimized
-
-    _show_confirm_create(say, channel, thread_ts, ctx_data)
+    # No similar tickets — create directly
+    _do_create_ticket(say, client, channel, thread_ts, ctx_data)
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +374,7 @@ def _handle_message_core(event, say, client):
         if state and state.get('user_id') == user_id:
             title_parsed, uc_parsed = parse_request(text)
 
-            # If the user explicitly labels a title in their reply, always use it
-            # (the stored title might be a raw, unlabelled fallback from the original msg)
+            # Always respect an explicitly labelled title from the reply
             if title_parsed:
                 state['title'] = title_parsed
             elif not state.get('title'):
@@ -465,7 +437,7 @@ def _handle_message_core(event, say, client):
                 )
             return
 
-        # --- User rejects similar tickets via text → offer to create new ticket ---
+        # --- User rejects similar tickets via text → create new ticket directly ---
         rejection_match = REJECTION_RE.search(text)
         logger.info(
             f"Thread reply: rejection_match={bool(rejection_match)}, "
@@ -520,7 +492,7 @@ def _handle_message_core(event, say, client):
                     'images': root_images,
                 }
 
-            _show_confirm_create(say, channel, thread_ts, ctx)
+            _do_create_ticket(say, client, channel, thread_ts, ctx)
             return
 
         # --- #improvement trigger inside a thread → read from original message ---
@@ -651,11 +623,7 @@ def handle_message(event, say, client):
 
 @app.event({"type": "message", "subtype": "file_share"})
 def handle_file_share_message(event, say, client):
-    """Explicit handler for messages that include file/image uploads.
-
-    Bolt may not dispatch file_share events to the generic message handler,
-    so we register a dedicated listener here to be safe.
-    """
+    """Explicit handler for messages that include file/image uploads."""
     _handle_message_core(event, say, client)
 
 
@@ -665,7 +633,7 @@ def handle_file_share_message(event, say, client):
 
 @app.action("reject_similar_create_ticket")
 def handle_reject_similar(ack, body, say, client):
-    """User clicked 'Kein Ticket passt — neues anlegen' button."""
+    """User clicked '➕ Kein Ticket passt — neues anlegen' button."""
     ack()
     value = body['actions'][0]['value']
     try:
@@ -714,54 +682,26 @@ def handle_reject_similar(ack, body, say, client):
             'images': root_images,
         }
 
-    _show_confirm_create(say, channel, thread_ts, ctx)
-
-
-@app.action("confirm_create_ticket")
-def handle_confirm_create(ack, body, say, client):
-    ack()
-    value = body['actions'][0]['value']
-    try:
-        channel, thread_ts = value.split('|||')
-    except ValueError:
-        say(text="Fehler beim Verarbeiten der Anfrage.", thread_ts=body.get('message', {}).get('thread_ts'))
-        return
-
-    data = _ticket_data.pop((channel, thread_ts), None)
-    if not data:
-        say(text="Fehler: Ticket-Daten nicht mehr verfügbar.", thread_ts=thread_ts)
-        return
-
-    try:
-        ticket = create_ticket(
-            summary=data['title'],
-            use_case=data['use_case'],
-            user_name=data['user_name'],
-            request_date=data['request_date'],
-            slack_link=data.get('slack_link', ''),
-            images=data.get('images', []),
-            slack_token=SLACK_BOT_TOKEN,
-        )
-        say(
-            blocks=format_ticket_created(ticket),
-            text=f"Ticket {ticket['key']} erstellt",
-            thread_ts=thread_ts,
-        )
-        _set_done(client, channel, thread_ts)
-    except Exception as e:
-        logger.exception("Ticket creation failed")
-        say(
-            blocks=format_error(f"Fehler beim Erstellen des Tickets: {str(e)}"),
-            text="Fehler",
-            thread_ts=thread_ts,
-        )
+    _do_create_ticket(say, client, channel, thread_ts, ctx)
 
 
 @app.action("cancel_create_ticket")
-def handle_cancel(ack, body, say):
+def handle_cancel(ack, body, say, client):
+    """User clicked '❌ Kein Ticket nötig' — remove 👀 and add ❌ on root message."""
     ack()
-    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
-    say(text=":ok: Kein Problem — kein Ticket wurde erstellt.", thread_ts=thread_ts)
+    value = body['actions'][0].get('value', '')
+    try:
+        channel, thread_ts = value.split('|||')
+    except ValueError:
+        channel = body.get('channel', {}).get('id', '')
+        thread_ts = (
+            body.get('message', {}).get('thread_ts')
+            or body.get('message', {}).get('ts')
+        )
+    _similar_shown.pop((channel, thread_ts), None)
+    _ticket_data.pop((channel, thread_ts), None)
+    _set_cancelled(client, channel, thread_ts)
+    say(text=":x: OK — kein Ticket wird erstellt.", thread_ts=thread_ts)
 
 
 @app.action("create_ticket_button")
