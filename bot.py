@@ -338,8 +338,8 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
         return
 
     if similar:
-        # Store context so we can create a ticket if user rejects all suggestions
-        _similar_shown[(channel, thread_ts)] = {
+        # Store context in BOTH dicts so rejection handler finds it even after restart
+        ctx_data = {
             'user_id': user_id,
             'user_name': user_name,
             'request_date': request_date,
@@ -347,6 +347,8 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
             'use_case': use_case,
             'slack_link': slack_link,
         }
+        _similar_shown[(channel, thread_ts)] = ctx_data
+        _ticket_data[(channel, thread_ts)] = ctx_data  # backup for rejection flow
         say(
             blocks=found_ticket_blocks(similar),
             text="Ähnliche Tickets gefunden",
@@ -463,35 +465,43 @@ def handle_message(event, say, client):
         rejection_match = REJECTION_RE.search(text)
         logger.info(
             f"Thread reply: rejection_match={bool(rejection_match)}, "
-            f"similar_shown_key_exists={(channel, thread_ts) in _similar_shown}, "
+            f"similar_shown={( channel, thread_ts) in _similar_shown}, "
+            f"ticket_data={(channel, thread_ts) in _ticket_data}, "
             f"text={text!r}"
         )
         if rejection_match:
+            # Check in-memory caches first (fast path, works without API call)
             ctx = _similar_shown.pop((channel, thread_ts), None)
+            if not ctx:
+                ctx = _ticket_data.pop((channel, thread_ts), None)
 
             if not ctx:
-                # In-memory context lost (e.g. after restart) — reconstruct from thread root
+                # Both caches empty (e.g. after restart) — try to reconstruct from Slack thread
+                logger.warning(f"Rejection in {channel}/{thread_ts} but no context in memory — fetching thread root")
                 try:
                     result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
                     messages = result.get('messages', [])
                     root_msg = messages[0] if messages else {}
                     root_text = root_msg.get('text', '')
                     root_user = root_msg.get('user', user_id)
-                except Exception:
-                    logger.exception("Could not fetch thread root for rejection fallback")
+                    logger.info(f"Thread root fetched: user={root_user}, text={root_text[:80]!r}")
+                except Exception as e:
+                    logger.warning(f"conversations_replies failed: {e}")
                     root_text = ''
                     root_user = user_id
 
                 if '#improvement' not in root_text.lower():
-                    return  # not an improvement thread — ignore
+                    logger.info("Thread root has no #improvement — ignoring rejection")
+                    return
 
                 title, use_case = parse_request(root_text)
                 if not title or not use_case:
                     say(
                         text=(
-                            ":thinking_face: Ich konnte die ursprüngliche Anfrage nicht "
-                            "vollständig rekonstruieren. Bitte ergänze Titel und Use Case "
-                            "hier im Thread, damit ich das Ticket anlegen kann."
+                            ":thinking_face: Kein Problem! Mein Kurzzeitgedächtnis wurde durch "
+                            "ein Server-Update gelöscht.\n"
+                            "Schreib bitte `#improvement` erneut in diesen Thread mit Titel "
+                            "und Use Case — dann lege ich das Ticket direkt an."
                         ),
                         thread_ts=thread_ts,
                     )
