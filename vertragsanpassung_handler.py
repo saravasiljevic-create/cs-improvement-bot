@@ -181,19 +181,39 @@ def missing_va_fields(parsed: dict) -> list[str]:
     return out
 
 
-def ask_for_va_info_blocks(user_id: str, missing: list[str]) -> list[dict]:
-    items = '\n'.join(f'• {m}' for m in missing)
-    return [{
-        'type': 'section',
-        'text': {
-            'type': 'mrkdwn',
-            'text': (
-                f"Hey <@{user_id}> :wave: Ich habe eine *Vertragsanpassungs-Anfrage* erkannt.\n\n"
-                f"Mir fehlen noch folgende Angaben:\n{items}\n\n"
-                "Bitte ergänze diese Informationen hier im Thread."
-            ),
-        },
-    }]
+def _format_found_fields(parsed: dict) -> str:
+    """Formatiert die bereits erkannten Felder für die Slack-Nachricht."""
+    lines = []
+    if parsed.get('customer_name'):
+        lines.append(f"• *Kunde:* {parsed['customer_name']}")
+    if parsed.get('new_plan'):
+        lines.append(f"• *Neuer Plan:* {parsed['new_plan']}")
+    if parsed.get('payment_type'):
+        lines.append(f"• *Zahlweise:* {parsed['payment_type']}")
+    if parsed.get('effective_date'):
+        lines.append(f"• *Vertragsbeginn:* {parsed['effective_date']}")
+    if parsed.get('offer_link'):
+        lines.append(f"• *Angebots-Link:* {parsed['offer_link']}")
+    if parsed.get('addons_add'):
+        lines.append(f"• *Add-Ons hinzufügen:* {parsed['addons_add']}")
+    if parsed.get('addons_remove'):
+        lines.append(f"• *Add-Ons entfernen:* {parsed['addons_remove']}")
+    if parsed.get('berichtswesen_tier'):
+        lines.append(f"• *Berichtswesen-Tier:* `{parsed['berichtswesen_tier']}`")
+    return '\n'.join(lines)
+
+
+def ask_for_va_info_blocks(user_id: str, missing: list[str], parsed: dict | None = None) -> list[dict]:
+    parsed = parsed or {}
+    found = _format_found_fields(parsed)
+    missing_items = '\n'.join(f'• {m}' for m in missing)
+
+    text = f"Hey <@{user_id}> :wave: Ich habe eine *Vertragsanpassungs-Anfrage* erkannt.\n\n"
+    if found:
+        text += f"*Bereits erkannt:*\n{found}\n\n"
+    text += f"*Mir fehlen noch:*\n{missing_items}\n\nBitte ergänze diese Informationen hier im Thread."
+
+    return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
 
 
 # ---------------------------------------------------------------------------

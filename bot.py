@@ -416,7 +416,7 @@ def _handle_message_core(event, say, client):
             missing = missing_va_fields(va_state['parsed'])
             if missing:
                 say(
-                    blocks=ask_for_va_info_blocks(user_id, missing),
+                    blocks=ask_for_va_info_blocks(user_id, missing, va_state['parsed']),
                     text="Fehlende Informationen",
                     thread_ts=thread_ts,
                 )
@@ -453,7 +453,7 @@ def _handle_message_core(event, say, client):
                     'created_at': time.time(),
                 }
                 say(
-                    blocks=ask_for_va_info_blocks(user_id, missing),
+                    blocks=ask_for_va_info_blocks(user_id, missing, parsed),
                     text="Vertragsanpassung — fehlende Informationen",
                     thread_ts=thread_ts,
                 )
@@ -675,7 +675,7 @@ def _handle_message_core(event, say, client):
                 'created_at': time.time(),
             }
             say(
-                blocks=ask_for_va_info_blocks(user_id, missing),
+                blocks=ask_for_va_info_blocks(user_id, missing, parsed),
                 text="Vertragsanpassung erkannt — fehlende Informationen",
                 thread_ts=ts,
             )
