@@ -320,13 +320,12 @@ def _format_found_fields(parsed: dict, subscription: dict | None = None) -> str:
     if parsed.get('customer_name'):
         lines.append(f"• *Kunde:* {parsed['customer_name']}")
     if subscription:
-        cb_info = f"<{subscription['url']}|{subscription['subscription_id']}>"
+        lines.append(f"• *Chargebee:* <{subscription['url']}|{subscription['subscription_id']}>")
         if subscription.get('plan_id'):
-            cb_info += f"  (`{subscription['plan_id']}`"
+            plan_info = f"`{subscription['plan_id']}`"
             if subscription.get('billing_cycle'):
-                cb_info += f", {subscription['billing_cycle']}"
-            cb_info += ")"
-        lines.append(f"• *Chargebee:* {cb_info}")
+                plan_info += f" · {subscription['billing_cycle']}"
+            lines.append(f"• *Aktueller Plan:* {plan_info}")
         if subscription.get('addons'):
             lines.append(f"• *Aktive Add-Ons:* {', '.join(subscription['addons'])}")
         if subscription.get('coupons'):
