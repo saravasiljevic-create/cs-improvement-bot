@@ -274,12 +274,13 @@ def _planhat_company_search(customer_name: str, api_token: str) -> dict | None:
                 if companies:
                     company = companies[0]
                     ph_id = company.get('_id', '')
-                    # 'externalId' in Planhat = Chargebee subscription ID (serial)
-                    subscription_id = company.get('externalId', '')
+                    # externalId in Planhat = Chargebee Customer-ID
+                    # (der Chargebee-Link auf der Planhat-Company-Seite zeigt auf den Customer)
+                    chargebee_id = company.get('externalId', '')
                     return {
                         'planhat_id': ph_id,
                         'name': company.get('name', customer_name),
-                        'subscription_id': subscription_id,
+                        'chargebee_id': chargebee_id,
                         'planhat_url': f"https://app.planhat.com/customer/{ph_id}",
                     }
         except Exception as e:
@@ -396,13 +397,38 @@ def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str,
 
     logger.info(f"Starte Planhat-Fallback für '{customer_name}'")
     ph = _planhat_company_search(customer_name, planhat_token)
-    if not ph or not ph.get('subscription_id'):
-        logger.info(f"Planhat: kein Treffer oder keine Subscription-ID für '{customer_name}'")
+    if not ph or not ph.get('chargebee_id'):
+        logger.info(f"Planhat: kein Treffer oder keine Chargebee-ID für '{customer_name}'")
         return None
 
-    sub_id = ph['subscription_id']
-    logger.info(f"Planhat: '{ph['name']}' → Subscription '{sub_id}' — lade aus Chargebee")
-    result = _fetch_subscription_by_id(sub_id, api_key, site)
+    chargebee_id = ph['chargebee_id']
+    logger.info(f"Planhat: '{ph['name']}' → Chargebee-ID '{chargebee_id}'")
+
+    # externalId kann Customer-ID oder Subscription-ID sein — beide versuchen
+    # Versuch 1: als Customer-ID → Subscriptions laden
+    try:
+        resp = requests.get(
+            f"{base}/subscriptions",
+            params={'customer_id': chargebee_id, 'limit': 10},
+            auth=auth, timeout=10,
+        )
+        logger.info(f"Chargebee subscriptions?customer_id={chargebee_id}: status={resp.status_code}")
+        if resp.ok:
+            subs = resp.json().get('list', [])
+            active = [s['subscription'] for s in subs if s['subscription'].get('status') == 'active']
+            candidates = active or [s['subscription'] for s in subs if 'subscription' in s]
+            _STD = re.compile(r'^\d{4}-\d{4}-\d{4}-\d{4}$')
+            standard = [s for s in candidates if _STD.match(s.get('id', ''))]
+            sub = (standard or candidates)[0] if candidates else None
+            if sub:
+                result = _build_subscription_result(sub, site)
+                result['company'] = ph['name']
+                return result
+    except Exception as e:
+        logger.warning(f"Planhat fallback (customer_id) failed: {e}")
+
+    # Versuch 2: als Subscription-ID direkt
+    result = _fetch_subscription_by_id(chargebee_id, api_key, site)
     if result:
         result['company'] = ph['name']
     return result
