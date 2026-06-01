@@ -164,7 +164,7 @@ def ask_for_info_blocks(user_id: str, missing: list[str]) -> list[dict]:
     ]
 
 
-def found_ticket_blocks(tickets: list[dict]) -> list[dict]:
+def found_ticket_blocks(tickets: list[dict], channel: str, thread_ts: str) -> list[dict]:
     blocks = [
         {
             "type": "section",
@@ -192,11 +192,20 @@ def found_ticket_blocks(tickets: list[dict]) -> list[dict]:
             "text": (
                 ":point_up: Wenn dein Request durch eines dieser Tickets abgedeckt ist, "
                 "schreibe die *Ticket-Nummer* (z.B. `CS-123`) hier in den Thread — "
-                "ich erledige das Upvoting automatisch! :thumbsup:\n\n"
-                "Wenn *keines* der Tickets passt, schreibe es kurz in den Thread "
-                "(z.B. _„Die Tickets passen nicht"_) — ich lege dann ein neues Ticket an."
+                "ich erledige das Upvoting automatisch! :thumbsup:"
             ),
         },
+    })
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "➕ Kein Ticket passt — neues anlegen"},
+                "action_id": "reject_similar_create_ticket",
+                "value": f"{channel}|||{thread_ts}",
+            }
+        ],
     })
     return blocks
 
@@ -350,7 +359,7 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
         _similar_shown[(channel, thread_ts)] = ctx_data
         _ticket_data[(channel, thread_ts)] = ctx_data  # backup for rejection flow
         say(
-            blocks=found_ticket_blocks(similar),
+            blocks=found_ticket_blocks(similar, channel, thread_ts),
             text="Ähnliche Tickets gefunden",
             thread_ts=thread_ts,
         )
@@ -629,6 +638,59 @@ def handle_message(event, say, client):
         title=title,
         use_case=use_case,
     )
+
+
+@app.action("reject_similar_create_ticket")
+def handle_reject_similar(ack, body, say, client):
+    """User clicked 'Kein Ticket passt — neues anlegen' button."""
+    ack()
+    value = body['actions'][0]['value']
+    try:
+        channel, thread_ts = value.split('|||')
+    except ValueError:
+        say(text="Fehler beim Verarbeiten der Anfrage.", thread_ts=body.get('message', {}).get('thread_ts'))
+        return
+
+    # Try in-memory caches first
+    ctx = _similar_shown.pop((channel, thread_ts), None) or _ticket_data.get((channel, thread_ts))
+
+    if not ctx:
+        # Reconstruct from thread root via Slack API
+        logger.info(f"reject_similar: no in-memory context for {channel}/{thread_ts} — fetching thread root")
+        try:
+            result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
+            messages = result.get('messages', [])
+            root_msg = messages[0] if messages else {}
+            root_text = root_msg.get('text', '')
+            root_user = root_msg.get('user', '')
+        except Exception as e:
+            logger.warning(f"conversations_replies failed in reject_similar: {e}")
+            root_text = ''
+            root_user = ''
+
+        title, use_case = parse_request(root_text) if root_text else (None, None)
+
+        if not title or not use_case:
+            say(
+                text=(
+                    ":thinking_face: Ich konnte deine ursprüngliche Anfrage nicht mehr laden.\n"
+                    "Bitte schreib `#improvement` mit Titel und Use Case nochmal in den Thread — "
+                    "ich lege das Ticket dann direkt an."
+                ),
+                thread_ts=thread_ts,
+            )
+            return
+
+        ctx = {
+            'user_id': root_user,
+            'user_name': get_user_name(client, root_user) if root_user else 'Unbekannt',
+            'request_date': ts_to_date(thread_ts),
+            'title': title,
+            'use_case': use_case,
+            'slack_link': slack_message_link(channel, thread_ts),
+        }
+
+    _show_confirm_create(say, channel, thread_ts, ctx)
 
 
 @app.action("confirm_create_ticket")
