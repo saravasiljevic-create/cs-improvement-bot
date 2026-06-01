@@ -65,7 +65,7 @@ def search_similar_tickets(title: str, use_case: str = ''):
     return results
 
 
-def add_vote(issue_key: str) -> dict:
+def add_vote(issue_key: str, user_name: str = 'CS Team') -> dict:
     """Record a CS-team upvote on a Jira issue.
 
     Attempts a real Jira vote first (works for tickets the bot didn't create).
@@ -86,7 +86,7 @@ def add_vote(issue_key: str) -> dict:
     # Always add a comment so the upvote is visible regardless of vote settings
     date_str = datetime.now(tz=_tz.utc).strftime('%d.%m.%Y')
     try:
-        client.add_comment(issue_key, f"👍 *Upvote vom CS Team* ({date_str})")
+        client.add_comment(issue_key, f"👍 *Upvote von {user_name}* ({date_str})")
     except Exception as e:
         print(f"add_comment({issue_key}) failed: {e}")
 

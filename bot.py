@@ -418,7 +418,7 @@ def _handle_message_core(event, say, client):
         if jira_match:
             issue_key = jira_match.group(1)
             try:
-                issue = add_vote(issue_key)
+                issue = add_vote(issue_key, user_name=user_name)
                 say(
                     text=(
                         f":thumbsup: Ich habe dein Upvote auf "
