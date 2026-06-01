@@ -182,8 +182,7 @@ def missing_va_fields(parsed: dict) -> list[str]:
         out.append('*Zahlweise* — jährlich oder monatlich?')
     if not parsed.get('effective_date'):
         out.append('*Vertragsbeginn / Effective Date* — ab wann gilt die Änderung?')
-    if not parsed.get('offer_link'):
-        out.append('*Link zum unterschriebenen Angebot*')
+    # offer_link ist optional — wird in der Summary angezeigt wenn vorhanden
     return out
 
 
