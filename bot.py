@@ -363,15 +363,19 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
 # Event handlers
 # ---------------------------------------------------------------------------
 
-@app.event("message")
-def handle_message(event, say, client):
+def _handle_message_core(event, say, client):
+    """Core message processing logic, shared by the generic and file_share handlers."""
+    subtype = event.get('subtype')
+    logger.info(
+        f"Incoming message: subtype={subtype!r}, channel={event.get('channel')!r}, "
+        f"has_files={bool(event.get('files'))}, thread={event.get('thread_ts')!r}"
+    )
+
     if event.get('bot_id'):
         return
     if event.get('channel') != SLACK_CHANNEL_ID:
         return
-    # Allow file_share (user message with image/attachment) through;
-    # skip everything else that carries a subtype (edits, deletes, joins, …)
-    subtype = event.get('subtype')
+    # Skip system subtypes (edits, deletes, joins, …) but allow file_share through
     if subtype and subtype != 'file_share':
         return
 
@@ -385,7 +389,7 @@ def handle_message(event, say, client):
     user_name = get_user_name(client, user_id)
     request_date = ts_to_date(thread_ts or ts)
 
-    logger.info(f"Message: channel={channel}, thread={thread_ts}, user={user_id} ({user_name})")
+    logger.info(f"Processing: channel={channel}, thread={thread_ts}, user={user_id} ({user_name})")
 
     # -----------------------------------------------------------------------
     # THREAD REPLY
@@ -634,6 +638,25 @@ def handle_message(event, say, client):
         images=images,
     )
 
+
+@app.event("message")
+def handle_message(event, say, client):
+    _handle_message_core(event, say, client)
+
+
+@app.event({"type": "message", "subtype": "file_share"})
+def handle_file_share_message(event, say, client):
+    """Explicit handler for messages that include file/image uploads.
+
+    Bolt may not dispatch file_share events to the generic message handler,
+    so we register a dedicated listener here to be safe.
+    """
+    _handle_message_core(event, say, client)
+
+
+# ---------------------------------------------------------------------------
+# Action handlers
+# ---------------------------------------------------------------------------
 
 @app.action("reject_similar_create_ticket")
 def handle_reject_similar(ack, body, say, client):
