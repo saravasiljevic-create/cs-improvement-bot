@@ -352,14 +352,19 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
 # Vertragsanpassungs-Flow helpers
 # ---------------------------------------------------------------------------
 
+def _cb_lookup(customer_name: str) -> dict | None:
+    """Chargebee-Lookup wenn API-Key konfiguriert, sonst None."""
+    if customer_name and CHARGEBEE_API_KEY:
+        return lookup_chargebee_subscription(customer_name, CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+    return None
+
+
 def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
-                                user_name: str, parsed: dict):
-    """Chargebee-Lookup (read-only) + Zusammenfassung in Slack posten."""
-    subscription = None
-    if parsed.get('customer_name') and CHARGEBEE_API_KEY:
-        subscription = lookup_chargebee_subscription(
-            parsed['customer_name'], CHARGEBEE_API_KEY, CHARGEBEE_SITE
-        )
+                                user_name: str, parsed: dict,
+                                subscription: dict | None = None):
+    """Zusammenfassung in Slack posten. Subscription wird wiederverwendet wenn bereits geladen."""
+    if subscription is None:
+        subscription = _cb_lookup(parsed.get('customer_name', ''))
     blocks = build_va_summary_blocks(parsed, subscription, user_name)
     say(blocks=blocks, text="📋 Vertragsanpassung — Zusammenfassung", thread_ts=thread_ts)
     _set_done(client, channel, thread_ts)
@@ -413,17 +418,22 @@ def _handle_message_core(event, say, client):
             for k, v in new_parsed.items():
                 if v and not va_state['parsed'].get(k):
                     va_state['parsed'][k] = v
+            # Try Chargebee lookup now if customer_name just became available
+            if not va_state.get('subscription') and va_state['parsed'].get('customer_name'):
+                va_state['subscription'] = _cb_lookup(va_state['parsed']['customer_name'])
             missing = missing_va_fields(va_state['parsed'])
             if missing:
                 say(
-                    blocks=ask_for_va_info_blocks(user_id, missing, va_state['parsed']),
+                    blocks=ask_for_va_info_blocks(
+                        user_id, missing, va_state['parsed'], va_state.get('subscription')
+                    ),
                     text="Fehlende Informationen",
                     thread_ts=thread_ts,
                 )
             else:
                 _process_vertragsanpassung(
                     say, client, channel, thread_ts,
-                    va_state['user_name'], va_state['parsed'],
+                    va_state['user_name'], va_state['parsed'], va_state.get('subscription'),
                 )
             return
 
@@ -444,21 +454,23 @@ def _handle_message_core(event, say, client):
                 root_text = ''
             _set_eyes(client, channel, thread_ts)
             parsed = parse_vertragsanpassung(root_text or text)
+            subscription = _cb_lookup(parsed.get('customer_name', ''))
             missing = missing_va_fields(parsed)
             if missing:
                 _pending_vertragsanpassung[(channel, thread_ts)] = {
                     'parsed': parsed,
                     'user_id': user_id,
                     'user_name': user_name,
+                    'subscription': subscription,
                     'created_at': time.time(),
                 }
                 say(
-                    blocks=ask_for_va_info_blocks(user_id, missing, parsed),
+                    blocks=ask_for_va_info_blocks(user_id, missing, parsed, subscription),
                     text="Vertragsanpassung — fehlende Informationen",
                     thread_ts=thread_ts,
                 )
             else:
-                _process_vertragsanpassung(say, client, channel, thread_ts, user_name, parsed)
+                _process_vertragsanpassung(say, client, channel, thread_ts, user_name, parsed, subscription)
             return
 
         state = _pending.get((channel, thread_ts))
@@ -666,21 +678,23 @@ def _handle_message_core(event, say, client):
     if _in_va and detect_vertragsanpassung(text):
         _set_eyes(client, channel, ts)
         parsed = parse_vertragsanpassung(text)
+        subscription = _cb_lookup(parsed.get('customer_name', ''))
         missing = missing_va_fields(parsed)
         if missing:
             _pending_vertragsanpassung[(channel, ts)] = {
                 'parsed': parsed,
                 'user_id': user_id,
                 'user_name': user_name,
+                'subscription': subscription,
                 'created_at': time.time(),
             }
             say(
-                blocks=ask_for_va_info_blocks(user_id, missing, parsed),
+                blocks=ask_for_va_info_blocks(user_id, missing, parsed, subscription),
                 text="Vertragsanpassung erkannt — fehlende Informationen",
                 thread_ts=ts,
             )
         else:
-            _process_vertragsanpassung(say, client, channel, ts, user_name, parsed)
+            _process_vertragsanpassung(say, client, channel, ts, user_name, parsed, subscription)
         return
 
     # --- Improvement: only react to #improvement tag ---

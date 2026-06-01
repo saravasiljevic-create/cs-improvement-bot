@@ -181,11 +181,16 @@ def missing_va_fields(parsed: dict) -> list[str]:
     return out
 
 
-def _format_found_fields(parsed: dict) -> str:
+def _format_found_fields(parsed: dict, subscription: dict | None = None) -> str:
     """Formatiert die bereits erkannten Felder für die Slack-Nachricht."""
     lines = []
     if parsed.get('customer_name'):
         lines.append(f"• *Kunde:* {parsed['customer_name']}")
+    if subscription:
+        lines.append(
+            f"• *Chargebee:* <{subscription['url']}|{subscription['subscription_id']}>"
+            f"  (`{subscription.get('plan_id') or '–'}`)"
+        )
     if parsed.get('new_plan'):
         lines.append(f"• *Neuer Plan:* {parsed['new_plan']}")
     if parsed.get('payment_type'):
@@ -203,9 +208,14 @@ def _format_found_fields(parsed: dict) -> str:
     return '\n'.join(lines)
 
 
-def ask_for_va_info_blocks(user_id: str, missing: list[str], parsed: dict | None = None) -> list[dict]:
+def ask_for_va_info_blocks(
+    user_id: str,
+    missing: list[str],
+    parsed: dict | None = None,
+    subscription: dict | None = None,
+) -> list[dict]:
     parsed = parsed or {}
-    found = _format_found_fields(parsed)
+    found = _format_found_fields(parsed, subscription)
     missing_items = '\n'.join(f'• {m}' for m in missing)
 
     text = f"Hey <@{user_id}> :wave: Ich habe eine *Vertragsanpassungs-Anfrage* erkannt.\n\n"
