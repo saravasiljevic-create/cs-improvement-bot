@@ -63,18 +63,19 @@ def search_similar_tickets(title: str, use_case: str = ''):
     return results
 
 
-def create_ticket(slack_user_id, original_text, summary=None):
-    """Create a new Jira task ticket from a Slack message."""
+def create_ticket(summary: str, use_case: str, user_name: str, request_date: str):
+    """Create a new Jira task ticket from a Slack improvement request."""
     try:
-        ticket_summary = summary or f"Slack request from user {slack_user_id}"
         description = (
-            f"This ticket was created automatically via the CS Improvement Bot.\n\n"
-            f"*Slack User ID:* {slack_user_id}\n\n"
-            f"*Original Message:*\n{original_text}"
+            f"*Beschreibung:*\n{use_case}\n\n"
+            f"*Anfrage von:* {user_name}\n"
+            f"*Datum der Anfrage:* {request_date}\n\n"
+            f"This ticket was created automatically via the CS Improvement Bot.\n"
+            f"*Autor:* {user_name}"
         )
         issue_dict = {
             'project': {'key': 'CS'},
-            'summary': ticket_summary,
+            'summary': summary,
             'description': description,
             'issuetype': {'name': 'Task'},
         }
@@ -84,7 +85,7 @@ def create_ticket(slack_user_id, original_text, summary=None):
         return {
             'key': new_issue.key,
             'url': f'{JIRA_SERVER_URL}/browse/{new_issue.key}',
-            'summary': ticket_summary,
+            'summary': summary,
         }
     except Exception as e:
         print(f"Error creating ticket: {str(e)}")

@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from datetime import datetime, timezone
 
 from flask import Flask, request
 from slack_bolt import App
@@ -21,13 +22,34 @@ app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
 
-# (channel, thread_ts) -> {'user_id': str, 'title': str|None, 'use_case': str|None}
+# (channel, thread_ts) -> {'user_id', 'user_name', 'request_date', 'title', 'use_case'}
 _pending: dict[tuple[str, str], dict] = {}
+# (channel, thread_ts) -> ticket data for confirm button
+_ticket_data: dict[tuple[str, str], dict] = {}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def get_user_name(client, user_id: str) -> str:
+    """Return the Slack display name or real name for a user."""
+    try:
+        info = client.users_info(user=user_id)
+        profile = info['user']['profile']
+        return profile.get('display_name') or profile.get('real_name') or user_id
+    except Exception:
+        return user_id
+
+
+def ts_to_date(ts: str) -> str:
+    """Convert Slack timestamp to readable date string (DD.MM.YYYY)."""
+    try:
+        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        return dt.strftime('%d.%m.%Y')
+    except Exception:
+        return ts
+
 
 def parse_request(text: str) -> tuple[str | None, str | None]:
     """Extract title and use case from a message.
@@ -146,8 +168,10 @@ def handle_message(event, say, client):
     ts = event.get('ts')
     thread_ts = event.get('thread_ts')
     user_id = event.get('user')
+    user_name = get_user_name(client, user_id)
+    request_date = ts_to_date(thread_ts or ts)
 
-    logger.info(f"Message: channel={channel}, thread={thread_ts}, user={user_id}")
+    logger.info(f"Message: channel={channel}, thread={thread_ts}, user={user_id} ({user_name})")
 
     # -----------------------------------------------------------------------
     # THREAD REPLY — bot is waiting for more info from this user
@@ -183,7 +207,9 @@ def handle_message(event, say, client):
             say=say,
             channel=channel,
             thread_ts=thread_ts,
-            user_id=user_id,
+            user_id=state['user_id'],
+            user_name=state.get('user_name', user_name),
+            request_date=state.get('request_date', request_date),
             title=state['title'],
             use_case=state['use_case'],
         )
@@ -199,9 +225,10 @@ def handle_message(event, say, client):
     still_missing = missing_info(title, use_case)
 
     if still_missing:
-        # Ask for missing info and store pending state
         _pending[(channel, ts)] = {
             'user_id': user_id,
+            'user_name': user_name,
+            'request_date': request_date,
             'title': title,
             'use_case': use_case,
         }
@@ -218,12 +245,14 @@ def handle_message(event, say, client):
         channel=channel,
         thread_ts=ts,
         user_id=user_id,
+        user_name=user_name,
+        request_date=request_date,
         title=title,
         use_case=use_case,
     )
 
 
-def _process_request(say, channel, thread_ts, user_id, title, use_case):
+def _process_request(say, channel, thread_ts, user_id, user_name, request_date, title, use_case):
     """Search Jira CS board and respond appropriately."""
     try:
         similar = search_similar_tickets(title=title, use_case=use_case)
@@ -244,7 +273,15 @@ def _process_request(say, channel, thread_ts, user_id, title, use_case):
         )
         return
 
-    # No similar tickets — ask user to confirm before creating
+    # No similar tickets — store data and ask user to confirm before creating
+    _ticket_data[(channel, thread_ts)] = {
+        'user_id': user_id,
+        'user_name': user_name,
+        'request_date': request_date,
+        'title': title,
+        'use_case': use_case,
+    }
+
     say(
         blocks=[
             {
@@ -267,7 +304,7 @@ def _process_request(say, channel, thread_ts, user_id, title, use_case):
                         "text": {"type": "plain_text", "text": "✅ Ja, Ticket erstellen"},
                         "style": "primary",
                         "action_id": "confirm_create_ticket",
-                        "value": f"{user_id}|||{title}|||{use_case}|||{thread_ts}",
+                        "value": f"{channel}|||{thread_ts}",
                     },
                     {
                         "type": "button",
@@ -288,13 +325,23 @@ def handle_confirm_create(ack, body, say):
     ack()
     value = body['actions'][0]['value']
     try:
-        user_id, title, use_case, thread_ts = value.split('|||')
+        channel, thread_ts = value.split('|||')
     except ValueError:
         say(text="Fehler beim Verarbeiten der Anfrage.", thread_ts=body.get('message', {}).get('thread_ts'))
         return
 
+    data = _ticket_data.pop((channel, thread_ts), None)
+    if not data:
+        say(text="Fehler: Ticket-Daten nicht mehr verfügbar.", thread_ts=thread_ts)
+        return
+
     try:
-        ticket = create_ticket(slack_user_id=user_id, original_text=use_case, summary=title)
+        ticket = create_ticket(
+            summary=data['title'],
+            use_case=data['use_case'],
+            user_name=data['user_name'],
+            request_date=data['request_date'],
+        )
         say(
             blocks=format_ticket_created(ticket),
             text=f"Ticket {ticket['key']} erstellt",
