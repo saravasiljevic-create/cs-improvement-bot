@@ -23,13 +23,27 @@ app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
 
-# (channel, thread_ts) -> {'user_id', 'user_name', 'request_date', 'title', 'use_case', 'created_at'}
+# (channel, thread_ts) -> {'user_id', 'user_name', 'request_date', 'title', 'use_case', 'slack_link', 'created_at'}
 _pending: dict[tuple[str, str], dict] = {}
-# (channel, thread_ts) -> ticket data for confirm button
+# (channel, thread_ts) -> ticket data stored after similar-ticket flow or no-match flow
 _ticket_data: dict[tuple[str, str], dict] = {}
+# (channel, thread_ts) -> context stored when similar tickets were shown (for rejection re-trigger)
+_similar_shown: dict[tuple[str, str], dict] = {}
 
 JIRA_KEY_RE = re.compile(r'\b([A-Z]+-\d+)\b')
 PENDING_TTL = 72 * 3600  # 72 hours in seconds
+
+# Phrases that signal the user thinks the suggested tickets don't match their request
+REJECTION_RE = re.compile(
+    r'passen?\s+nicht|passt?\s+nicht|nicht\s+passend|'
+    r'trifft?\s+nicht\s+zu|stimmt?\s+nicht|'
+    r'kein[e]?\s*(?:match|treffer|übereinstimmung)|'
+    r'nicht\s+(?:relevant|zutreffend|richtig|das\s+gleiche|was\s+ich\s+meine|gemeint)|'
+    r'anders|falsch|wrong|'
+    r'not\s+(?:relevant|matching|applicable|right)|'
+    r"doesn'?t\s+match|don'?t\s+match|no\s+match",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +69,11 @@ def ts_to_date(ts: str) -> str:
         return ts
 
 
+def slack_message_link(channel: str, ts: str) -> str:
+    """Build a deep link to a Slack message."""
+    return f"https://slack.com/archives/{channel}/p{ts.replace('.', '')}"
+
+
 def parse_request(text: str) -> tuple[str | None, str | None]:
     """Extract title and use case from a message.
 
@@ -62,7 +81,6 @@ def parse_request(text: str) -> tuple[str | None, str | None]:
     or falls back to first-line = title, rest = use case.
     """
     clean = re.sub(r'#improvement', '', text, flags=re.IGNORECASE).strip()
-    # Remove Slack user mentions for parsing
     clean = re.sub(r'<@[A-Z0-9]+>', '', clean).strip()
 
     title: str | None = None
@@ -99,6 +117,34 @@ def missing_info(title, use_case) -> list[str]:
     if not use_case:
         missing.append('*Use Case / Beschreibung* (warum ist das wichtig und wie wird es genutzt?)')
     return missing
+
+
+def validate_use_case(title: str | None, use_case: str | None) -> str | None:
+    """Return an error message if the use case lacks substance, None if it's OK.
+
+    Checks:
+    - Minimum word count (< 4 words → too short)
+    - Minimum character length (< 20 chars → too short)
+    - Not identical to the title (copy-paste)
+    """
+    if not use_case:
+        return None  # handled separately by missing_info
+
+    uc = use_case.strip()
+    if len(uc.split()) < 4 or len(uc) < 20:
+        return (
+            ":pencil2: Der *Use Case* ist sehr kurz. "
+            "Bitte erkläre etwas ausführlicher: *warum* ist das wichtig, "
+            "*wie* wird es genutzt und welchen *Mehrwert* bringt die Verbesserung?"
+        )
+
+    if title and uc.lower() == title.lower():
+        return (
+            ":pencil2: Der *Use Case* entspricht dem Titel. "
+            "Bitte beschreibe den Hintergrund und den Mehrwert etwas genauer."
+        )
+
+    return None
 
 
 def ask_for_info_blocks(user_id: str, missing: list[str]) -> list[dict]:
@@ -144,13 +190,50 @@ def found_ticket_blocks(tickets: list[dict]) -> list[dict]:
         "text": {
             "type": "mrkdwn",
             "text": (
-                ":point_up: Wenn dein Request bereits durch eines dieser Tickets abgedeckt ist, "
-                "schreibe einfach die *Ticket-Nummer* (z.B. `CS-123`) hier in den Thread — "
-                "ich erledige das Upvoting automatisch für dich! :thumbsup:"
+                ":point_up: Wenn dein Request durch eines dieser Tickets abgedeckt ist, "
+                "schreibe die *Ticket-Nummer* (z.B. `CS-123`) hier in den Thread — "
+                "ich erledige das Upvoting automatisch! :thumbsup:\n\n"
+                "Wenn *keines* der Tickets passt, schreibe es kurz in den Thread "
+                "(z.B. _„Die Tickets passen nicht"_) — ich lege dann ein neues Ticket an."
             ),
         },
     })
     return blocks
+
+
+def confirm_create_blocks(title: str, use_case: str) -> list[dict]:
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f":mag: Ich habe keine ähnlichen Tickets im CS Admin Board gefunden.\n\n"
+                    f"*Titel:* {title}\n"
+                    f"*Use Case:* {use_case}\n\n"
+                    "Soll ich ein neues Jira-Ticket anlegen?"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Ja, Ticket erstellen"},
+                    "style": "primary",
+                    "action_id": "confirm_create_ticket",
+                    "value": "PLACEHOLDER",  # filled in before sending
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "❌ Nein, abbrechen"},
+                    "action_id": "cancel_create_ticket",
+                    "value": "cancel",
+                },
+            ],
+        },
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -176,12 +259,10 @@ def _remove_reaction(client, channel: str, ts: str, emoji: str):
 
 
 def _set_eyes(client, channel: str, ts: str):
-    """Add 👀 to the root message to signal the bot is working on it."""
     _add_reaction(client, channel, ts, 'eyes')
 
 
 def _set_done(client, channel: str, ts: str):
-    """Replace 👀 with ✅ to signal the request has been handled."""
     _remove_reaction(client, channel, ts, 'eyes')
     _add_reaction(client, channel, ts, 'white_check_mark')
 
@@ -201,6 +282,90 @@ def _cleanup_expired_pending(client):
 
 
 # ---------------------------------------------------------------------------
+# Core processing
+# ---------------------------------------------------------------------------
+
+def _show_confirm_create(say, channel: str, thread_ts: str, data: dict):
+    """Show the ✅/❌ confirmation buttons, storing data for the action handler."""
+    _ticket_data[(channel, thread_ts)] = data
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f":pencil: Kein passendes Ticket gefunden — soll ich ein neues anlegen?\n\n"
+                    f"*Titel:* {data['title']}\n"
+                    f"*Use Case:* {data['use_case']}"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Ja, Ticket erstellen"},
+                    "style": "primary",
+                    "action_id": "confirm_create_ticket",
+                    "value": f"{channel}|||{thread_ts}",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "❌ Nein, abbrechen"},
+                    "action_id": "cancel_create_ticket",
+                    "value": "cancel",
+                },
+            ],
+        },
+    ]
+    say(blocks=blocks, text="Neues Ticket erstellen?", thread_ts=thread_ts)
+
+
+def _process_request(say, client, channel, thread_ts, user_id, user_name, request_date, title, use_case):
+    """Search Jira CS board and respond appropriately."""
+    slack_link = slack_message_link(channel, thread_ts)
+
+    try:
+        similar = search_similar_tickets(title=title, use_case=use_case)
+    except Exception as e:
+        logger.exception("Jira search failed")
+        say(
+            blocks=format_error(f"Fehler bei der Jira-Suche: {str(e)}"),
+            text="Jira-Fehler",
+            thread_ts=thread_ts,
+        )
+        return
+
+    if similar:
+        # Store context so we can create a ticket if user rejects all suggestions
+        _similar_shown[(channel, thread_ts)] = {
+            'user_id': user_id,
+            'user_name': user_name,
+            'request_date': request_date,
+            'title': title,
+            'use_case': use_case,
+            'slack_link': slack_link,
+        }
+        say(
+            blocks=found_ticket_blocks(similar),
+            text="Ähnliche Tickets gefunden",
+            thread_ts=thread_ts,
+        )
+        return
+
+    # No similar tickets — ask user to confirm before creating
+    _show_confirm_create(say, channel, thread_ts, {
+        'user_id': user_id,
+        'user_name': user_name,
+        'request_date': request_date,
+        'title': title,
+        'use_case': use_case,
+        'slack_link': slack_link,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Event handlers
 # ---------------------------------------------------------------------------
 
@@ -213,7 +378,6 @@ def handle_message(event, say, client):
     if event.get('subtype'):
         return
 
-    # Lazily expire pending states older than 72h
     _cleanup_expired_pending(client)
 
     text = event.get('text', '') or ''
@@ -242,13 +406,19 @@ def handle_message(event, say, client):
                 state['use_case'] = uc_parsed or text.strip()
 
             still_missing = missing_info(state.get('title'), state.get('use_case'))
-
             if still_missing:
                 say(
                     blocks=ask_for_info_blocks(user_id, still_missing),
                     text="Bitte ergänze die fehlenden Infos",
                     thread_ts=thread_ts,
                 )
+                return
+
+            # Validate use case quality
+            uc_error = validate_use_case(state.get('title'), state.get('use_case'))
+            if uc_error:
+                state['use_case'] = None  # reset so user re-provides it
+                say(text=uc_error, thread_ts=thread_ts)
                 return
 
             _pending.pop((channel, thread_ts), None)
@@ -279,6 +449,7 @@ def handle_message(event, say, client):
                     ),
                     thread_ts=thread_ts,
                 )
+                _similar_shown.pop((channel, thread_ts), None)
                 _set_done(client, channel, thread_ts)
             except Exception as e:
                 logger.exception("Jira vote failed")
@@ -286,6 +457,13 @@ def handle_message(event, say, client):
                     text=f":x: Upvote für `{issue_key}` fehlgeschlagen: {str(e)}",
                     thread_ts=thread_ts,
                 )
+            return
+
+        # --- User rejects similar tickets → offer to create new ticket ---
+        similar_ctx = _similar_shown.get((channel, thread_ts))
+        if similar_ctx and REJECTION_RE.search(text):
+            _similar_shown.pop((channel, thread_ts), None)
+            _show_confirm_create(say, channel, thread_ts, similar_ctx)
             return
 
         # --- #improvement trigger inside a thread → read from original message ---
@@ -299,7 +477,6 @@ def handle_message(event, say, client):
                 original_text = ''
 
             original_request_date = ts_to_date(thread_ts)
-
             title, use_case = parse_request(original_text or text)
             still_missing = missing_info(title, use_case)
 
@@ -319,6 +496,19 @@ def handle_message(event, say, client):
                     text="Fehlende Informationen",
                     thread_ts=thread_ts,
                 )
+                return
+
+            uc_error = validate_use_case(title, use_case)
+            if uc_error:
+                _pending[(channel, thread_ts)] = {
+                    'user_id': user_id,
+                    'user_name': user_name,
+                    'request_date': original_request_date,
+                    'title': title,
+                    'use_case': None,
+                    'created_at': time.time(),
+                }
+                say(text=uc_error, thread_ts=thread_ts)
                 return
 
             _process_request(
@@ -361,7 +551,20 @@ def handle_message(event, say, client):
         )
         return
 
-    # All info present immediately
+    # Validate use case quality
+    uc_error = validate_use_case(title, use_case)
+    if uc_error:
+        _pending[(channel, ts)] = {
+            'user_id': user_id,
+            'user_name': user_name,
+            'request_date': request_date,
+            'title': title,
+            'use_case': None,
+            'created_at': time.time(),
+        }
+        say(text=uc_error, thread_ts=ts)
+        return
+
     _process_request(
         say=say,
         client=client,
@@ -372,75 +575,6 @@ def handle_message(event, say, client):
         request_date=request_date,
         title=title,
         use_case=use_case,
-    )
-
-
-def _process_request(say, client, channel, thread_ts, user_id, user_name, request_date, title, use_case):
-    """Search Jira CS board and respond appropriately."""
-    try:
-        similar = search_similar_tickets(title=title, use_case=use_case)
-    except Exception as e:
-        logger.exception("Jira search failed")
-        say(
-            blocks=format_error(f"Fehler bei der Jira-Suche: {str(e)}"),
-            text="Jira-Fehler",
-            thread_ts=thread_ts,
-        )
-        return
-
-    if similar:
-        # 👀 stays — waiting for user to reply with a ticket number or let it expire
-        say(
-            blocks=found_ticket_blocks(similar),
-            text="Ähnliche Tickets gefunden",
-            thread_ts=thread_ts,
-        )
-        return
-
-    # No similar tickets — store data and ask user to confirm before creating
-    _ticket_data[(channel, thread_ts)] = {
-        'user_id': user_id,
-        'user_name': user_name,
-        'request_date': request_date,
-        'title': title,
-        'use_case': use_case,
-    }
-
-    say(
-        blocks=[
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f":mag: Ich habe keine ähnlichen Tickets im CS Admin Board gefunden.\n\n"
-                        f"*Titel:* {title}\n"
-                        f"*Use Case:* {use_case}\n\n"
-                        "Soll ich ein neues Jira-Ticket anlegen?"
-                    ),
-                },
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "✅ Ja, Ticket erstellen"},
-                        "style": "primary",
-                        "action_id": "confirm_create_ticket",
-                        "value": f"{channel}|||{thread_ts}",
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "❌ Nein, abbrechen"},
-                        "action_id": "cancel_create_ticket",
-                        "value": "cancel",
-                    },
-                ],
-            },
-        ],
-        text="Neues Ticket erstellen?",
-        thread_ts=thread_ts,
     )
 
 
@@ -465,6 +599,7 @@ def handle_confirm_create(ack, body, say, client):
             use_case=data['use_case'],
             user_name=data['user_name'],
             request_date=data['request_date'],
+            slack_link=data.get('slack_link', ''),
         )
         say(
             blocks=format_ticket_created(ticket),

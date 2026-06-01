@@ -78,13 +78,14 @@ def add_vote(issue_key: str) -> dict:
     }
 
 
-def create_ticket(summary: str, use_case: str, user_name: str, request_date: str):
+def create_ticket(summary: str, use_case: str, user_name: str, request_date: str, slack_link: str = ''):
     """Create a new Jira task ticket from a Slack improvement request."""
     try:
+        slack_ref = f"\n*Slack-Post:* {slack_link}" if slack_link else ""
         description = (
             f"*Beschreibung:*\n{use_case}\n\n"
             f"*Anfrage von:* {user_name}\n"
-            f"*Datum der Anfrage:* {request_date}\n\n"
+            f"*Datum der Anfrage:* {request_date}{slack_ref}\n\n"
             f"This ticket was created automatically via the CS Improvement Bot.\n"
             f"*Autor:* {user_name}"
         )
