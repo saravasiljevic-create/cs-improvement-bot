@@ -374,7 +374,12 @@ def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str,
             )
             subs = resp.json().get('list', []) if resp.ok else []
             active = [s['subscription'] for s in subs if s['subscription'].get('status') == 'active']
-            sub = (active or [s['subscription'] for s in subs if 'subscription' in s])[0] if subs else None
+            candidates = active or [s['subscription'] for s in subs if 'subscription' in s]
+            # Prefer subscriptions with the standard XXXX-XXXX-XXXX-XXXX ID format
+            # (these are the current Xentral subscriptions; old ones use alphanumeric IDs)
+            _STD_ID = re.compile(r'^\d{4}-\d{4}-\d{4}-\d{4}$')
+            standard = [s for s in candidates if _STD_ID.match(s.get('id', ''))]
+            sub = (standard or candidates)[0] if candidates else None
             if sub:
                 result = _build_subscription_result(sub, site)
                 result['company'] = company_name
