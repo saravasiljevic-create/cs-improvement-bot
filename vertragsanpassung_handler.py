@@ -188,19 +188,23 @@ def _ts_to_date(ts: int | None) -> str:
 
 
 def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> list:
-    """Versucht mehrere Suchstrategien um einen Chargebee-Kunden zu finden."""
-    # Suffix (GmbH, AG, …) entfernen für breitere Suche
+    """Versucht mehrere Suchstrategien um einen Chargebee-Kunden zu finden.
+
+    Chargebee v2 unterstützt nur 'company[is]' und 'company[starts_with]' —
+    KEIN 'company[contains]'. Deshalb nutzen wir starts_with als Hauptstrategie.
+    """
     name_no_suffix = re.sub(
         r'\s*(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?\s*$',
         '', customer_name, flags=re.IGNORECASE,
     ).strip()
     first_word = customer_name.split()[0] if customer_name else ''
 
+    # Reihenfolge: exakt → starts_with (ohne Suffix) → starts_with (erstes Wort)
     strategies = [
-        ('company[contains]', customer_name),
-        ('company[contains]', name_no_suffix),
+        ('company[is]', customer_name),
         ('company[starts_with]', name_no_suffix),
-        ('company[contains]', first_word),
+        ('company[starts_with]', customer_name),
+        ('company[starts_with]', first_word),
     ]
     seen = set()
     for param_key, param_val in strategies:
@@ -261,9 +265,15 @@ def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str) -
 
         sub_id = sub['id']
 
-        # Add-Ons mit Details
-        addons_raw = sub.get('addons', [])
-        addons = [a.get('id', '') for a in addons_raw if a.get('id')]
+        # Add-Ons: neues Item-Model (subscription_items) hat Vorrang, Fallback auf altes addons-Feld
+        if sub.get('subscription_items'):
+            addons = [
+                item['item_price_id']
+                for item in sub['subscription_items']
+                if item.get('item_type') == 'addon' and item.get('unit_price', 0) > 0
+            ]
+        else:
+            addons = [a.get('id', '') for a in sub.get('addons', []) if a.get('id')]
 
         # Billing-Zyklus lesbar machen
         period = sub.get('billing_period', 1)
