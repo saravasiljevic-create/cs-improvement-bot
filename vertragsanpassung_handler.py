@@ -207,14 +207,13 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
         r'\s*(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?\s*$',
         '', customer_name, flags=re.IGNORECASE,
     ).strip()
-    first_word = customer_name.split()[0] if customer_name else ''
 
-    # Reihenfolge: exakt → starts_with (ohne Suffix) → starts_with (erstes Wort)
+    # Nur exakte und Präfix-Suche auf den vollen Namen — kein Fallback auf erstes Wort,
+    # da "company[starts_with]=wev" andere Kunden treffen kann.
     strategies = [
         ('company[is]', customer_name),
-        ('company[starts_with]', name_no_suffix),
         ('company[starts_with]', customer_name),
-        ('company[starts_with]', first_word),
+        ('company[starts_with]', name_no_suffix),
     ]
     seen = set()
     for param_key, param_val in strategies:
@@ -254,7 +253,11 @@ def _planhat_company_search(customer_name: str, api_token: str) -> dict | None:
     ).strip()
     first_word = customer_name.split()[0] if customer_name else ''
 
-    for search_term in [customer_name, name_no_suffix, first_word]:
+    name_no_suffix_ph = re.sub(
+        r'\s*(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?\s*$',
+        '', customer_name, flags=re.IGNORECASE,
+    ).strip()
+    for search_term in dict.fromkeys([customer_name, name_no_suffix_ph]):  # dedup, preserve order
         if not search_term:
             continue
         try:
