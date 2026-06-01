@@ -76,12 +76,20 @@ _PLAN_RE = re.compile(
     re.IGNORECASE,
 )
 _CUSTOMER_LABELED_RE = re.compile(
-    r'(?:kunde|kundschaft|customer|company|firma|unternehmen)\s*[:\-]\s*(.+?)(?:\n|,|$)',
+    r'(?:kunde|kundschaft|customer|company|firma|unternehmen|kund)\s*[:\-]\s*'
+    r'(.+?)(?=\s+(?:soll|hat|möchte|will|kann|wünscht|bittet|muss|ist|wurde|werden)|\n|,|$)',
     re.IGNORECASE,
 )
 _COMPANY_SUFFIX_RE = re.compile(
     r'([A-ZÄÖÜ][a-zA-ZäöüÄÖÜ\s&.\-]{1,40}'
     r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?)',
+)
+# Nur "Artikel + häufiges Nomen" am Anfang entfernen ("Der Kunde X" → "X")
+# "The Glow GmbH" bleibt unverändert — "The" ohne folgendes Nomen wird NICHT gestripped
+_STRIP_COMPANY_PREFIX_RE = re.compile(
+    r'^(?:der|die|das|den|dem|des|ein|eine|the)\s+'
+    r'(?:kunde[n]?|kund|klient|unternehmen|firma|company|client)\s+',
+    re.IGNORECASE,
 )
 _BERICHTSWESEN_RE = re.compile(r'berichtswesen\s*(?:tier)?\s*[:\-]?\s*(\d+)', re.IGNORECASE)
 _ADDON_ADD_RE = re.compile(
@@ -103,11 +111,13 @@ def parse_vertragsanpassung(text: str) -> dict:
 
     m = _CUSTOMER_LABELED_RE.search(text)
     if m:
-        result['customer_name'] = m.group(1).strip()
+        raw = m.group(1).strip()
+        result['customer_name'] = _STRIP_COMPANY_PREFIX_RE.sub('', raw).strip()
     else:
         m = _COMPANY_SUFFIX_RE.search(text)
         if m:
-            result['customer_name'] = m.group(1).strip()
+            raw = m.group(1).strip()
+            result['customer_name'] = _STRIP_COMPANY_PREFIX_RE.sub('', raw).strip()
 
     urls = _URL_RE.findall(text)
     if urls:
