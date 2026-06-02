@@ -207,12 +207,12 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
         '', customer_name, flags=re.IGNORECASE,
     ).strip()
 
-    # Nur exakte und Präfix-Suche auf den vollen Namen — kein Fallback auf erstes Wort,
-    # da "company[starts_with]=wev" andere Kunden treffen kann.
+    first_word = customer_name.split()[0] if customer_name else ''
     strategies = [
         ('company[is]', customer_name),
         ('company[starts_with]', customer_name),
         ('company[starts_with]', name_no_suffix),
+        ('company[starts_with]', first_word),   # Fallback auf erstes Wort (z.B. "wev")
     ]
     seen = set()
     for param_key, param_val in strategies:
@@ -387,28 +387,7 @@ def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str,
     base = f"https://{site}.chargebee.com/api/v2"
     auth = (api_key, '')
 
-    # --- Versuch 1: Planhat ---
-    if planhat_token:
-        ph = _planhat_company_search(customer_name, planhat_token)
-        if ph and ph.get('chargebee_id'):
-            chargebee_id = ph['chargebee_id']
-            logger.info(f"Planhat: '{ph['name']}' → Chargebee-ID '{chargebee_id}'")
-            result = _fetch_subscriptions_for_customer(
-                chargebee_id, base, auth, site, ph['name']
-            )
-            if result:
-                return result
-            # Fallback: externalId direkt als Subscription-ID probieren
-            result = _fetch_subscription_by_id(chargebee_id, api_key, site)
-            if result:
-                result['company'] = ph['name']
-                return result
-        else:
-            logger.info(f"Planhat: kein Treffer für '{customer_name}'")
-    else:
-        logger.info("Kein PLANHAT_API_TOKEN — überspringe Planhat-Suche")
-
-    # --- Versuch 2: Chargebee-Namenssuche ---
+    # Chargebee-Namenssuche (zuverlässige Quelle — Planhat externalId ist ggf. fehlerhaft)
     try:
         customers = _chargebee_customer_search(base, auth, customer_name)
         if customers:
@@ -427,7 +406,7 @@ def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str,
     except Exception as e:
         logger.warning(f"Chargebee-Namenssuche Fehler für '{customer_name}': {e}")
 
-    logger.info(f"Kein Treffer für '{customer_name}' (alle Strategien erschöpft)")
+    logger.info(f"Kein Treffer für '{customer_name}'")
     return None
 
 
