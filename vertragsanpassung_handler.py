@@ -282,13 +282,42 @@ def _planhat_company_search(customer_name: str, api_token: str) -> dict | None:
                 if companies:
                     company = companies[0]
                     ph_id = company.get('_id', '')
-                    # externalId in Planhat = Chargebee Customer-ID
-                    # (der Chargebee-Link auf der Planhat-Company-Seite zeigt auf den Customer)
-                    chargebee_id = company.get('externalId', '')
+                    name = company.get('name', customer_name)
+                    # Log alle Felder damit wir das Debitorennummer-Feld finden
+                    logger.info(f"Planhat company '{name}' top-level keys: {list(company.keys())}")
+                    logger.info(f"Planhat externalId={company.get('externalId')!r} "
+                                f"coId={company.get('coId')!r} "
+                                f"custom={company.get('custom')!r} "
+                                f"customFields={company.get('customFields')!r}")
+
+                    # Suche nach der Debitorennummer (numerischer Wert in verschiedenen Feldern)
+                    debit_number = ''
+                    for key in ['externalId', 'coId', 'accountId', 'debitNumber',
+                                'cf_debit_number', 'debitorennummer']:
+                        val = company.get(key)
+                        if val and str(val).strip().isdigit():
+                            debit_number = str(val).strip()
+                            logger.info(f"Planhat Debitorennummer gefunden: {key}={debit_number}")
+                            break
+                    # Auch in nested custom-Feldern suchen
+                    if not debit_number:
+                        for field_name in ['custom', 'customFields', 'fields']:
+                            nested = company.get(field_name) or {}
+                            if isinstance(nested, dict):
+                                for k, v in nested.items():
+                                    logger.info(f"Planhat custom field: {field_name}.{k}={v!r}")
+                                    if v and str(v).strip().isdigit():
+                                        debit_number = str(v).strip()
+                                        logger.info(f"Planhat Debitorennummer in {field_name}.{k}={debit_number}")
+                                        break
+                            if debit_number:
+                                break
+
                     return {
                         'planhat_id': ph_id,
-                        'name': company.get('name', customer_name),
-                        'chargebee_id': chargebee_id,
+                        'name': name,
+                        'chargebee_id': company.get('externalId', ''),
+                        'debit_number': debit_number,
                         'planhat_url': f"https://app.planhat.com/customer/{ph_id}",
                     }
         except Exception as e:
@@ -355,6 +384,27 @@ def _build_subscription_result(sub: dict, site: str) -> dict:
     }
 
 
+def _search_by_debit_number(debit_number: str, base: str, auth: tuple,
+                             site: str, company_name: str) -> dict | None:
+    """Sucht Chargebee-Kunden eindeutig über cf_debit_number (Debitorennummer)."""
+    from urllib.parse import quote as _q
+    url = f"{base}/customers?cf_debit_number[is]={_q(debit_number)}&limit=5"
+    try:
+        resp = requests.get(url, auth=auth, timeout=10)
+        logger.info(f"Chargebee [cf_debit_number[is]={debit_number}]: status={resp.status_code}")
+        if resp.ok:
+            customers = resp.json().get('list', [])
+            if customers:
+                customer_id = customers[0]['customer']['id']
+                logger.info(f"Chargebee Debit-Match: customer_id={customer_id}")
+                return _fetch_subscriptions_for_customer(
+                    customer_id, base, auth, site, company_name
+                )
+    except Exception as e:
+        logger.warning(f"Chargebee debit_number search failed: {e}")
+    return None
+
+
 def _fetch_subscriptions_for_customer(customer_id: str, base: str, auth: tuple,
                                        site: str, company_name: str) -> dict | None:
     """Lädt Subscriptions für eine bekannte Chargebee Customer-ID."""
@@ -393,26 +443,23 @@ def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str,
     base = f"https://{site}.chargebee.com/api/v2"
     auth = (api_key, '')
 
-    # Chargebee-Namenssuche (zuverlässige Quelle — Planhat externalId ist ggf. fehlerhaft)
-    try:
-        customers = _chargebee_customer_search(base, auth, customer_name)
-        if customers:
-            customer = customers[0]['customer']
-            company_name = (
-                customer.get('company')
-                or f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
-            )
-            result = _fetch_subscriptions_for_customer(
-                customer['id'], base, auth, site, company_name
+    # --- Versuch 1: Planhat → Debitorennummer → Chargebee cf_debit_number (eindeutig) ---
+    if planhat_token:
+        ph = _planhat_company_search(customer_name, planhat_token)
+        if ph and ph.get('debit_number'):
+            logger.info(f"Planhat: '{ph['name']}' → Debitnr={ph['debit_number']}")
+            result = _search_by_debit_number(
+                ph['debit_number'], base, auth, site, ph['name']
             )
             if result:
                 return result
+        elif ph:
+            logger.info(f"Planhat: '{ph.get('name')}' — keine Debitorennummer gefunden")
         else:
-            logger.info(f"Chargebee: kein Treffer für '{customer_name}'")
-    except Exception as e:
-        logger.warning(f"Chargebee-Namenssuche Fehler für '{customer_name}': {e}")
+            logger.info(f"Planhat: kein Treffer für '{customer_name}'")
 
-    logger.info(f"Kein Treffer für '{customer_name}'")
+    # --- Versuch 2: kein Link — lieber nichts als falsch ---
+    logger.info(f"Kein zuverlässiger Chargebee-Treffer für '{customer_name}'")
     return None
 
 
