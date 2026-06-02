@@ -217,6 +217,7 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
     # WICHTIG: requests encodiert [ ] → %5B %5D — Chargebee ignoriert den Filter dann
     # und gibt ALLE Kunden zurück. URL muss mit literalen Klammern gebaut werden.
     from urllib.parse import quote as _q
+    search_lower = customer_name.lower()
     seen: set = set()
     for filter_key, filter_val in strategies:
         if not filter_val or filter_val in seen:
@@ -228,9 +229,17 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
             results = len(resp.json().get('list', [])) if resp.ok else 'error'
             logger.info(f"Chargebee [{filter_key}={filter_val!r}]: status={resp.status_code} results={results}")
             if resp.ok:
-                customers = resp.json().get('list', [])
-                if customers:
-                    return customers
+                candidates = resp.json().get('list', [])
+                # Sicherheitsprüfung: Kundenname muss zum Suchnamen passen
+                # (verhindert falsche Treffer wenn Filter ignoriert wird)
+                verified = [
+                    c for c in candidates
+                    if search_lower in (c['customer'].get('company') or '').lower()
+                    or (c['customer'].get('company') or '').lower() in search_lower
+                ]
+                if verified:
+                    logger.info(f"Chargebee: verifizierter Treffer → {verified[0]['customer']['id']}")
+                    return verified
         except Exception as e:
             logger.warning(f"Chargebee search [{filter_key}={filter_val!r}] failed: {e}")
     return []
