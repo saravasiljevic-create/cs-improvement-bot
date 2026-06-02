@@ -547,12 +547,27 @@ def ask_for_va_info_blocks(
 
 
 def build_cs_admin_subscription_blocks(subscription: dict) -> list[dict]:
-    """Postet die CS-Admin-Warnung mit allen Subscription-Links wenn mehrere gefunden."""
+    """Postet die CS-Admin-Warnung. Bei ≤3 Subscriptions alle zeigen, sonst nur erste 3 + Hinweis."""
     admin_mentions = ' '.join(f'<@{uid}>' for uid in _CS_ADMIN_IDS)
+    subs = subscription.get('multiple_subs', [])
+    site = subscription.get('url', '').split('/d/')[0]  # e.g. https://xentral-dach.chargebee.com
+
+    MAX_SHOWN = 3
+    shown = subs[:MAX_SHOWN]
+    rest = len(subs) - MAX_SHOWN
+
+    lines = []
+    for s in shown:
+        sub_id = s.get('id', '')
+        url = f"{site}/d/subscriptions/{sub_id}"
+        lines.append(f"• <{url}|{sub_id}>")
+    if rest > 0:
+        lines.append(f"_…und {rest} weitere — bitte in Chargebee prüfen_")
+
     text = (
         f"⚠️ {admin_mentions} *Mehrere Subscriptions gefunden* — "
         f"bitte die richtige Chargebee-URL in den Thread schreiben:\n"
-        f"{subscription['multiple_links']}"
+        + '\n'.join(lines)
     )
     return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
 

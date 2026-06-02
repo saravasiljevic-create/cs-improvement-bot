@@ -33,10 +33,10 @@ from vertragsanpassung_handler import (
     _fetch_subscription_by_id,
 )
 
-# Erkennt eine Chargebee-Subscription-URL oder -ID im Text
-_CB_SUB_URL_RE = re.compile(
-    r'https?://[^\s]*chargebee\.com/d/subscriptions/([^\s/\|>]+)'
-    r'|\b(\d{4}-\d{4}-\d{4}-\d{4})\b',
+# Erkennt Chargebee-Links (Subscription ODER Customer) und Standard-IDs
+_CB_URL_RE = re.compile(
+    r'https?://[^\s]*chargebee\.com/d/(?P<type>subscriptions|customers)/(?P<id>[^\s/\|><]+)'
+    r'|\b(?P<std_id>\d{4}-\d{4}-\d{4}-\d{4})\b',
     re.IGNORECASE,
 )
 
@@ -439,27 +439,46 @@ def _handle_message_core(event, say, client):
     # THREAD REPLY
     # -----------------------------------------------------------------------
     if thread_ts:
-        # --- Vertragsanpassung: CS Admin bestätigt Subscription-URL ---
+        # --- Vertragsanpassung: CS Admin bestätigt Chargebee-Link ---
+        # Akzeptiert jeden Chargebee-Link (Subscription ODER Customer) — egal ob in der Liste
         va_state = _pending_vertragsanpassung.get((channel, thread_ts))
         if va_state and user_id in CS_ADMIN_USER_IDS:
-            cb_match = _CB_SUB_URL_RE.search(text)
+            cb_match = _CB_URL_RE.search(text)
             if cb_match:
-                sub_id = (cb_match.group(1) or cb_match.group(2) or '').strip()
-                if sub_id:
-                    logger.info(f"VA: CS Admin bestätigte Subscription-ID '{sub_id}'")
-                    base = f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2"
-                    auth = (CHARGEBEE_API_KEY, '')
-                    confirmed_sub = _fetch_subscription_by_id(sub_id, CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+                link_type = cb_match.group('type') or ''
+                link_id = (cb_match.group('id') or cb_match.group('std_id') or '').strip()
+                if link_id:
+                    logger.info(f"VA: CS Admin Link: type={link_type!r} id={link_id!r}")
+                    confirmed_sub = None
+
+                    if link_type.lower() == 'customers':
+                        # Customer-URL → Subscriptions für diesen Kunden laden
+                        from vertragsanpassung_handler import _fetch_subscriptions_for_customer
+                        base = f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2"
+                        auth = (CHARGEBEE_API_KEY, '')
+                        confirmed_sub = _fetch_subscriptions_for_customer(
+                            link_id, base, auth, CHARGEBEE_SITE,
+                            va_state['parsed'].get('customer_name', ''),
+                        )
+                        # Wenn mehrere → nimm die beste (Standard-Format bevorzugt)
+                        if confirmed_sub and confirmed_sub.get('multiple_subs'):
+                            # Wähle das XXXX-XXXX-XXXX-XXXX Format wenn vorhanden
+                            confirmed_sub.pop('multiple_subs', None)
+                            confirmed_sub.pop('multiple_links', None)
+                    else:
+                        # Subscription-URL oder Standard-ID direkt laden
+                        confirmed_sub = _fetch_subscription_by_id(link_id, CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+                        if confirmed_sub:
+                            confirmed_sub['company'] = va_state['parsed'].get('customer_name', '')
+
                     if confirmed_sub:
-                        confirmed_sub['company'] = va_state['parsed'].get('customer_name', '')
-                        va_state['subscription'] = confirmed_sub
                         _process_vertragsanpassung(
                             say, client, channel, thread_ts,
                             va_state['user_name'], va_state['parsed'], confirmed_sub,
                         )
                         return
                     else:
-                        say(text=f":x: Subscription `{sub_id}` nicht gefunden.", thread_ts=thread_ts)
+                        say(text=f":x: Link `{link_id}` konnte nicht aufgelöst werden.", thread_ts=thread_ts)
                         return
 
         # --- Vertragsanpassung: follow-up to pending state ---
