@@ -235,12 +235,20 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
                 candidates = resp.json().get('list', [])
                 # company MUSS nicht-leer sein UND zum Suchnamen passen
                 # ("" in "any string" == True in Python → explizit prüfen)
+                # Mindestens 2 Wörter müssen übereinstimmen
+                # "wev" (1 Wort) darf "wev schmalkalden" nicht matchen
+                search_words = set(search_lower.split())
+                min_match = min(2, len(search_words))
                 verified = []
                 for c in candidates:
                     company = (c['customer'].get('company') or '').strip().lower()
-                    if company and (search_lower in company or company in search_lower):
+                    if not company:
+                        continue
+                    company_words = set(company.split())
+                    matching = search_words & company_words
+                    if len(matching) >= min_match:
                         verified.append(c)
-                        logger.info(f"Chargebee verifiziert: {c['customer']['id']} ({c['customer'].get('company')})")
+                        logger.info(f"Chargebee match: {c['customer']['id']} ({c['customer'].get('company')}) words={matching}")
                 if verified:
                     return verified
         except Exception as e:
@@ -521,7 +529,7 @@ def ask_for_va_info_blocks(
     if found:
         text += f"*Bereits erkannt:*\n{found}\n\n"
     text += f"*Mir fehlen noch:*\n{missing_items}\n\nBitte ergänze diese Informationen hier im Thread."
-    text += "\n\n_[v2.2]_"  # version marker — remove after debugging
+    text += "\n\n_[v2.3]_"  # version marker — remove after debugging
 
     return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
 
