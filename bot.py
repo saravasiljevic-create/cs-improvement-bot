@@ -33,6 +33,9 @@ from vertragsanpassung_handler import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_BOT_VERSION = "v2.1-fix-empty-company"  # updated 2026-06-02
+logger.info(f"Bot starting — version {_BOT_VERSION}")
+
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
