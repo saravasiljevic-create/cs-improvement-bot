@@ -28,6 +28,14 @@ from vertragsanpassung_handler import (
     lookup_chargebee_subscription,
     missing_va_fields,
     parse_vertragsanpassung,
+    _fetch_subscription_by_id,
+)
+
+# Erkennt eine Chargebee-Subscription-URL oder -ID im Text
+_CB_SUB_URL_RE = re.compile(
+    r'https?://[^\s]*chargebee\.com/d/subscriptions/([^\s/\|>]+)'
+    r'|\b(\d{4}-\d{4}-\d{4}-\d{4})\b',
+    re.IGNORECASE,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -417,8 +425,30 @@ def _handle_message_core(event, say, client):
     # THREAD REPLY
     # -----------------------------------------------------------------------
     if thread_ts:
-        # --- Vertragsanpassung: follow-up to pending state ---
+        # --- Vertragsanpassung: CS Admin bestätigt Subscription-URL ---
         va_state = _pending_vertragsanpassung.get((channel, thread_ts))
+        if va_state and user_id in CS_ADMIN_USER_IDS:
+            cb_match = _CB_SUB_URL_RE.search(text)
+            if cb_match:
+                sub_id = (cb_match.group(1) or cb_match.group(2) or '').strip()
+                if sub_id:
+                    logger.info(f"VA: CS Admin bestätigte Subscription-ID '{sub_id}'")
+                    base = f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2"
+                    auth = (CHARGEBEE_API_KEY, '')
+                    confirmed_sub = _fetch_subscription_by_id(sub_id, CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+                    if confirmed_sub:
+                        confirmed_sub['company'] = va_state['parsed'].get('customer_name', '')
+                        va_state['subscription'] = confirmed_sub
+                        _process_vertragsanpassung(
+                            say, client, channel, thread_ts,
+                            va_state['user_name'], va_state['parsed'], confirmed_sub,
+                        )
+                        return
+                    else:
+                        say(text=f":x: Subscription `{sub_id}` nicht gefunden.", thread_ts=thread_ts)
+                        return
+
+        # --- Vertragsanpassung: follow-up to pending state ---
         if va_state and va_state.get('user_id') == user_id:
             new_parsed = parse_vertragsanpassung(text)
             # Merge: only fill empty fields from the follow-up reply
