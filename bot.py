@@ -24,6 +24,7 @@ from optimizer import optimize_ticket
 from slack_utils import format_error, format_ticket_created
 from vertragsanpassung_handler import (
     ask_for_va_info_blocks,
+    build_cs_admin_subscription_blocks,
     build_va_summary_blocks,
     detect_vertragsanpassung,
     lookup_chargebee_subscription,
@@ -366,34 +367,33 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
 # ---------------------------------------------------------------------------
 
 def _cb_lookup(customer_name: str) -> dict | None:
-    """Chargebee-Lookup per Kundenname. Planhat NUR für die Company-ID (Planhat-URL)."""
+    """Chargebee-Lookup per Kundenname (exakter Company-Match)."""
     if not customer_name or not CHARGEBEE_API_KEY:
         return None
-    result = lookup_chargebee_subscription(
+    return lookup_chargebee_subscription(
         customer_name, CHARGEBEE_API_KEY, CHARGEBEE_SITE, planhat_token='',
     )
-    # Planhat-URL separat bauen — NUR für den Link, keine Chargebee-Daten aus Planhat
-    if PLANHAT_API_TOKEN:
-        try:
-            from vertragsanpassung_handler import _planhat_company_search
-            ph = _planhat_company_search(customer_name, PLANHAT_API_TOKEN)
-            if ph and ph.get('planhat_id'):
-                planhat_url = f"{PLANHAT_WORKSPACE_URL}?profile=Company.{ph['planhat_id']}"
-                if result:
-                    result['planhat_url'] = planhat_url
-                else:
-                    result = {'planhat_url': planhat_url, 'company': customer_name}
-        except Exception as e:
-            logger.warning(f"Planhat ID lookup failed: {e}")
-    return result
 
 
 def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
                                 user_name: str, parsed: dict,
                                 subscription: dict | None = None):
-    """Zusammenfassung in Slack posten. Subscription wird wiederverwendet wenn bereits geladen."""
+    """Alle Felder vollständig — entweder Zusammenfassung oder CS-Admin-Warnung."""
     if subscription is None:
         subscription = _cb_lookup(parsed.get('customer_name', ''))
+
+    # Mehrere Subscriptions → CS Admin fragen, noch keine Zusammenfassung
+    if subscription and subscription.get('multiple_links'):
+        logger.info("VA: Mehrere Subscriptions — warte auf CS Admin Bestätigung")
+        say(
+            blocks=build_cs_admin_subscription_blocks(subscription),
+            text="Mehrere Subscriptions gefunden — bitte CS Admin bestätigen",
+            thread_ts=thread_ts,
+        )
+        # State bleibt aktiv damit CS Admin antworten kann
+        return
+
+    # Eindeutige Subscription (oder keine) → direkt Zusammenfassung
     blocks = build_va_summary_blocks(parsed, subscription, user_name)
     say(blocks=blocks, text="📋 Vertragsanpassung — Zusammenfassung", thread_ts=thread_ts)
     _set_done(client, channel, thread_ts)

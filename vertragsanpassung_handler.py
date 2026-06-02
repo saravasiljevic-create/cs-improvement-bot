@@ -497,13 +497,9 @@ def _format_found_fields(parsed: dict, subscription: dict | None = None) -> str:
     lines = []
     if parsed.get('customer_name'):
         lines.append(f"• *Kunde:* {parsed['customer_name']}")
-    if subscription:
-        # Planhat-Link (korrektes Format mit Company-ID)
-        if subscription.get('planhat_url'):
-            lines.append(f"• *Planhat:* <{subscription['planhat_url']}|{parsed.get('customer_name', 'Planhat öffnen')}>")
-        # Chargebee: nur wenn eindeutig (mehrere → separater Hinweis am Ende der Nachricht)
-        if not subscription.get('multiple_links') and subscription.get('url'):
-            lines.append(f"• *Chargebee:* <{subscription['url']}|{subscription['subscription_id']}>")
+    if subscription and not subscription.get('multiple_links') and subscription.get('url'):
+        # Nur eindeutige Subscription anzeigen — mehrere werden erst nach Infos abgefragt
+        lines.append(f"• *Chargebee:* <{subscription['url']}|{subscription['subscription_id']}>")
         if subscription.get('plan_id'):
             plan_info = f"`{subscription['plan_id']}`"
             if subscription.get('billing_cycle'):
@@ -542,27 +538,22 @@ def ask_for_va_info_blocks(
     found = _format_found_fields(parsed, subscription)
     missing_items = '\n'.join(f'• {m}' for m in missing)
 
-    # CS Admin Mentions (für die Subscription-Warnung)
-    admin_mentions = ' '.join(f'<@{uid}>' for uid in _CS_ADMIN_IDS)
-
     text = f"Hey <@{user_id}> :wave: Ich habe eine *Vertragsanpassungs-Anfrage* erkannt.\n\n"
-
     if found:
         text += f"*Bereits erkannt:*\n{found}\n\n"
-
-    # Fehlende Felder — der Anfragende ergänzt diese zuerst
     if missing_items:
         text += f"*Mir fehlen noch:*\n{missing_items}\n\nBitte ergänze diese Informationen hier im Thread."
+    return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
 
-    # Subscription-Warnung am Ende mit CS-Admin-Mention
-    if subscription and subscription.get('multiple_links'):
-        text += (
-            f"\n\n---\n"
-            f"⚠️ {admin_mentions} *Mehrere Subscriptions gefunden* — "
-            f"bitte die richtige Chargebee-URL in den Thread schreiben:\n"
-            f"{subscription['multiple_links']}"
-        )
 
+def build_cs_admin_subscription_blocks(subscription: dict) -> list[dict]:
+    """Postet die CS-Admin-Warnung mit allen Subscription-Links wenn mehrere gefunden."""
+    admin_mentions = ' '.join(f'<@{uid}>' for uid in _CS_ADMIN_IDS)
+    text = (
+        f"⚠️ {admin_mentions} *Mehrere Subscriptions gefunden* — "
+        f"bitte die richtige Chargebee-URL in den Thread schreiben:\n"
+        f"{subscription['multiple_links']}"
+    )
     return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
 
 
