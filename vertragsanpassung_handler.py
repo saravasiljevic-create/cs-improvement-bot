@@ -529,7 +529,6 @@ def ask_for_va_info_blocks(
     if found:
         text += f"*Bereits erkannt:*\n{found}\n\n"
     text += f"*Mir fehlen noch:*\n{missing_items}\n\nBitte ergänze diese Informationen hier im Thread."
-    text += "\n\n_[v2.3]_"  # version marker — remove after debugging
 
     return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
 
