@@ -13,6 +13,7 @@ from config import (
     CHARGEBEE_SITE,
     CS_ADMIN_USER_IDS,
     PLANHAT_API_TOKEN,
+    PLANHAT_WORKSPACE_URL,
     SLACK_BOT_TOKEN,
     SLACK_CHANNEL_ID,
     SLACK_SIGNING_SECRET,
@@ -365,13 +366,26 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
 # ---------------------------------------------------------------------------
 
 def _cb_lookup(customer_name: str) -> dict | None:
-    """Chargebee-Lookup direkt per Kundenname (Planhat deaktiviert — fehlerhafte Links)."""
-    if customer_name and CHARGEBEE_API_KEY:
-        return lookup_chargebee_subscription(
-            customer_name, CHARGEBEE_API_KEY, CHARGEBEE_SITE,
-            planhat_token='',   # Planhat deaktiviert
-        )
-    return None
+    """Chargebee-Lookup per Kundenname. Planhat NUR für die Company-ID (Planhat-URL)."""
+    if not customer_name or not CHARGEBEE_API_KEY:
+        return None
+    result = lookup_chargebee_subscription(
+        customer_name, CHARGEBEE_API_KEY, CHARGEBEE_SITE, planhat_token='',
+    )
+    # Planhat-URL separat bauen — NUR für den Link, keine Chargebee-Daten aus Planhat
+    if PLANHAT_API_TOKEN:
+        try:
+            from vertragsanpassung_handler import _planhat_company_search
+            ph = _planhat_company_search(customer_name, PLANHAT_API_TOKEN)
+            if ph and ph.get('planhat_id'):
+                planhat_url = f"{PLANHAT_WORKSPACE_URL}?profile=Company.{ph['planhat_id']}"
+                if result:
+                    result['planhat_url'] = planhat_url
+                else:
+                    result = {'planhat_url': planhat_url, 'company': customer_name}
+        except Exception as e:
+            logger.warning(f"Planhat ID lookup failed: {e}")
+    return result
 
 
 def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,

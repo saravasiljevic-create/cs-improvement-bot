@@ -15,6 +15,8 @@ JIRA_API_TOKEN = os.environ.get('JIRA_API_TOKEN')
 CHARGEBEE_API_KEY = os.environ.get('CHARGEBEE_API_KEY', '')
 CHARGEBEE_SITE = os.environ.get('CHARGEBEE_SITE', 'xentral-dach')
 PLANHAT_API_TOKEN = os.environ.get('PLANHAT_API_TOKEN', '')
+# Feste Planhat-Workspace-URL für Xentral (Tenant-ID aus App-URL)
+PLANHAT_WORKSPACE_URL = 'https://ws.planhat.com/xentral/home/69941855813dcb5e78d08519'
 # Wenn nicht separat gesetzt, wird derselbe Channel wie für den Improvement-Flow genutzt
 VERTRAGSANPASSUNG_CHANNEL_ID = os.environ.get('VERTRAGSANPASSUNG_CHANNEL_ID') or SLACK_CHANNEL_ID
 

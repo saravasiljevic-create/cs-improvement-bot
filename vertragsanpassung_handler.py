@@ -13,6 +13,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# CS Admin Slack User IDs für @-Mentions in der Subscription-Warnung
+# Mirjam Köberlein, Linda Litzkow, Sara Vasiljevic
+_CS_ADMIN_IDS = ('U07G83YH6RW', 'U092RN6D339', 'U07TRKK8BH9')
+
 # ---------------------------------------------------------------------------
 # Intent Detection
 # ---------------------------------------------------------------------------
@@ -494,10 +498,11 @@ def _format_found_fields(parsed: dict, subscription: dict | None = None) -> str:
     if parsed.get('customer_name'):
         lines.append(f"• *Kunde:* {parsed['customer_name']}")
     if subscription:
-        if subscription.get('multiple_links'):
-            # Multiple subscriptions — show all links, ask admin to pick
-            lines.append(f"• *Chargebee — mehrere Subscriptions:*\n{subscription['multiple_links']}")
-        else:
+        # Planhat-Link (korrektes Format mit Company-ID)
+        if subscription.get('planhat_url'):
+            lines.append(f"• *Planhat:* <{subscription['planhat_url']}|{parsed.get('customer_name', 'Planhat öffnen')}>")
+        # Chargebee: nur wenn eindeutig (mehrere → separater Hinweis am Ende der Nachricht)
+        if not subscription.get('multiple_links') and subscription.get('url'):
             lines.append(f"• *Chargebee:* <{subscription['url']}|{subscription['subscription_id']}>")
         if subscription.get('plan_id'):
             plan_info = f"`{subscription['plan_id']}`"
@@ -537,27 +542,26 @@ def ask_for_va_info_blocks(
     found = _format_found_fields(parsed, subscription)
     missing_items = '\n'.join(f'• {m}' for m in missing)
 
-    from urllib.parse import quote as _q
-    customer_name = parsed.get('customer_name', '')
-    planhat_url = f"https://app.planhat.com/customers?search={_q(customer_name)}" if customer_name else ''
+    # CS Admin Mentions (für die Subscription-Warnung)
+    admin_mentions = ' '.join(f'<@{uid}>' for uid in _CS_ADMIN_IDS)
 
     text = f"Hey <@{user_id}> :wave: Ich habe eine *Vertragsanpassungs-Anfrage* erkannt.\n\n"
 
     if found:
         text += f"*Bereits erkannt:*\n{found}\n\n"
 
-    if planhat_url:
-        text += f"🔗 <{planhat_url}|In Planhat öffnen>\n\n"
+    # Fehlende Felder — der Anfragende ergänzt diese zuerst
+    if missing_items:
+        text += f"*Mir fehlen noch:*\n{missing_items}\n\nBitte ergänze diese Informationen hier im Thread."
 
+    # Subscription-Warnung am Ende mit CS-Admin-Mention
     if subscription and subscription.get('multiple_links'):
         text += (
-            "⚠️ *Mehrere Subscriptions gefunden* — bitte die richtige Chargebee-URL "
-            "in den Thread schreiben, damit ich die Zusammenfassung erstellen kann."
+            f"\n\n---\n"
+            f"⚠️ {admin_mentions} *Mehrere Subscriptions gefunden* — "
+            f"bitte die richtige Chargebee-URL in den Thread schreiben:\n"
+            f"{subscription['multiple_links']}"
         )
-    elif missing_items:
-        text += f"*Mir fehlen noch:*\n{missing_items}\n\nBitte ergänze diese Informationen hier im Thread."
-    else:
-        text += "Bitte ergänze diese Informationen hier im Thread."
 
     return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
 
