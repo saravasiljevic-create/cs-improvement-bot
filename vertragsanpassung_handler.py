@@ -283,41 +283,40 @@ def _planhat_company_search(customer_name: str, api_token: str) -> dict | None:
                     company = companies[0]
                     ph_id = company.get('_id', '')
                     name = company.get('name', customer_name)
-                    # Log alle Felder damit wir das Debitorennummer-Feld finden
-                    logger.info(f"Planhat company '{name}' top-level keys: {list(company.keys())}")
-                    logger.info(f"Planhat externalId={company.get('externalId')!r} "
-                                f"coId={company.get('coId')!r} "
-                                f"custom={company.get('custom')!r} "
-                                f"customFields={company.get('customFields')!r}")
+                    logger.info(f"Planhat company '{name}' keys: {list(company.keys())}")
 
-                    # Suche nach der Debitorennummer (numerischer Wert in verschiedenen Feldern)
-                    debit_number = ''
-                    for key in ['externalId', 'coId', 'accountId', 'debitNumber',
-                                'cf_debit_number', 'debitorennummer']:
-                        val = company.get(key)
-                        if val and str(val).strip().isdigit():
-                            debit_number = str(val).strip()
-                            logger.info(f"Planhat Debitorennummer gefunden: {key}={debit_number}")
+                    # 1) Chargebee-Link direkt aus Planhat-Links extrahieren
+                    # (sichtbar in Planhat UI unter "Links & Tags" → "Chargebee")
+                    chargebee_url = ''
+                    for link_field in ['links', 'tags', 'customLinks', 'integrations']:
+                        items = company.get(link_field) or []
+                        if isinstance(items, list):
+                            for item in items:
+                                url = ''
+                                if isinstance(item, dict):
+                                    url = (item.get('url') or item.get('href')
+                                           or item.get('link') or item.get('value') or '')
+                                elif isinstance(item, str):
+                                    url = item
+                                if url and 'chargebee.com' in url:
+                                    chargebee_url = url
+                                    logger.info(f"Planhat Chargebee-Link gefunden: {chargebee_url}")
+                                    break
+                        if chargebee_url:
                             break
-                    # Auch in nested custom-Feldern suchen
-                    if not debit_number:
-                        for field_name in ['custom', 'customFields', 'fields']:
-                            nested = company.get(field_name) or {}
-                            if isinstance(nested, dict):
-                                for k, v in nested.items():
-                                    logger.info(f"Planhat custom field: {field_name}.{k}={v!r}")
-                                    if v and str(v).strip().isdigit():
-                                        debit_number = str(v).strip()
-                                        logger.info(f"Planhat Debitorennummer in {field_name}.{k}={debit_number}")
-                                        break
-                            if debit_number:
-                                break
 
+                    # 2) Debitorennummer (externalId) für Chargebee cf_debit_number-Suche
+                    external_id = company.get('externalId', '')
+                    debit_number = str(external_id).strip() if str(external_id).strip().isdigit() else ''
+                    if debit_number:
+                        logger.info(f"Planhat externalId (Debitnr): {debit_number}")
+
+                    logger.info(f"Planhat: chargebee_url={chargebee_url!r} debit_number={debit_number!r}")
                     return {
                         'planhat_id': ph_id,
                         'name': name,
-                        'chargebee_id': company.get('externalId', ''),
-                        'debit_number': debit_number,
+                        'chargebee_url': chargebee_url,   # direkter Chargebee-Link aus Planhat
+                        'debit_number': debit_number,      # externalId = Debitorennummer
                         'planhat_url': f"https://app.planhat.com/customer/{ph_id}",
                     }
         except Exception as e:
@@ -443,18 +442,37 @@ def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str,
     base = f"https://{site}.chargebee.com/api/v2"
     auth = (api_key, '')
 
-    # --- Versuch 1: Planhat → Debitorennummer → Chargebee cf_debit_number (eindeutig) ---
+    # --- Versuch 1: Planhat → direkter Chargebee-Link oder Debitorennummer ---
     if planhat_token:
         ph = _planhat_company_search(customer_name, planhat_token)
-        if ph and ph.get('debit_number'):
-            logger.info(f"Planhat: '{ph['name']}' → Debitnr={ph['debit_number']}")
-            result = _search_by_debit_number(
-                ph['debit_number'], base, auth, site, ph['name']
-            )
-            if result:
-                return result
-        elif ph:
-            logger.info(f"Planhat: '{ph.get('name')}' — keine Debitorennummer gefunden")
+        if ph:
+            # Strategie A: Chargebee-URL direkt aus Planhat-Links
+            if ph.get('chargebee_url'):
+                cb_url = ph['chargebee_url']
+                # Customer-URL → Subscriptions laden
+                if '/d/customers/' in cb_url:
+                    customer_id = cb_url.split('/d/customers/')[-1].split('/')[0].split('?')[0]
+                    logger.info(f"Planhat Chargebee-Customer-URL → {customer_id}")
+                    result = _fetch_subscriptions_for_customer(customer_id, base, auth, site, ph['name'])
+                    if result:
+                        return result
+                # Subscription-URL → direkt laden
+                elif '/d/subscriptions/' in cb_url:
+                    sub_id = cb_url.split('/d/subscriptions/')[-1].split('/')[0].split('?')[0]
+                    logger.info(f"Planhat Chargebee-Subscription-URL → {sub_id}")
+                    result = _fetch_subscription_by_id(sub_id, api_key, site)
+                    if result:
+                        result['company'] = ph['name']
+                        return result
+
+            # Strategie B: externalId = Debitorennummer → cf_debit_number-Suche
+            if ph.get('debit_number'):
+                logger.info(f"Planhat: '{ph['name']}' → Debitnr={ph['debit_number']}")
+                result = _search_by_debit_number(ph['debit_number'], base, auth, site, ph['name'])
+                if result:
+                    return result
+
+            logger.info(f"Planhat: kein zuverlässiger Chargebee-Treffer für '{ph.get('name')}'")
         else:
             logger.info(f"Planhat: kein Treffer für '{customer_name}'")
 
