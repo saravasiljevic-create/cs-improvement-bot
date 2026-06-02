@@ -235,27 +235,15 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
                 candidates = resp.json().get('list', [])
                 # company MUSS nicht-leer sein UND zum Suchnamen passen
                 # ("" in "any string" == True in Python → explizit prüfen)
-                # Log alle Kandidaten zur Diagnose
-                for c in candidates[:10]:
-                    cust = c['customer']
-                    logger.info(f"  candidate: id={cust['id']} company={cust.get('company')!r} first={cust.get('first_name')!r} last={cust.get('last_name')!r}")
-
-                # Mindestens 2 Wörter müssen übereinstimmen
-                search_words = set(search_lower.split())
-                min_match = min(2, len(search_words))
-                verified = []
-                for c in candidates:
-                    cust = c['customer']
-                    company = (cust.get('company') or '').strip().lower()
-                    if not company:
-                        continue
-                    company_words = set(company.split())
-                    matching = search_words & company_words
-                    if len(matching) >= min_match:
-                        verified.append(c)
-                        logger.info(f"Chargebee MATCH: {cust['id']} ({cust.get('company')}) words={matching}")
-                if verified:
-                    return verified
+                # Exakter Company-Name-Vergleich (case-insensitive)
+                # Verhindert falsche Treffer wenn Chargebee den Filter ignoriert
+                exact = [
+                    c for c in candidates
+                    if (c['customer'].get('company') or '').strip().lower() == search_lower
+                ]
+                if exact:
+                    logger.info(f"Chargebee exakter Treffer: {exact[0]['customer']['id']} ({exact[0]['customer'].get('company')})")
+                    return exact
         except Exception as e:
             logger.warning(f"Chargebee search [{filter_key}={filter_val!r}] failed: {e}")
     return []
@@ -423,7 +411,11 @@ def _search_by_debit_number(debit_number: str, base: str, auth: tuple,
 
 def _fetch_subscriptions_for_customer(customer_id: str, base: str, auth: tuple,
                                        site: str, company_name: str) -> dict | None:
-    """Lädt Subscriptions für eine bekannte Chargebee Customer-ID."""
+    """Lädt Subscriptions für eine bekannte Chargebee Customer-ID.
+
+    Gibt die aktive Standard-Subscription zurück. Wenn mehrere aktive
+    Subscriptions existieren, wird ein Hinweis in 'multiple_note' gesetzt.
+    """
     try:
         resp = requests.get(
             f"{base}/subscriptions",
@@ -434,15 +426,21 @@ def _fetch_subscriptions_for_customer(customer_id: str, base: str, auth: tuple,
         if not resp.ok:
             return None
         subs = resp.json().get('list', [])
-        active = [s['subscription'] for s in subs if s['subscription'].get('status') == 'active']
+        active = [s['subscription'] for s in subs if s['subscription'].get('status') in ('active', 'non_renewing')]
         candidates = active or [s['subscription'] for s in subs if 'subscription' in s]
         _STD = re.compile(r'^\d{4}-\d{4}-\d{4}-\d{4}$')
         standard = [s for s in candidates if _STD.match(s.get('id', ''))]
-        sub = (standard or candidates)[0] if candidates else None
-        if sub:
-            result = _build_subscription_result(sub, site)
-            result['company'] = company_name
-            return result
+        # Prefer standard-format IDs (current Xentral subscriptions)
+        ordered = standard or candidates
+        if not ordered:
+            return None
+        sub = ordered[0]
+        result = _build_subscription_result(sub, site)
+        result['company'] = company_name
+        # Note if there are multiple subscriptions
+        if len(ordered) > 1:
+            result['multiple_note'] = f"⚠️ *Mehrere Subscriptions gefunden* — bitte manuell prüfen: {', '.join(s.get('id','') for s in ordered)}"
+        return result
     except Exception as e:
         logger.warning(f"_fetch_subscriptions_for_customer({customer_id}) failed: {e}")
     return None
@@ -492,6 +490,8 @@ def _format_found_fields(parsed: dict, subscription: dict | None = None) -> str:
         lines.append(f"• *Kunde:* {parsed['customer_name']}")
     if subscription:
         lines.append(f"• *Chargebee:* <{subscription['url']}|{subscription['subscription_id']}>")
+        if subscription.get('multiple_note'):
+            lines.append(f"  {subscription['multiple_note']}")
         if subscription.get('plan_id'):
             plan_info = f"`{subscription['plan_id']}`"
             if subscription.get('billing_cycle'):
