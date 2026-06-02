@@ -230,15 +230,15 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
             logger.info(f"Chargebee [{filter_key}={filter_val!r}]: status={resp.status_code} results={results}")
             if resp.ok:
                 candidates = resp.json().get('list', [])
-                # Sicherheitsprüfung: Kundenname muss zum Suchnamen passen
-                # (verhindert falsche Treffer wenn Filter ignoriert wird)
-                verified = [
-                    c for c in candidates
-                    if search_lower in (c['customer'].get('company') or '').lower()
-                    or (c['customer'].get('company') or '').lower() in search_lower
-                ]
+                # Sicherheitsprüfung: company MUSS nicht-leer sein UND zum Suchnamen passen
+                # WICHTIG: "" in "any string" == True in Python → explizit auf non-empty prüfen
+                verified = []
+                for c in candidates:
+                    company = (c['customer'].get('company') or '').strip().lower()
+                    if company and (search_lower in company or company in search_lower):
+                        verified.append(c)
                 if verified:
-                    logger.info(f"Chargebee: verifizierter Treffer → {verified[0]['customer']['id']}")
+                    logger.info(f"Chargebee: verifizierter Treffer → {verified[0]['customer']['id']} ({verified[0]['customer'].get('company')})")
                     return verified
         except Exception as e:
             logger.warning(f"Chargebee search [{filter_key}={filter_val!r}] failed: {e}")
