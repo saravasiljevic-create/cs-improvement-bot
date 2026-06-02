@@ -354,12 +354,8 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
 # ---------------------------------------------------------------------------
 
 def _cb_lookup(customer_name: str) -> dict | None:
-    """Chargebee-Lookup (mit Planhat-Fallback) wenn API-Keys konfiguriert, sonst None."""
-    if customer_name and CHARGEBEE_API_KEY:
-        return lookup_chargebee_subscription(
-            customer_name, CHARGEBEE_API_KEY, CHARGEBEE_SITE,
-            planhat_token=PLANHAT_API_TOKEN,
-        )
+    """Chargebee-Lookup — deaktiviert bis der richtige Datensatz zuverlässig gefunden wird.
+    Lieber kein Link als ein falscher Link."""
     return None
 
 
