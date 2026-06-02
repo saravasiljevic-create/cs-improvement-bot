@@ -443,42 +443,26 @@ def lookup_chargebee_subscription(customer_name: str, api_key: str, site: str,
     base = f"https://{site}.chargebee.com/api/v2"
     auth = (api_key, '')
 
-    # --- Versuch 1: Planhat → direkter Chargebee-Link oder Debitorennummer ---
-    if planhat_token:
-        ph = _planhat_company_search(customer_name, planhat_token)
-        if ph:
-            # Strategie A: Chargebee-URL direkt aus Planhat-Links
-            if ph.get('chargebee_url'):
-                cb_url = ph['chargebee_url']
-                # Customer-URL → Subscriptions laden
-                if '/d/customers/' in cb_url:
-                    customer_id = cb_url.split('/d/customers/')[-1].split('/')[0].split('?')[0]
-                    logger.info(f"Planhat Chargebee-Customer-URL → {customer_id}")
-                    result = _fetch_subscriptions_for_customer(customer_id, base, auth, site, ph['name'])
-                    if result:
-                        return result
-                # Subscription-URL → direkt laden
-                elif '/d/subscriptions/' in cb_url:
-                    sub_id = cb_url.split('/d/subscriptions/')[-1].split('/')[0].split('?')[0]
-                    logger.info(f"Planhat Chargebee-Subscription-URL → {sub_id}")
-                    result = _fetch_subscription_by_id(sub_id, api_key, site)
-                    if result:
-                        result['company'] = ph['name']
-                        return result
-
-            # Strategie B: externalId = Debitorennummer → cf_debit_number-Suche
-            if ph.get('debit_number'):
-                logger.info(f"Planhat: '{ph['name']}' → Debitnr={ph['debit_number']}")
-                result = _search_by_debit_number(ph['debit_number'], base, auth, site, ph['name'])
-                if result:
-                    return result
-
-            logger.info(f"Planhat: kein zuverlässiger Chargebee-Treffer für '{ph.get('name')}'")
+    # Direkte Chargebee-Namenssuche (Planhat deaktiviert — Links dort fehlerhaft)
+    # MCP-Test bestätigt: company[starts_with]=wev findet exakt BTcLSNTO7WSZBjCd
+    try:
+        customers = _chargebee_customer_search(base, auth, customer_name)
+        if customers:
+            customer = customers[0]['customer']
+            company_name = (
+                customer.get('company')
+                or f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
+            )
+            result = _fetch_subscriptions_for_customer(
+                customer['id'], base, auth, site, company_name
+            )
+            if result:
+                return result
         else:
-            logger.info(f"Planhat: kein Treffer für '{customer_name}'")
+            logger.info(f"Chargebee: kein Treffer für '{customer_name}'")
+    except Exception as e:
+        logger.warning(f"Chargebee-Suche Fehler für '{customer_name}': {e}")
 
-    # --- Versuch 2: kein Link — lieber nichts als falsch ---
-    logger.info(f"Kein zuverlässiger Chargebee-Treffer für '{customer_name}'")
     return None
 
 
