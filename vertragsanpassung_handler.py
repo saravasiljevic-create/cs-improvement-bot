@@ -214,28 +214,25 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
         ('company[starts_with]', name_no_suffix),
         ('company[starts_with]', first_word),   # Fallback auf erstes Wort (z.B. "wev")
     ]
-    seen = set()
-    for param_key, param_val in strategies:
-        if not param_val or param_val in seen:
+    # WICHTIG: requests encodiert [ ] → %5B %5D — Chargebee ignoriert den Filter dann
+    # und gibt ALLE Kunden zurück. URL muss mit literalen Klammern gebaut werden.
+    from urllib.parse import quote as _q
+    seen: set = set()
+    for filter_key, filter_val in strategies:
+        if not filter_val or filter_val in seen:
             continue
-        seen.add(param_val)
+        seen.add(filter_val)
         try:
-            resp = requests.get(
-                f"{base}/customers",
-                params={param_key: param_val, 'limit': 5},
-                auth=auth, timeout=10,
-            )
-            logger.info(
-                f"Chargebee search [{param_key}={param_val!r}]: "
-                f"status={resp.status_code}, "
-                f"results={len(resp.json().get('list', [])) if resp.ok else 'error'}"
-            )
+            url = f"{base}/customers?{filter_key}={_q(filter_val)}&limit=5"
+            resp = requests.get(url, auth=auth, timeout=10)
+            results = len(resp.json().get('list', [])) if resp.ok else 'error'
+            logger.info(f"Chargebee [{filter_key}={filter_val!r}]: status={resp.status_code} results={results}")
             if resp.ok:
                 customers = resp.json().get('list', [])
                 if customers:
                     return customers
         except Exception as e:
-            logger.warning(f"Chargebee search [{param_key}={param_val!r}] failed: {e}")
+            logger.warning(f"Chargebee search [{filter_key}={filter_val!r}] failed: {e}")
     return []
 
 
