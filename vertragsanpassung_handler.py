@@ -214,9 +214,6 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
         ('company[starts_with]', name_no_suffix),
         ('company[starts_with]', first_word),   # Fallback auf erstes Wort (z.B. "wev")
     ]
-    # WICHTIG: requests encodiert [ ] → %5B %5D — Chargebee ignoriert den Filter dann
-    # und gibt ALLE Kunden zurück. URL muss mit literalen Klammern gebaut werden.
-    from urllib.parse import quote as _q
     search_lower = customer_name.lower()
     seen: set = set()
     for filter_key, filter_val in strategies:
@@ -224,21 +221,27 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
             continue
         seen.add(filter_val)
         try:
-            url = f"{base}/customers?{filter_key}={_q(filter_val)}&limit=5"
-            resp = requests.get(url, auth=auth, timeout=10)
-            results = len(resp.json().get('list', [])) if resp.ok else 'error'
-            logger.info(f"Chargebee [{filter_key}={filter_val!r}]: status={resp.status_code} results={results}")
+            # params={} lässt requests die Brackets als %5B%5D encodieren
+            # (identisches Format wie Chargebee-SDK und MCP-Tools verwenden)
+            resp = requests.get(
+                f"{base}/customers",
+                params={filter_key: filter_val, 'limit': 100},  # limit=100 um wev Schmalkalden sicher zu treffen
+                auth=auth,
+                timeout=10,
+            )
+            total = len(resp.json().get('list', [])) if resp.ok else 'error'
+            logger.info(f"Chargebee [{filter_key}={filter_val!r}]: status={resp.status_code} total={total}")
             if resp.ok:
                 candidates = resp.json().get('list', [])
-                # Sicherheitsprüfung: company MUSS nicht-leer sein UND zum Suchnamen passen
-                # WICHTIG: "" in "any string" == True in Python → explizit auf non-empty prüfen
+                # company MUSS nicht-leer sein UND zum Suchnamen passen
+                # ("" in "any string" == True in Python → explizit prüfen)
                 verified = []
                 for c in candidates:
                     company = (c['customer'].get('company') or '').strip().lower()
                     if company and (search_lower in company or company in search_lower):
                         verified.append(c)
+                        logger.info(f"Chargebee verifiziert: {c['customer']['id']} ({c['customer'].get('company')})")
                 if verified:
-                    logger.info(f"Chargebee: verifizierter Treffer → {verified[0]['customer']['id']} ({verified[0]['customer'].get('company')})")
                     return verified
         except Exception as e:
             logger.warning(f"Chargebee search [{filter_key}={filter_val!r}] failed: {e}")
