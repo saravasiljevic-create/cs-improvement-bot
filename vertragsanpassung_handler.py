@@ -235,20 +235,25 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
                 candidates = resp.json().get('list', [])
                 # company MUSS nicht-leer sein UND zum Suchnamen passen
                 # ("" in "any string" == True in Python → explizit prüfen)
+                # Log alle Kandidaten zur Diagnose
+                for c in candidates[:10]:
+                    cust = c['customer']
+                    logger.info(f"  candidate: id={cust['id']} company={cust.get('company')!r} first={cust.get('first_name')!r} last={cust.get('last_name')!r}")
+
                 # Mindestens 2 Wörter müssen übereinstimmen
-                # "wev" (1 Wort) darf "wev schmalkalden" nicht matchen
                 search_words = set(search_lower.split())
                 min_match = min(2, len(search_words))
                 verified = []
                 for c in candidates:
-                    company = (c['customer'].get('company') or '').strip().lower()
+                    cust = c['customer']
+                    company = (cust.get('company') or '').strip().lower()
                     if not company:
                         continue
                     company_words = set(company.split())
                     matching = search_words & company_words
                     if len(matching) >= min_match:
                         verified.append(c)
-                        logger.info(f"Chargebee match: {c['customer']['id']} ({c['customer'].get('company')}) words={matching}")
+                        logger.info(f"Chargebee MATCH: {cust['id']} ({cust.get('company')}) words={matching}")
                 if verified:
                     return verified
         except Exception as e:
