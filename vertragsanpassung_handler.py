@@ -421,11 +421,11 @@ def _fetch_subscriptions_for_customer(customer_id: str, base: str, auth: tuple,
     Subscriptions existieren, wird ein Hinweis in 'multiple_note' gesetzt.
     """
     try:
-        resp = requests.get(
-            f"{base}/subscriptions",
-            params={'customer_id': customer_id, 'limit': 10},
-            auth=auth, timeout=10,
-        )
+        from urllib.parse import quote as _q
+        # customer_id[is] mit literalen Klammern — params={} encodiert sie und
+        # Chargebee ignoriert den Filter ggf., daher direkter URL-Build
+        url = f"{base}/subscriptions?customer_id[is]={_q(customer_id)}&limit=10"
+        resp = requests.get(url, auth=auth, timeout=10)
         logger.info(f"Chargebee subscriptions?customer_id={customer_id}: status={resp.status_code}")
         if not resp.ok:
             return None
@@ -708,11 +708,7 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
                 f"⚠️ *Ramp nötig:* Vertragsbeginn ({parsed['effective_date']}) liegt in der Zukunft "
                 "→ in Chargebee über Tab \"Ramps\" → \"Add Ramp\" anlegen"
             )
-    if parsed.get('has_discount'):
-        warnings.append(
-            "⚠️ *Discount erkannt:* Manuell eintragen — erst Approval aus "
-            "*#approval-discount-refunds* einholen. *Nie als Price Override!*"
-        )
+    # Discount-Hinweis bewusst weggelassen (wird manuell behandelt)
 
     # Kontextuelle Hinweise aus Chargebee-Daten
     suggestions = _build_suggestions(parsed, subscription) if subscription else []
@@ -720,8 +716,7 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
     next_steps = (
         "1. Subscription in Chargebee öffnen (Link oben)\n"
         "2. Plan & Add-Ons laut Zusammenfassung eintragen\n"
-        "3. Bei Discount: erst Approval in #approval-discount-refunds\n"
-        "4. Im Thread als ✅ done markieren"
+        "3. Im Thread als ✅ done markieren"
     )
 
     blocks: list[dict] = [
