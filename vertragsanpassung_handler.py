@@ -283,7 +283,8 @@ def _planhat_company_search(customer_name: str, api_token: str) -> dict | None:
                     company = companies[0]
                     ph_id = company.get('_id', '')
                     name = company.get('name', customer_name)
-                    logger.info(f"Planhat company '{name}' keys: {list(company.keys())}")
+                    import json as _json
+                    logger.info(f"Planhat company FULL: {_json.dumps(company, default=str)[:3000]}")
 
                     # 1) Chargebee-Link direkt aus Planhat-Links extrahieren
                     # (sichtbar in Planhat UI unter "Links & Tags" → "Chargebee")
