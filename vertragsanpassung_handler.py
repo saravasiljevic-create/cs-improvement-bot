@@ -25,11 +25,14 @@ _CS_ADMIN_IDS = ('U07G83YH6RW', 'U092RN6D339', 'U07TRKK8BH9')
 _STRONG = [
     r'vertrags\s*anpassung',
     r'vertrags\s*[äa]nderung',
-    r'vertrags\s*verlängerung',   # Vertragsverlängerung
+    r'vertrags\s*verlängerung',
     r'vertragswechsel',
     r'unterschriebene[snm]?\s+angebot',
+    r'unterzeichnetes?\s+angebot',          # "unterzeichnete Angebot" (Synonym)
     r'angebot.{0,60}unterschrieben',
     r'unterschrieben.{0,60}angebot',
+    r'angebot.{0,60}unterzeichnet',
+    r'unterzeichnet.{0,60}angebot',         # "unterzeichnete Angebot: https://..."
     r'signed\s+(?:offer|contract|proposal)',
 ]
 
@@ -46,13 +49,18 @@ _MEDIUM = [
     r'(?:monatlich|jährlich)\w*\s+(?:miete|gebühr|preis|beitrag)',
     r'(?:subscription|abo|vertrag|konditionen)\s+(?:ändern|anpassen|wechseln|korrigieren)',
     r'könnt?\s+(?:ihr|sie).{0,30}(?:ändern|anpassen|korrigieren|umstellen)',
+    # Upgrade/Downgrade-Signale
+    r'\bupgrad\w*\b',                       # "upgrade", "upgraden", "upgradet"
+    r'grad\w*\s+.{0,80}\s+up\b',           # "gradet ... auf ... up" (DE Anglizismus)
+    r'(?:auf|zum?)\s+(?:das?\s+)?(?:pro|premium|enterprise|business|starter|growth)\s+(?:paket|plan|tarif|abo)',
+    r'(?:paket|tarif|plan)\s+(?:up\b|upgrade)',
     # Verlängerungs-Signale
-    r'verlängerung.{0,50}vertrags?',        # "Verlängerung seines Vertrags"
-    r'vertrags?.{0,30}verlänger\w*',        # "Vertrag verlängert / verlängern"
-    r'\d+[\s\-]?jahres?[\s\-]?umstellung',  # "2-Jahres-Umstellung"
-    r'\d+\s*(?:monats?|jahres?)\s*verlängerung',  # "24-Monats-Verlängerung"
-    r'um\s+\d+\s+(?:jahre?|monate?)\s+verlänger',  # "um 24 Monate verlängern"
-    r'verlänger\w*\s+um\s+\d+',             # "verlängert um 24"
+    r'verlängerung.{0,50}vertrags?',
+    r'vertrags?.{0,30}verlänger\w*',
+    r'\d+[\s\-]?jahres?[\s\-]?umstellung',
+    r'\d+\s*(?:monats?|jahres?)\s*verlängerung',
+    r'um\s+\d+\s+(?:jahre?|monate?)\s+verlänger',
+    r'verlänger\w*\s+um\s+\d+',
 ]
 
 
