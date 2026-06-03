@@ -234,10 +234,12 @@ def fetch_offer_data(url: str) -> dict:
         soup = BeautifulSoup(resp.text, 'html.parser')
         result: dict = {}
 
-        # --- Firmenname ---
-        # Xentral-Angebote zeigen den Kundennamen typisch in h1/h2 oder einem
-        # Adress-/Empfängerblock. Wir probieren mehrere Selektoren.
+        # Normalisiere Non-Breaking-Spaces und andere Unicode-Whitespace
         full_text = soup.get_text(separator='\n', strip=True)
+        full_text = full_text.replace('\xa0', ' ').replace(' ', ' ').replace(' ', ' ')
+
+        # Log ersten 800 Zeichen für Debugging
+        logger.info(f"Offer page text (first 800): {full_text[:800]!r}")
 
         company_candidates = []
 
@@ -282,17 +284,16 @@ def fetch_offer_data(url: str) -> dict:
         # --- Plan + Zahlweise aus Produkte & Services ---
         # Format: "Pro 25 | 12-Monatsvertrag [monatliche Zahlung] inkl. ..."
         # Auch: "Pro 25 | 1-Jahresvertrag [jährliche Zahlung]"
-        # Plan-Pattern flexibel für Tabellen (Zellen durch \n getrennt)
-        # Erwartet: "Pro 25 | 12-Monatsvertrag [monatliche Zahlung] inkl. ..."
-        # Oder Tabellen: "Pro 25\n|\n12-Monatsvertrag\n[monatliche Zahlung]"
+        # Plan-Pattern: "Pro 25 | 12-Monatsvertrag [monatliche Zahlung]"
         plan_re = re.compile(
-            r'([\w][\w\s\-]*?\d+[\w\s\-]*?)'  # Plan-Name mit Zahl (z.B. "Pro 25")
-            r'[\s\n]*\|[\s\n]*'                # Pipe-Trennzeichen
-            r'([\d]+[\s\-]?(?:Monats|Jahres)vertrag[^\[\n]*)'  # Vertragstyp
-            r'[\s\n]*\[([^\]\n]+)\]',           # [Zahlweise]
+            r'([\w][\w \-]*?\d+[\w \-]*?)'    # Plan-Name mit Zahl
+            r'[ ]*[|｜][ ]*'                   # Pipe (normal oder Unicode)
+            r'([\d]+[ \-]?(?:Monats|Jahres)vertrag[^\[\n]*)'
+            r'[ ]*\[([^\]\n]+)\]',
             re.IGNORECASE | re.MULTILINE,
         )
         plan_match = plan_re.search(full_text)
+        logger.info(f"Plan regex match: {bool(plan_match)} | searched in {len(full_text)} chars")
         if plan_match:
             plan_raw = plan_match.group(1).strip()
             contract_raw = plan_match.group(2).strip()
