@@ -199,6 +199,95 @@ def missing_va_fields(parsed: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Offer-Page Parser
+# ---------------------------------------------------------------------------
+
+def fetch_offer_data(url: str) -> dict:
+    """Lädt eine Xentral-Angebots-URL und extrahiert Vertragsinformationen.
+
+    Liest aus der HTML-Seite:
+    - Firmenname (oben auf der Seite)
+    - Plan + Zahlweise aus "Produkte & Services" (Format: "Plan | 12-Monatsvertrag [monatliche Zahlung]")
+    """
+    try:
+        resp = requests.get(
+            url,
+            timeout=15,
+            headers={'User-Agent': 'Mozilla/5.0 (compatible; CS-Admin-Bot/1.0)'},
+        )
+        if not resp.ok:
+            logger.warning(f"Offer URL {url}: HTTP {resp.status_code}")
+            return {}
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        result: dict = {}
+
+        # --- Firmenname ---
+        # Xentral-Angebote zeigen den Kundennamen typisch in h1/h2 oder einem
+        # Adress-/Empfängerblock. Wir probieren mehrere Selektoren.
+        full_text = soup.get_text(separator='\n', strip=True)
+
+        company_candidates = []
+        for tag in soup.find_all(['h1', 'h2', 'h3']):
+            t = tag.get_text(strip=True)
+            if 5 < len(t) < 100:
+                company_candidates.append(t)
+
+        # Alternativ: suche nach GmbH/AG-Suffix im Text (erstes Vorkommen)
+        if not company_candidates:
+            m = re.search(
+                r'([A-ZÄÖÜ][a-zA-ZäöüÄÖÜ\s&.\-]{2,50}'
+                r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|GbR)(?:\s*&\s*Co\.?\s*KG)?)',
+                full_text,
+            )
+            if m:
+                company_candidates.append(m.group(1).strip())
+
+        if company_candidates:
+            result['customer_name'] = company_candidates[0]
+
+        # --- Plan + Zahlweise aus Produkte & Services ---
+        # Format: "Pro 25 | 12-Monatsvertrag [monatliche Zahlung] inkl. ..."
+        # Auch: "Pro 25 | 1-Jahresvertrag [jährliche Zahlung]"
+        plan_re = re.compile(
+            r'([\w\s\-]+?)'              # Plan-Name (z.B. "Pro 25")
+            r'\s*\|\s*'                  # Trennzeichen
+            r'(\d+[-\s]?(?:Monats|Jahres)vertrag[^[\n]*)'  # Vertragstyp
+            r'\s*\[([^\]\n]+)\]',        # [Zahlweise]
+            re.IGNORECASE,
+        )
+        plan_match = plan_re.search(full_text)
+        if plan_match:
+            plan_raw = plan_match.group(1).strip()
+            contract_raw = plan_match.group(2).strip()
+            payment_raw = plan_match.group(3).strip().lower()
+
+            result['new_plan'] = plan_raw
+
+            if 'monatl' in payment_raw:
+                result['payment_type'] = 'monatlich'
+            elif 'jährl' in payment_raw or 'yearly' in payment_raw or 'annual' in payment_raw:
+                result['payment_type'] = 'jährlich'
+
+            # Laufzeit aus Vertragstyp extrahieren
+            dur = re.search(r'(\d+)', contract_raw)
+            if dur:
+                n = int(dur.group(1))
+                if 'Monats' in contract_raw:
+                    result['contract_months'] = n
+                elif 'Jahres' in contract_raw:
+                    result['contract_months'] = n * 12
+
+        logger.info(f"Offer data from {url}: {result}")
+        return result
+
+    except Exception as e:
+        logger.warning(f"fetch_offer_data({url}) failed: {e}")
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Chargebee + Planhat Lookup (read-only)
 # ---------------------------------------------------------------------------
 

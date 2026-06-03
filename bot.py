@@ -27,6 +27,7 @@ from vertragsanpassung_handler import (
     build_cs_admin_subscription_blocks,
     build_va_summary_blocks,
     detect_vertragsanpassung,
+    fetch_offer_data,
     lookup_chargebee_subscription,
     missing_va_fields,
     parse_vertragsanpassung,
@@ -366,6 +367,22 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
 # Vertragsanpassungs-Flow helpers
 # ---------------------------------------------------------------------------
 
+def _enrich_from_offer(parsed: dict) -> dict:
+    """Lädt Vertragsdaten aus der Angebots-URL und ergänzt fehlende Felder."""
+    url = parsed.get('offer_link')
+    if not url:
+        return parsed
+    try:
+        offer_data = fetch_offer_data(url)
+        for key, value in offer_data.items():
+            if value and not parsed.get(key):  # nur fehlende Felder ergänzen
+                parsed[key] = value
+                logger.info(f"Offer enrichment: {key}={value!r}")
+    except Exception as e:
+        logger.warning(f"Offer enrichment failed: {e}")
+    return parsed
+
+
 def _cb_lookup(customer_name: str) -> dict | None:
     """Chargebee-Lookup per Kundenname (exakter Company-Match)."""
     if not customer_name or not CHARGEBEE_API_KEY:
@@ -483,7 +500,7 @@ def _handle_message_core(event, say, client):
 
         # --- Vertragsanpassung: follow-up to pending state ---
         if va_state and va_state.get('user_id') == user_id:
-            new_parsed = parse_vertragsanpassung(text)
+            new_parsed = _enrich_from_offer(parse_vertragsanpassung(text))
             # Merge: only fill empty fields from the follow-up reply
             for k, v in new_parsed.items():
                 if v and not va_state['parsed'].get(k):
@@ -523,7 +540,7 @@ def _handle_message_core(event, say, client):
                 logger.warning(f"conversations_replies failed in VA trigger: {e}")
                 root_text = ''
             _set_eyes(client, channel, thread_ts)
-            parsed = parse_vertragsanpassung(root_text or text)
+            parsed = _enrich_from_offer(parse_vertragsanpassung(root_text or text))
             subscription = _cb_lookup(parsed.get('customer_name', ''))
             missing = missing_va_fields(parsed)
             if missing:
@@ -747,7 +764,7 @@ def _handle_message_core(event, say, client):
     # --- Vertragsanpassung: auto-detection (only in VA channel) ---
     if _in_va and detect_vertragsanpassung(text):
         _set_eyes(client, channel, ts)
-        parsed = parse_vertragsanpassung(text)
+        parsed = _enrich_from_offer(parse_vertragsanpassung(text))
         subscription = _cb_lookup(parsed.get('customer_name', ''))
         missing = missing_va_fields(parsed)
         if missing:

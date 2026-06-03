@@ -3,3 +3,4 @@ flask==3.0.3
 python-dotenv==1.0.0
 requests==2.31.0
 jira>=3.5.0,<4.0.0
+beautifulsoup4>=4.12.0
