@@ -44,8 +44,12 @@ _CB_URL_RE = re.compile(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_BOT_VERSION = "v2.1-fix-empty-company"  # updated 2026-06-02
+_BOT_VERSION = "v2.4"
 logger.info(f"Bot starting — version {_BOT_VERSION}")
+
+# Custom-Emoji für die VA-Zusammenfassung (Slack-Name ohne Doppelpunkte)
+# Sobald das Custom-Emoji erstellt ist, diesen Wert anpassen:
+VA_DONE_EMOJI = os.environ.get('VA_DONE_EMOJI', 'white_check_mark')
 
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
@@ -412,8 +416,21 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
 
     # Eindeutige Subscription (oder keine) → direkt Zusammenfassung
     blocks = build_va_summary_blocks(parsed, subscription, user_name)
+    # CS Admin Team in der Zusammenfassung erwähnen
+    admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
+    blocks.append({
+        'type': 'section',
+        'text': {
+            'type': 'mrkdwn',
+            'text': (
+                f":{VA_DONE_EMOJI}: {admin_mentions} — bitte prüfen und Go geben!"
+            ),
+        },
+    })
     say(blocks=blocks, text="📋 Vertragsanpassung — Zusammenfassung", thread_ts=thread_ts)
-    _set_done(client, channel, thread_ts)
+    # Reaktion auf Root-Nachricht (👀 → custom emoji)
+    _remove_reaction(client, channel, thread_ts, 'eyes')
+    _add_reaction(client, channel, thread_ts, VA_DONE_EMOJI)
     _pending_vertragsanpassung.pop((channel, thread_ts), None)
 
 
