@@ -85,7 +85,7 @@ _DATE_RE = re.compile(
     r'|jan|feb|mär|apr|jun|jul|aug|sep|okt|nov|dez)\w*\.?\s*\d{2,4})\b',
     re.IGNORECASE,
 )
-_URL_RE = re.compile(r'https?://\S+')
+_URL_RE = re.compile(r'https?://[^\s<>"\'>\])]+')
 _PAYMENT_RE = re.compile(
     r'\b(jährlich|monatlich|annual(?:ly)?|yearly|monthly|quarterly|quartalsweise)\b',
     re.IGNORECASE,
