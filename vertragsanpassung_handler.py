@@ -13,6 +13,44 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Chargebee Plan-ID Lookup
+# ---------------------------------------------------------------------------
+
+_PLAN_SLUG: dict[str, str] = {
+    'pro 25': 'pro', 'pro25': 'pro', 'pro': 'pro',
+    'pro 2025': 'pro-25', 'pro2025': 'pro-25',
+    'pro 23': 'pro23', 'pro2023': 'pro23',
+    'business 25': 'business', 'business25': 'business', 'business': 'business',
+    'business 2025': 'business-25', 'business2025': 'business-25',
+    'scale': 'scale',
+    'starter': 'starter',
+    'launch 25': 'launch', 'launch25': 'launch', 'launch': 'launch',
+}
+_DURATION_SLUG: dict[int, str] = {1: 'monthly', 12: 'annual', 24: 'biennial', 36: 'triennial'}
+_PAYMENT_SLUG: dict[str, str] = {
+    'jährlich': 'annual', 'jaehrlich': 'annual', 'annual': 'annual', 'yearly': 'annual',
+    'monatlich': 'monthly', 'monthly': 'monthly',
+    'quartalsweise': 'quarterly', 'quarterly': 'quarterly',
+}
+
+
+def resolve_chargebee_plan_id(plan_name: str, contract_months: int, payment_type: str) -> str | None:
+    """Leitet die Chargebee item_price_id ab.
+
+    Beispiel: ('Pro 25', 24, 'jährlich') → 'pro-biennial-contract-annual-payment'
+    """
+    slug = _PLAN_SLUG.get(plan_name.lower().strip())
+    if not slug:
+        # Fallback: kebab-case des Namens
+        slug = re.sub(r'\s+', '-', plan_name.lower().strip())
+    duration = _DURATION_SLUG.get(contract_months)
+    payment = _PAYMENT_SLUG.get(payment_type.lower().strip())
+    if not duration or not payment:
+        return None
+    return f"{slug}-{duration}-contract-{payment}-payment"
+
+
 # CS Admin Slack User IDs für @-Mentions in der Subscription-Warnung
 # Mirjam Köberlein, Linda Litzkow, Sara Vasiljevic
 _CS_ADMIN_IDS = ('U07G83YH6RW', 'U092RN6D339', 'U07TRKK8BH9')
@@ -200,19 +238,41 @@ def parse_vertragsanpassung(text: str) -> dict:
         else:
             result['payment_type'] = 'quartalsweise'
 
-    # Plan: erst "Plan | N-Monatsvertrag [Zahlung]"-Format (direkt im Text wie im Angebot)
+    # Plan: erst "Plan | N-Monatsvertrag [Zahlung] inkl. X"-Format (wie im Angebot)
     _inline_plan = re.compile(
-        r'([\w][\w \-]*?\d+[\w \-]*?)[ ]*\|[ ]*([\d]+[ \-]?(?:Monats|Jahres)vertrag[^\[]*)\[([^\]]+)\]',
+        r'([\w][\w \-]*?\d+[\w \-]*?)'          # Plan-Name mit Zahl (z.B. "Pro 25")
+        r'[ ]*\|[ ]*'                             # Pipe
+        r'([\d]+[ \-]?(?:Monats|Jahres)vertrag[^\[]*)'  # Vertragstyp
+        r'\[([^\]]+)\]'                           # [Zahlweise]
+        r'([^\n]*)',                               # inkl. X (optional)
         re.IGNORECASE,
     )
     inline = _inline_plan.search(text)
     if inline:
-        result['new_plan'] = inline.group(1).strip()
-        _p = inline.group(3).strip().lower()
-        if 'monatl' in _p:
+        plan_base = inline.group(1).strip()
+        contract_raw = inline.group(2).strip()
+        payment_raw = inline.group(3).strip()
+        inkl = inline.group(4).strip()
+        # Vollständiger Plan-Name wie im Angebot
+        result['new_plan'] = plan_base
+        result['plan_full_name'] = (
+            f"{plan_base} | {contract_raw} [{payment_raw}]"
+            + (f" {inkl}" if inkl else '')
+        ).strip()
+        if 'monatl' in payment_raw.lower():
             result['payment_type'] = 'monatlich'
-        elif 'jährl' in _p or 'annual' in _p:
+        elif 'jährl' in payment_raw.lower() or 'annual' in payment_raw.lower():
             result['payment_type'] = 'jährlich'
+        # Laufzeit in Monaten
+        _dur = re.search(r'(\d+)', contract_raw)
+        if _dur:
+            n = int(_dur.group(1))
+            result['contract_months'] = n * 12 if 'Jahres' in contract_raw else n
+        # Chargebee plan_id auflösen
+        if result.get('payment_type') and result.get('contract_months'):
+            pid = resolve_chargebee_plan_id(plan_base, result['contract_months'], result['payment_type'])
+            if pid:
+                result['chargebee_plan_id'] = pid
     else:
         m = _PLAN_RE.search(text)
         if m:
@@ -361,23 +421,32 @@ def fetch_offer_data(url: str) -> dict:
         if plan_match:
             plan_raw = plan_match.group(1).strip()
             contract_raw = plan_match.group(2).strip()
-            payment_raw = plan_match.group(3).strip().lower()
+            payment_raw = plan_match.group(3).strip()
+            # "inkl. X" nach dem Match
+            after = full_text[plan_match.end():plan_match.end() + 60].split('\n')[0].strip()
+            inkl = after if after.lower().startswith('inkl') else ''
 
             result['new_plan'] = plan_raw
+            result['plan_full_name'] = (
+                f"{plan_raw} | {contract_raw} [{payment_raw}]"
+                + (f" {inkl}" if inkl else '')
+            ).strip()
 
-            if 'monatl' in payment_raw:
+            payment_lower = payment_raw.lower()
+            if 'monatl' in payment_lower:
                 result['payment_type'] = 'monatlich'
-            elif 'jährl' in payment_raw or 'yearly' in payment_raw or 'annual' in payment_raw:
+            elif 'jährl' in payment_lower or 'annual' in payment_lower:
                 result['payment_type'] = 'jährlich'
 
-            # Laufzeit aus Vertragstyp extrahieren
             dur = re.search(r'(\d+)', contract_raw)
             if dur:
                 n = int(dur.group(1))
-                if 'Monats' in contract_raw:
-                    result['contract_months'] = n
-                elif 'Jahres' in contract_raw:
-                    result['contract_months'] = n * 12
+                months = n * 12 if 'Jahres' in contract_raw else n
+                result['contract_months'] = months
+                if result.get('payment_type'):
+                    pid = resolve_chargebee_plan_id(plan_raw, months, result['payment_type'])
+                    if pid:
+                        result['chargebee_plan_id'] = pid
 
         logger.info(f"Offer data from {url}: {result}")
         return result
@@ -880,8 +949,13 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
     soll_lines = []
     if parsed.get('new_plan'):
         old = subscription.get('plan_id', '') if subscription else ''
-        arrow = f" _(war: `{old}`)_" if old and old.lower() != parsed['new_plan'].lower() else ''
-        soll_lines.append(f"• Neuer Plan: `{parsed['new_plan']}`{arrow}")
+        # Vollständiger Planname (mit Vertragslaufzeit + Zahlweise + inkl.)
+        plan_display = parsed.get('plan_full_name') or parsed['new_plan']
+        arrow = f" _(war: `{old}`)_" if old and old.lower() not in (parsed['new_plan'].lower(), plan_display.lower()) else ''
+        soll_lines.append(f"• Neuer Plan: {plan_display}{arrow}")
+        # Chargebee item_price_id (für Automatisierung)
+        if parsed.get('chargebee_plan_id'):
+            soll_lines.append(f"  → Chargebee `item_price_id`: `{parsed['chargebee_plan_id']}`")
     if parsed.get('payment_type'):
         soll_lines.append(f"• Zahlweise: {parsed['payment_type']}")
     if parsed.get('effective_date'):
