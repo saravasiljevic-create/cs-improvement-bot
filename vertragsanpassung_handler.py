@@ -91,7 +91,8 @@ _PAYMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _PLAN_RE = re.compile(
-    r'\b(?:growth\s*[mlxs]?|pro\s*(?:25|2025)?(?:\s*legacy)?|starter|enterprise'
+    # "pro" MUSS eine Zahl dahinter haben (verhindert Match auf "pro Paket")
+    r'\b(?:growth\s*[mlxs]?|pro\s*\d+(?:\s*legacy)?|starter|enterprise'
     r'|basic|premium|scale|connect(?:\s*only)?)\b',
     re.IGNORECASE,
 )
@@ -131,15 +132,25 @@ def parse_vertragsanpassung(text: str) -> dict:
     """Extrahiert strukturierte Felder aus einer Vertragsanpassungs-Anfrage im Freitext."""
     result: dict = {}
 
+    def _trim_to_company_suffix(name: str) -> str:
+        """Schneidet alles nach dem rechtlichen Suffix ab (GmbH, AG, ...)."""
+        suffix = re.search(
+            r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?',
+            name, re.IGNORECASE,
+        )
+        if suffix:
+            name = name[:suffix.end()].strip()
+        return name
+
     m = _CUSTOMER_LABELED_RE.search(text)
     if m:
-        raw = m.group(1).strip()
-        result['customer_name'] = _STRIP_COMPANY_PREFIX_RE.sub('', raw).strip()
+        raw = _STRIP_COMPANY_PREFIX_RE.sub('', m.group(1)).strip()
+        result['customer_name'] = _trim_to_company_suffix(raw)
     else:
         m = _COMPANY_SUFFIX_RE.search(text)
         if m:
-            raw = m.group(1).strip()
-            result['customer_name'] = _STRIP_COMPANY_PREFIX_RE.sub('', raw).strip()
+            raw = _STRIP_COMPANY_PREFIX_RE.sub('', m.group(1)).strip()
+            result['customer_name'] = _trim_to_company_suffix(raw)
 
     urls = _URL_RE.findall(text)
     if urls:
@@ -229,15 +240,28 @@ def fetch_offer_data(url: str) -> dict:
         full_text = soup.get_text(separator='\n', strip=True)
 
         company_candidates = []
+
+        # Heading-Tags
         for tag in soup.find_all(['h1', 'h2', 'h3']):
             t = tag.get_text(strip=True)
-            if 5 < len(t) < 100:
+            if 5 < len(t) < 120:
                 company_candidates.append(t)
 
-        # Alternativ: suche nach GmbH/AG-Suffix im Text (erstes Vorkommen)
+        # Elemente mit typischen Klassen für Empfänger-/Kundenname
+        if not company_candidates:
+            for sel in ['.company', '.customer', '.recipient', '.empfaenger',
+                        '[class*="company"]', '[class*="recipient"]', '[class*="address"]']:
+                el = soup.select_one(sel)
+                if el:
+                    t = el.get_text(strip=True)
+                    if 5 < len(t) < 120:
+                        company_candidates.append(t)
+                        break
+
+        # GmbH/AG-Suffix-Suche im Text (erstes Vorkommen)
         if not company_candidates:
             m = re.search(
-                r'([A-ZÄÖÜ][a-zA-ZäöüÄÖÜ\s&.\-]{2,50}'
+                r'([A-ZÄÖÜ][a-zA-ZäöüÄÖÜ\s&.\-]{2,60}'
                 r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|GbR)(?:\s*&\s*Co\.?\s*KG)?)',
                 full_text,
             )
@@ -245,17 +269,28 @@ def fetch_offer_data(url: str) -> dict:
                 company_candidates.append(m.group(1).strip())
 
         if company_candidates:
-            result['customer_name'] = company_candidates[0]
+            # Nur bis zum ersten GmbH/AG/... kürzen
+            name = company_candidates[0]
+            suffix = re.search(
+                r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|GbR)(?:\s*&\s*Co\.?\s*KG)?',
+                name, re.IGNORECASE,
+            )
+            if suffix:
+                name = name[:suffix.end()].strip()
+            result['customer_name'] = name
 
         # --- Plan + Zahlweise aus Produkte & Services ---
         # Format: "Pro 25 | 12-Monatsvertrag [monatliche Zahlung] inkl. ..."
         # Auch: "Pro 25 | 1-Jahresvertrag [jährliche Zahlung]"
+        # Plan-Pattern flexibel für Tabellen (Zellen durch \n getrennt)
+        # Erwartet: "Pro 25 | 12-Monatsvertrag [monatliche Zahlung] inkl. ..."
+        # Oder Tabellen: "Pro 25\n|\n12-Monatsvertrag\n[monatliche Zahlung]"
         plan_re = re.compile(
-            r'([\w\s\-]+?)'              # Plan-Name (z.B. "Pro 25")
-            r'\s*\|\s*'                  # Trennzeichen
-            r'(\d+[-\s]?(?:Monats|Jahres)vertrag[^[\n]*)'  # Vertragstyp
-            r'\s*\[([^\]\n]+)\]',        # [Zahlweise]
-            re.IGNORECASE,
+            r'([\w][\w\s\-]*?\d+[\w\s\-]*?)'  # Plan-Name mit Zahl (z.B. "Pro 25")
+            r'[\s\n]*\|[\s\n]*'                # Pipe-Trennzeichen
+            r'([\d]+[\s\-]?(?:Monats|Jahres)vertrag[^\[\n]*)'  # Vertragstyp
+            r'[\s\n]*\[([^\]\n]+)\]',           # [Zahlweise]
+            re.IGNORECASE | re.MULTILINE,
         )
         plan_match = plan_re.search(full_text)
         if plan_match:
