@@ -424,16 +424,34 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
 
     # Eindeutige Subscription (oder keine) → direkt Zusammenfassung
     blocks = build_va_summary_blocks(parsed, subscription, user_name)
-    # CS Admin Team in der Zusammenfassung erwähnen
+    # CS Admin Team mit Buttons
     admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
+    thread_ref = f"{channel}|||{thread_ts}"
+    blocks.append({'type': 'divider'})
     blocks.append({
         'type': 'section',
         'text': {
             'type': 'mrkdwn',
-            'text': (
-                f":{VA_DONE_EMOJI}: {admin_mentions} — bitte prüfen und Go geben!"
-            ),
+            'text': f":{VA_DONE_EMOJI}: {admin_mentions}",
         },
+    })
+    blocks.append({
+        'type': 'actions',
+        'elements': [
+            {
+                'type': 'button',
+                'text': {'type': 'plain_text', 'text': '🙋 Mache ich — ich übernehme'},
+                'action_id': 'va_take_over',
+                'value': thread_ref,
+            },
+            {
+                'type': 'button',
+                'text': {'type': 'plain_text', 'text': '✅ Geprüft — bitte ausführen'},
+                'style': 'primary',
+                'action_id': 'va_approved',
+                'value': thread_ref,
+            },
+        ],
     })
     say(blocks=blocks, text="📋 Vertragsanpassung — Zusammenfassung", thread_ts=thread_ts)
     # Reaktion auf Root-Nachricht (👀 → custom emoji)
@@ -950,6 +968,49 @@ def handle_cancel(ack, body, say, client):
     _ticket_data.pop((channel, thread_ts), None)
     _set_cancelled(client, channel, thread_ts)
     say(text=":x: OK — kein Ticket wird erstellt.", thread_ts=thread_ts)
+
+
+@app.action("va_take_over")
+def handle_va_take_over(ack, body, say, client):
+    """CS Admin übernimmt die Umsetzung manuell."""
+    ack()
+    user_id = body.get('user', {}).get('id', '')
+    user_name = get_user_name(client, user_id)
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    say(
+        text=f":cs-admin-bot: *{user_name}* übernimmt die Umsetzung — bitte im Thread als ✅ done markieren wenn erledigt.",
+        thread_ts=thread_ts,
+    )
+
+
+@app.action("va_take_over")
+def handle_va_take_over(ack, body, say, client):
+    """CS Admin übernimmt die Ausführung."""
+    ack()
+    user_id = body.get('user', {}).get('id', '')
+    user_name = get_user_name(client, user_id)
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    say(
+        text=f":cs-admin-bot: *{user_name}* übernimmt die Ausführung der Vertragsanpassung.",
+        thread_ts=thread_ts,
+    )
+
+
+@app.action("va_approved")
+def handle_va_approved(ack, body, say, client):
+    """CS Admin hat geprüft und gibt das Go für die Ausführung."""
+    ack()
+    user_id = body.get('user', {}).get('id', '')
+    user_name = get_user_name(client, user_id)
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    say(
+        text=f":cs-admin-bot: *{user_name}* hat die Zusammenfassung geprüft und gibt das Go — Vertragsanpassung kann ausgeführt werden. :white_check_mark:",
+        thread_ts=thread_ts,
+    )
+    if channel and thread_ts:
+        _add_reaction(client, channel, thread_ts, 'white_check_mark')
 
 
 @app.action("create_ticket_button")

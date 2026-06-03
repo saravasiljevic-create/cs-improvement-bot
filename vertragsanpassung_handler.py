@@ -636,6 +636,17 @@ def _fetch_subscription_by_id(subscription_id: str, api_key: str, site: str) -> 
 def _build_subscription_result(sub: dict, site: str) -> dict:
     """Wandelt ein Chargebee-Subscription-Objekt in unser einheitliches Format um."""
     sub_id = sub['id']
+
+    # Plan-ID: zuerst plan_id-Feld, dann aus subscription_items (neues Item-Modell)
+    plan_id = sub.get('plan_id', '')
+    if not plan_id and sub.get('subscription_items'):
+        plan_item = next(
+            (it for it in sub['subscription_items'] if it.get('item_type') == 'plan'),
+            None,
+        )
+        if plan_item:
+            plan_id = plan_item.get('item_price_id', '')
+
     if sub.get('subscription_items'):
         addons = [
             item['item_price_id']
@@ -661,7 +672,7 @@ def _build_subscription_result(sub: dict, site: str) -> dict:
     return {
         'subscription_id': sub_id,
         'customer_id': sub.get('customer_id', ''),
-        'plan_id': sub.get('plan_id', ''),
+        'plan_id': plan_id,
         'addons': addons,
         'status': sub.get('status', ''),
         'billing_cycle': billing_cycle,
@@ -671,6 +682,7 @@ def _build_subscription_result(sub: dict, site: str) -> dict:
         'trial_end': _ts_to_date(sub.get('trial_end')),
         'coupons': coupons,
         'url': f"https://{site}.chargebee.com/d/subscriptions/{sub_id}",
+        '_raw_sub': sub,  # für IST-Plan-Fallback
     }
 
 
@@ -943,7 +955,14 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
     ist_lines = []
     if subscription:
         ist_lines.append(f"*Subscription:* <{subscription['url']}|{subscription['subscription_id']}>")
-        plan_info = f"`{subscription.get('plan_id') or '–'}`"
+        # Plan aus plan_id ODER subscription_items (neues Item-Modell)
+        plan_id_ist = subscription.get('plan_id', '')
+        if not plan_id_ist and subscription.get('_raw_sub'):
+            for it in subscription.get('_raw_sub', {}).get('subscription_items', []):
+                if it.get('item_type') == 'plan':
+                    plan_id_ist = it.get('item_price_id', '')
+                    break
+        plan_info = f"`{plan_id_ist}`" if plan_id_ist else '`–`'
         if subscription.get('billing_cycle'):
             plan_info += f"  ·  {subscription['billing_cycle']}"
         ist_lines.append(f"*Aktueller Plan:* {plan_info}")
@@ -969,11 +988,9 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
         plan_display = parsed.get('plan_full_name') or parsed['new_plan']
         arrow = f" _(war: `{old}`)_" if old and old.lower() not in (parsed['new_plan'].lower(), plan_display.lower()) else ''
         soll_lines.append(f"• Neuer Plan: {plan_display}{arrow}")
-        # Chargebee item_price_id + Name (für Automatisierung)
+        # Chargebee item_price_id (für Automatisierung)
         if parsed.get('chargebee_plan_id'):
             soll_lines.append(f"  → `item_price_id`: `{parsed['chargebee_plan_id']}`")
-            if parsed.get('chargebee_plan_name'):
-                soll_lines.append(f"  → `item_price name`: {parsed['chargebee_plan_name']}")
     if parsed.get('payment_type'):
         soll_lines.append(f"• Zahlweise: {parsed['payment_type']}")
     if parsed.get('effective_date'):
