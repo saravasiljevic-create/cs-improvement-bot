@@ -972,9 +972,11 @@ def handle_cancel(ack, body, say, client):
 
 @app.action("va_take_over")
 def handle_va_take_over(ack, body, say, client):
-    """CS Admin übernimmt die Umsetzung manuell."""
+    """CS Admin übernimmt die Umsetzung — nur für CS Admin Team."""
     ack()
     user_id = body.get('user', {}).get('id', '')
+    if user_id not in CS_ADMIN_USER_IDS:
+        return
     user_name = get_user_name(client, user_id)
     thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
     channel = body.get('channel', {}).get('id', '')
@@ -982,35 +984,26 @@ def handle_va_take_over(ack, body, say, client):
         text=f":cs-admin-bot: *{user_name}* übernimmt die Umsetzung — bitte im Thread als ✅ done markieren wenn erledigt.",
         thread_ts=thread_ts,
     )
-
-
-@app.action("va_take_over")
-def handle_va_take_over(ack, body, say, client):
-    """CS Admin übernimmt die Ausführung."""
-    ack()
-    user_id = body.get('user', {}).get('id', '')
-    user_name = get_user_name(client, user_id)
-    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
-    say(
-        text=f":cs-admin-bot: *{user_name}* übernimmt die Ausführung der Vertragsanpassung.",
-        thread_ts=thread_ts,
-    )
+    _va_pending_approval.pop((channel, thread_ts), None)
 
 
 @app.action("va_approved")
 def handle_va_approved(ack, body, say, client):
-    """CS Admin hat geprüft und gibt das Go für die Ausführung."""
+    """CS Admin hat geprüft und gibt das Go — nur für CS Admin Team."""
     ack()
     user_id = body.get('user', {}).get('id', '')
+    if user_id not in CS_ADMIN_USER_IDS:
+        return
     user_name = get_user_name(client, user_id)
     thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
     channel = body.get('channel', {}).get('id', '')
     say(
-        text=f":cs-admin-bot: *{user_name}* hat die Zusammenfassung geprüft und gibt das Go — Vertragsanpassung kann ausgeführt werden. :white_check_mark:",
+        text=f":cs-admin-bot: *{user_name}* hat geprüft und gibt das Go — Vertragsanpassung kann ausgeführt werden. :white_check_mark:",
         thread_ts=thread_ts,
     )
     if channel and thread_ts:
         _add_reaction(client, channel, thread_ts, 'white_check_mark')
+    _va_pending_approval.pop((channel, thread_ts), None)
 
 
 @app.action("create_ticket_button")
