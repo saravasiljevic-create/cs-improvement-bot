@@ -67,6 +67,11 @@ _similar_shown: dict[tuple[str, str], dict] = {}
 # (channel, thread_ts) -> {'parsed': dict, 'user_id', 'user_name', 'created_at'}
 _pending_vertragsanpassung: dict[tuple[str, str], dict] = {}
 
+# VA-Zusammenfassungen die auf CS Admin Bestätigung warten (für 48h Reminder)
+# (channel, thread_ts) -> {'sent_at': float, 'reminded': bool}
+_va_pending_approval: dict[tuple[str, str], dict] = {}
+VA_REMINDER_TTL = 48 * 3600  # 48 Stunden
+
 JIRA_KEY_RE = re.compile(r'\b([A-Z]+-\d+)\b')
 PENDING_TTL = 72 * 3600  # 72 hours in seconds
 
@@ -283,6 +288,7 @@ def _set_cancelled(client, channel: str, ts: str):
 
 def _cleanup_expired_pending(client):
     now = time.time()
+    # Improvement-Flow: 72h TTL
     expired = [
         key for key, state in list(_pending.items())
         if now - state.get('created_at', now) > PENDING_TTL
@@ -292,6 +298,26 @@ def _cleanup_expired_pending(client):
         channel, thread_ts = key
         logger.info(f"Pending state expired for {channel}/{thread_ts} — marking done")
         _set_done(client, channel, thread_ts)
+
+    # VA-Zusammenfassung: 48h Reminder wenn noch keine Bestätigung
+    admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
+    for key, state in list(_va_pending_approval.items()):
+        if not state.get('reminded') and now - state.get('sent_at', now) > VA_REMINDER_TTL:
+            channel, thread_ts = key
+            logger.info(f"VA 48h reminder for {channel}/{thread_ts}")
+            try:
+                from slack_bolt import App as _App
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=(
+                        f":reminder_ribbon: {admin_mentions} — "
+                        "Erinnerung: Diese Vertragsanpassung wartet noch auf Bestätigung oder Ausführung."
+                    ),
+                )
+            except Exception as e:
+                logger.warning(f"VA reminder failed: {e}")
+            state['reminded'] = True
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +484,8 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
     _remove_reaction(client, channel, thread_ts, 'eyes')
     _add_reaction(client, channel, thread_ts, VA_DONE_EMOJI)
     _pending_vertragsanpassung.pop((channel, thread_ts), None)
+    # 48h Reminder registrieren
+    _va_pending_approval[(channel, thread_ts)] = {'sent_at': time.time(), 'reminded': False}
 
 
 # ---------------------------------------------------------------------------
