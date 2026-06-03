@@ -27,6 +27,7 @@ from vertragsanpassung_handler import (
     build_cs_admin_subscription_blocks,
     build_va_summary_blocks,
     detect_vertragsanpassung,
+    fetch_item_price_name,
     fetch_offer_data,
     lookup_chargebee_subscription,
     missing_va_fields,
@@ -413,6 +414,13 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
         )
         # State bleibt aktiv damit CS Admin antworten kann
         return
+
+    # item_price Name aus Chargebee laden (für Zusammenfassung)
+    if parsed.get('chargebee_plan_id') and CHARGEBEE_API_KEY and not parsed.get('chargebee_plan_name'):
+        name = fetch_item_price_name(parsed['chargebee_plan_id'], CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+        if name:
+            parsed['chargebee_plan_name'] = name
+            logger.info(f"item_price name: {name!r}")
 
     # Eindeutige Subscription (oder keine) → direkt Zusammenfassung
     blocks = build_va_summary_blocks(parsed, subscription, user_name)

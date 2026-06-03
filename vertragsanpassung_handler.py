@@ -35,6 +35,22 @@ _PAYMENT_SLUG: dict[str, str] = {
 }
 
 
+def fetch_item_price_name(item_price_id: str, api_key: str, site: str) -> str:
+    """Lädt den offiziellen Chargebee-Namen einer item_price_id."""
+    from urllib.parse import quote as _q
+    try:
+        resp = requests.get(
+            f"https://{site}.chargebee.com/api/v2/item_prices/{_q(item_price_id)}",
+            auth=(api_key, ''),
+            timeout=10,
+        )
+        if resp.ok:
+            return resp.json().get('item_price', {}).get('name', '')
+    except Exception as e:
+        logger.warning(f"fetch_item_price_name({item_price_id}) failed: {e}")
+    return ''
+
+
 def resolve_chargebee_plan_id(plan_name: str, contract_months: int, payment_type: str) -> str | None:
     """Leitet die Chargebee item_price_id ab.
 
@@ -953,9 +969,11 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
         plan_display = parsed.get('plan_full_name') or parsed['new_plan']
         arrow = f" _(war: `{old}`)_" if old and old.lower() not in (parsed['new_plan'].lower(), plan_display.lower()) else ''
         soll_lines.append(f"• Neuer Plan: {plan_display}{arrow}")
-        # Chargebee item_price_id (für Automatisierung)
+        # Chargebee item_price_id + Name (für Automatisierung)
         if parsed.get('chargebee_plan_id'):
-            soll_lines.append(f"  → Chargebee `item_price_id`: `{parsed['chargebee_plan_id']}`")
+            soll_lines.append(f"  → `item_price_id`: `{parsed['chargebee_plan_id']}`")
+            if parsed.get('chargebee_plan_name'):
+                soll_lines.append(f"  → `item_price name`: {parsed['chargebee_plan_name']}")
     if parsed.get('payment_type'):
         soll_lines.append(f"• Zahlweise: {parsed['payment_type']}")
     if parsed.get('effective_date'):
