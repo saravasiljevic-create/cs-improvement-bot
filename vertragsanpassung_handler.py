@@ -286,14 +286,34 @@ def fetch_offer_data(url: str) -> dict:
         # Auch: "Pro 25 | 1-Jahresvertrag [jährliche Zahlung]"
         # Plan-Pattern: "Pro 25 | 12-Monatsvertrag [monatliche Zahlung]"
         plan_re = re.compile(
-            r'([\w][\w \-]*?\d+[\w \-]*?)'    # Plan-Name mit Zahl
-            r'[ ]*[|｜][ ]*'                   # Pipe (normal oder Unicode)
-            r'([\d]+[ \-]?(?:Monats|Jahres)vertrag[^\[\n]*)'
-            r'[ ]*\[([^\]\n]+)\]',
-            re.IGNORECASE | re.MULTILINE,
+            r'([\w][\w \-]*?\d+[\w \-]*?)'
+            r'[ \t]*[|｜][ \t]*'
+            r'([\d]+[ \-]?(?:Monats|Jahres)vertrag[^\[]*)'
+            r'[ \t]*\[([^\]]+)\]',
+            re.IGNORECASE,
         )
-        plan_match = plan_re.search(full_text)
-        logger.info(f"Plan regex match: {bool(plan_match)} | searched in {len(full_text)} chars")
+
+        # Strategie 1: Jede einzelne <td>-Zelle prüfen
+        plan_match = None
+        for td in soup.find_all('td'):
+            cell = td.get_text(separator=' ', strip=True).replace('\xa0', ' ')
+            m = plan_re.search(cell)
+            if m:
+                plan_match = m
+                logger.info(f"Plan found in td: {repr(cell[:120])}")
+                break
+
+        # Strategie 2: gesamter Text
+        if not plan_match:
+            plan_match = plan_re.search(full_text)
+            logger.info(f"Plan regex in full_text: {bool(plan_match)}")
+
+        # Strategie 3: roher HTML-Text (ohne BeautifulSoup)
+        if not plan_match:
+            import html as _html
+            raw = _html.unescape(resp.text).replace('\xa0', ' ')
+            plan_match = plan_re.search(raw)
+            logger.info(f"Plan regex in raw HTML: {bool(plan_match)}")
         if plan_match:
             plan_raw = plan_match.group(1).strip()
             contract_raw = plan_match.group(2).strip()
