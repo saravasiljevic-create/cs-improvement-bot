@@ -84,6 +84,12 @@ def detect_vertragsanpassung(text: str) -> bool:
 # Parsing
 # ---------------------------------------------------------------------------
 
+_ASAP_RE = re.compile(
+    r'\b(?:asap|sofort|ab\s+sofort|umgehend|so\s+schnell\s+wie\s+m[öo]glich'
+    r'|immediately|jetzt|now|baldm[öo]glichst)\b',
+    re.IGNORECASE,
+)
+
 _DATE_RE = re.compile(
     r'\b(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})\b'
     r'|\b(\d{1,2}\.\s*'
@@ -181,6 +187,8 @@ def parse_vertragsanpassung(text: str) -> dict:
     m = _DATE_RE.search(text)
     if m:
         result['effective_date'] = (m.group(1) or m.group(2) or '').strip()
+    elif _ASAP_RE.search(text):
+        result['effective_date'] = 'ASAP'  # wird durch next_billing_at aus Chargebee ersetzt
 
     m = _PAYMENT_RE.search(text)
     if m:
@@ -240,7 +248,7 @@ def missing_va_fields(parsed: dict) -> list[str]:
     if not parsed.get('payment_type'):
         out.append('*Zahlweise* — jährlich oder monatlich?')
     if not parsed.get('effective_date'):
-        out.append('*Vertragsbeginn / Effective Date* — ab wann gilt die Änderung?')
+        out.append('*Vertragsbeginn / Effective Date* — ab wann gilt die Änderung? (oder: ASAP/sofort)')
     # offer_link ist optional — wird in der Summary angezeigt wenn vorhanden
     return out
 
@@ -705,7 +713,12 @@ def _format_found_fields(parsed: dict, subscription: dict | None = None) -> str:
     if parsed.get('payment_type'):
         lines.append(f"• *Zahlweise:* {parsed['payment_type']}")
     if parsed.get('effective_date'):
-        lines.append(f"• *Vertragsbeginn:* {parsed['effective_date']}")
+        date_val = parsed['effective_date']
+        if date_val == 'ASAP' and subscription and subscription.get('next_billing_at'):
+            date_val = f"Ab sofort _(vorgeschlagen: nächste Rechnung {subscription['next_billing_at']})_"
+        elif date_val == 'ASAP':
+            date_val = 'Ab sofort / ASAP'
+        lines.append(f"• *Vertragsbeginn:* {date_val}")
     if parsed.get('offer_link'):
         lines.append(f"• *Angebots-Link:* {parsed['offer_link']}")
     if parsed.get('addons_add'):
@@ -872,7 +885,12 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
     if parsed.get('payment_type'):
         soll_lines.append(f"• Zahlweise: {parsed['payment_type']}")
     if parsed.get('effective_date'):
-        soll_lines.append(f"• Vertragsbeginn: {parsed['effective_date']}")
+        date_val = parsed['effective_date']
+        if date_val == 'ASAP' and subscription and subscription.get('next_billing_at'):
+            date_val = f"Ab sofort _(vorgeschlagen: nächste Rechnung {subscription['next_billing_at']})_"
+        elif date_val == 'ASAP':
+            date_val = 'Ab sofort / ASAP'
+        soll_lines.append(f"• Vertragsbeginn: {date_val}")
     if parsed.get('addons_add'):
         soll_lines.append(f"• Add-Ons *hinzufügen:* {parsed['addons_add']}")
     if parsed.get('addons_remove'):
