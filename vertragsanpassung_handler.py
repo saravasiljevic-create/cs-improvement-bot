@@ -27,12 +27,14 @@ _STRONG = [
     r'vertrags\s*[äa]nderung',
     r'vertrags\s*verlängerung',
     r'vertragswechsel',
+    r'vertrag\s+anlegen',                   # "Vertrag anlegen"
+    r'\d+[\s\-]?(?:monats|jahres)vertrag',  # "24-Monatsvertrag", "12-Jahresvertrag"
     r'unterschriebene[snm]?\s+angebot',
-    r'unterzeichnetes?\s+angebot',          # "unterzeichnete Angebot" (Synonym)
+    r'unterzeichnetes?\s+angebot',
     r'angebot.{0,60}unterschrieben',
     r'unterschrieben.{0,60}angebot',
     r'angebot.{0,60}unterzeichnet',
-    r'unterzeichnet.{0,60}angebot',         # "unterzeichnete Angebot: https://..."
+    r'unterzeichnet.{0,60}angebot',
     r'signed\s+(?:offer|contract|proposal)',
 ]
 
@@ -50,10 +52,14 @@ _MEDIUM = [
     r'(?:subscription|abo|vertrag|konditionen)\s+(?:ändern|anpassen|wechseln|korrigieren)',
     r'könnt?\s+(?:ihr|sie).{0,30}(?:ändern|anpassen|korrigieren|umstellen)',
     # Upgrade/Downgrade-Signale
-    r'\bupgrad\w*\b',                       # "upgrade", "upgraden", "upgradet"
-    r'grad\w*\s+.{0,80}\s+up\b',           # "gradet ... auf ... up" (DE Anglizismus)
+    r'\bupgrad\w*\b',
+    r'grad\w*\s+.{0,80}\s+up\b',
     r'(?:auf|zum?)\s+(?:das?\s+)?(?:pro|premium|enterprise|business|starter|growth)\s+(?:paket|plan|tarif|abo)',
     r'(?:paket|tarif|plan)\s+(?:up\b|upgrade)',
+    # Neue Vertragserstellung
+    r'\bjahresrechnung\b',                  # "Jahresrechnung mit monatlichem Zahlungsplan"
+    r'\bzahlungsplan\b',                    # "monatlicher Zahlungsplan"
+    r'(?:folgenden?|neuen?)\s+vertrag',     # "folgenden Vertrag anlegen"
     # Verlängerungs-Signale
     r'verlängerung.{0,50}vertrags?',
     r'vertrags?.{0,30}verlänger\w*',
@@ -132,15 +138,31 @@ def parse_vertragsanpassung(text: str) -> dict:
     """Extrahiert strukturierte Felder aus einer Vertragsanpassungs-Anfrage im Freitext."""
     result: dict = {}
 
-    def _trim_to_company_suffix(name: str) -> str:
-        """Schneidet alles nach dem rechtlichen Suffix ab (GmbH, AG, ...)."""
+    def _clean_company_name(name: str) -> str:
+        """Extrahiert nur den eigentlichen Firmennamen (kürzt vorne und hinten)."""
+        # Hinten: alles nach dem rechtlichen Suffix abschneiden
         suffix = re.search(
             r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?',
             name, re.IGNORECASE,
         )
         if suffix:
             name = name[:suffix.end()].strip()
-        return name
+
+        # Vorne: gemeinsame Nicht-Firmen-Wörter am Anfang überspringen
+        # (z.B. "Hi Team bitte für BitterPower GmbH" → "BitterPower GmbH")
+        _SKIP = {'der', 'die', 'das', 'den', 'dem', 'für', 'fur', 'fuer', 'bitte',
+                 'hi', 'hey', 'team', 'hallo', 'liebe', 'lieber', 'the', 'a', 'an',
+                 'please', 'bitte', 'hello', 'kunden', 'kunde', 'kundschaft'}
+        words = name.split()
+        start = 0
+        for i, w in enumerate(words):
+            wl = w.lower().rstrip(',:')
+            if wl not in _SKIP and w[0].isupper():
+                start = i
+                break
+        return ' '.join(words[start:]).strip() or name.strip()
+
+    _trim_to_company_suffix = _clean_company_name  # alias
 
     m = _CUSTOMER_LABELED_RE.search(text)
     if m:
@@ -170,9 +192,23 @@ def parse_vertragsanpassung(text: str) -> dict:
         else:
             result['payment_type'] = 'quartalsweise'
 
-    m = _PLAN_RE.search(text)
-    if m:
-        result['new_plan'] = m.group(0).strip()
+    # Plan: erst "Plan | N-Monatsvertrag [Zahlung]"-Format (direkt im Text wie im Angebot)
+    _inline_plan = re.compile(
+        r'([\w][\w \-]*?\d+[\w \-]*?)[ ]*\|[ ]*([\d]+[ \-]?(?:Monats|Jahres)vertrag[^\[]*)\[([^\]]+)\]',
+        re.IGNORECASE,
+    )
+    inline = _inline_plan.search(text)
+    if inline:
+        result['new_plan'] = inline.group(1).strip()
+        _p = inline.group(3).strip().lower()
+        if 'monatl' in _p:
+            result['payment_type'] = 'monatlich'
+        elif 'jährl' in _p or 'annual' in _p:
+            result['payment_type'] = 'jährlich'
+    else:
+        m = _PLAN_RE.search(text)
+        if m:
+            result['new_plan'] = m.group(0).strip()
 
     m = _BERICHTSWESEN_RE.search(text)
     if m:
