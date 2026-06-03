@@ -49,7 +49,7 @@ logger.info(f"Bot starting — version {_BOT_VERSION}")
 
 # Custom-Emoji für die VA-Zusammenfassung (Slack-Name ohne Doppelpunkte)
 # Sobald das Custom-Emoji erstellt ist, diesen Wert anpassen:
-VA_DONE_EMOJI = os.environ.get('VA_DONE_EMOJI', 'white_check_mark')
+VA_DONE_EMOJI = os.environ.get('VA_DONE_EMOJI', 'cs-admin-bot')
 
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
