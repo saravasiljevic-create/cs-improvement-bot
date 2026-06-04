@@ -35,6 +35,12 @@ _PAYMENT_SLUG: dict[str, str] = {
 }
 
 
+def extract_service_package(plan_name: str) -> str:
+    """Extrahiert das Service-Paket aus einem Plan-Namen (z.B. 'Premium L' aus 'Pro 25 | ... inkl. Premium L')."""
+    m = re.search(r'inkl\.?\s+(.+?)$', plan_name.strip(), re.IGNORECASE)
+    return m.group(1).strip() if m else ''
+
+
 def fetch_item_price_name(item_price_id: str, api_key: str, site: str) -> str:
     """Lädt den offiziellen Chargebee-Namen einer item_price_id."""
     from urllib.parse import quote as _q
@@ -275,6 +281,8 @@ def parse_vertragsanpassung(text: str) -> dict:
             f"{plan_base} | {contract_raw} [{payment_raw}]"
             + (f" {inkl}" if inkl else '')
         ).strip()
+        if inkl:
+            result['service_package'] = inkl.strip()  # z.B. "Premium L"
         if 'monatl' in payment_raw.lower():
             result['payment_type'] = 'monatlich'
         elif 'jährl' in payment_raw.lower() or 'annual' in payment_raw.lower():
@@ -447,6 +455,8 @@ def fetch_offer_data(url: str) -> dict:
                 f"{plan_raw} | {contract_raw} [{payment_raw}]"
                 + (f" {inkl}" if inkl else '')
             ).strip()
+            if inkl:
+                result['service_package'] = inkl.strip()
 
             payment_lower = payment_raw.lower()
             if 'monatl' in payment_lower:
@@ -792,8 +802,9 @@ def _format_found_fields(parsed: dict, subscription: dict | None = None) -> str:
     if parsed.get('customer_name'):
         lines.append(f"• *Kunde:* {parsed['customer_name']}")
     if subscription and not subscription.get('multiple_links') and subscription.get('url'):
-        # Nur eindeutige Subscription anzeigen — mehrere werden erst nach Infos abgefragt
         lines.append(f"• *Chargebee:* <{subscription['url']}|{subscription['subscription_id']}>")
+        if subscription.get('service_package'):
+            lines.append(f"• *Service-Paket (IST):* {subscription['service_package']}")
         if subscription.get('plan_id'):
             plan_info = f"`{subscription['plan_id']}`"
             if subscription.get('billing_cycle'):
@@ -966,6 +977,8 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
         if subscription.get('billing_cycle'):
             plan_info += f"  ·  {subscription['billing_cycle']}"
         ist_lines.append(f"*Aktueller Plan:* {plan_info}")
+        if subscription.get('service_package'):
+            ist_lines.append(f"*Service-Paket (IST):* {subscription['service_package']}")
         if subscription.get('addons'):
             ist_lines.append(f"*Aktive Add-Ons:* {', '.join(subscription['addons'])}")
         if subscription.get('coupons'):
@@ -991,8 +1004,21 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
         # Chargebee item_price_id (für Automatisierung)
         if parsed.get('chargebee_plan_id'):
             soll_lines.append(f"  → `item_price_id`: `{parsed['chargebee_plan_id']}`")
+        # Service-Paket (IST → SOLL Vergleich)
+        soll_pkg = parsed.get('service_package', '')
+        ist_pkg = subscription.get('service_package', '') if subscription else ''
+        if soll_pkg:
+            pkg_line = f"• Service-Paket (SOLL): *{soll_pkg}*"
+            if ist_pkg and ist_pkg.lower() != soll_pkg.lower():
+                pkg_line += f" _(war: {ist_pkg})_"
+            soll_lines.append(pkg_line)
+        elif ist_pkg:
+            soll_lines.append(f"• Service-Paket: {ist_pkg} _(unverändert — bitte prüfen)_")
     if parsed.get('payment_type'):
-        soll_lines.append(f"• Zahlweise: {parsed['payment_type']}")
+        pay_line = f"• Zahlweise: {parsed['payment_type']}"
+        if parsed.get('payment_type_inherited'):
+            pay_line += ' _(aus IST übernommen)_'
+        soll_lines.append(pay_line)
     if parsed.get('effective_date'):
         date_val = parsed['effective_date']
         if date_val == 'ASAP' and subscription and subscription.get('next_billing_at'):

@@ -27,6 +27,7 @@ from vertragsanpassung_handler import (
     build_cs_admin_subscription_blocks,
     build_va_summary_blocks,
     detect_vertragsanpassung,
+    extract_service_package,
     fetch_item_price_name,
     fetch_offer_data,
     lookup_chargebee_subscription,
@@ -414,6 +415,18 @@ def _enrich_from_offer(parsed: dict) -> dict:
     return parsed
 
 
+def _inherit_from_subscription(parsed: dict, subscription: dict | None) -> dict:
+    """Übernimmt Zahlweise aus der IST-Subscription wenn nicht explizit angegeben."""
+    if not subscription:
+        return parsed
+    unit = subscription.get('billing_period_unit', '')
+    if not parsed.get('payment_type') and unit:
+        parsed['payment_type'] = 'jährlich' if unit == 'year' else 'monatlich'
+        parsed['payment_type_inherited'] = True
+        logger.info(f"Zahlweise aus IST übernommen: {parsed['payment_type']}")
+    return parsed
+
+
 def _cb_lookup(customer_name: str) -> dict | None:
     """Chargebee-Lookup per Kundenname (exakter Company-Match)."""
     if not customer_name or not CHARGEBEE_API_KEY:
@@ -429,6 +442,19 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
     """Alle Felder vollständig — entweder Zusammenfassung oder CS-Admin-Warnung."""
     if subscription is None:
         subscription = _cb_lookup(parsed.get('customer_name', ''))
+
+    # Zahlweise aus IST übernehmen (falls nicht explizit angegeben)
+    parsed = _inherit_from_subscription(parsed, subscription)
+
+    # Service-Paket aus IST-Subscription lesen (via item_price Name)
+    if subscription and not subscription.get('service_package') and subscription.get('plan_id') and CHARGEBEE_API_KEY:
+        ist_price_name = fetch_item_price_name(subscription['plan_id'], CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+        if ist_price_name:
+            subscription['item_price_name'] = ist_price_name
+            pkg = extract_service_package(ist_price_name)
+            if pkg:
+                subscription['service_package'] = pkg
+                logger.info(f"Service-Paket IST: {pkg!r} (aus {ist_price_name!r})")
 
     # Mehrere Subscriptions → CS Admin fragen, noch keine Zusammenfassung
     if subscription and subscription.get('multiple_links'):
@@ -613,6 +639,7 @@ def _handle_message_core(event, say, client):
             _set_eyes(client, channel, thread_ts)
             parsed = _enrich_from_offer(parse_vertragsanpassung(root_text or text))
             subscription = _cb_lookup(parsed.get('customer_name', ''))
+            parsed = _inherit_from_subscription(parsed, subscription)
             missing = missing_va_fields(parsed)
             if missing:
                 _pending_vertragsanpassung[(channel, thread_ts)] = {
@@ -837,6 +864,7 @@ def _handle_message_core(event, say, client):
         _set_eyes(client, channel, ts)
         parsed = _enrich_from_offer(parse_vertragsanpassung(text))
         subscription = _cb_lookup(parsed.get('customer_name', ''))
+        parsed = _inherit_from_subscription(parsed, subscription)
         missing = missing_va_fields(parsed)
         if missing:
             _pending_vertragsanpassung[(channel, ts)] = {
