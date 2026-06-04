@@ -214,18 +214,20 @@ def parse_vertragsanpassung(text: str) -> dict:
         if suffix:
             name = name[:suffix.end()].strip()
 
-        # Vorne: gemeinsame Nicht-Firmen-Wörter am Anfang überspringen
-        # (z.B. "Hi Team bitte für BitterPower GmbH" → "BitterPower GmbH")
-        _SKIP = {'der', 'die', 'das', 'den', 'dem', 'für', 'fur', 'fuer', 'bitte',
-                 'hi', 'hey', 'team', 'hallo', 'liebe', 'lieber', 'the', 'a', 'an',
-                 'please', 'bitte', 'hello', 'kunden', 'kunde', 'kundschaft'}
+        # Vorne: nur explizit bekannte Füll-/Artikel-Wörter überspringen.
+        # Wichtig: Firmen wie "wev Schmalkalden" fangen klein an → NICHT nach
+        # Großbuchstaben suchen, sondern nur SKIP-Wörter überspringen.
+        _SKIP = {'der', 'die', 'das', 'den', 'dem', 'des', 'für', 'fur', 'fuer',
+                 'bitte', 'hi', 'hey', 'team', 'hallo', 'liebe', 'lieber',
+                 'the', 'a', 'an', 'please', 'hello',
+                 'kunden', 'kunde', 'kundschaft', 'firma', 'unternehmen'}
         words = name.split()
         start = 0
         for i, w in enumerate(words):
-            wl = w.lower().rstrip(',:')
-            if wl not in _SKIP and w[0].isupper():
-                start = i
-                break
+            if w.lower().rstrip(',:') in _SKIP:
+                start = i + 1  # dieses Wort überspringen
+            else:
+                break  # erstes Nicht-SKIP-Wort → Firmenname beginnt hier
         return ' '.join(words[start:]).strip() or name.strip()
 
     _trim_to_company_suffix = _clean_company_name  # alias
@@ -302,16 +304,21 @@ def parse_vertragsanpassung(text: str) -> dict:
         if m:
             result['new_plan'] = m.group(0).strip()
 
-    # Fallback: Laufzeit aus einfachem "N Monate" / "N Jahre" extrahieren
-    # (wenn der volle "Plan | N-Monatsvertrag [Zahlung]"-Format nicht gematcht hat)
+    # Fallback: Laufzeit aus "N Monate" / "N Jahre" / "N-Jahres-..." extrahieren
     if not result.get('contract_months'):
-        _dur_m = re.search(r'\b(\d+)\s*[-\s]?\s*monat(?:e|ig|svertrag)?\b', text, re.IGNORECASE)
-        _dur_y = re.search(r'\b(\d+)\s*[-\s]?\s*jahr(?:e|ig|esvertrag)?\b', text, re.IGNORECASE)
+        # Monate: "24 Monate", "24-monatig", "24-Monatsvertrag"
+        _dur_m = re.search(
+            r'\b(\d+)\s*[-\s]?\s*monat(?:e[ns]?|ig|svertrag)?', text, re.IGNORECASE
+        )
+        # Jahre: "2 Jahre", "2-Jahres-...", "2jährig", "2 jährlich"
+        _dur_y = re.search(
+            r'\b(\d+)\s*[-\s]?\s*(?:jahr(?:e[ns]?|ig)?|jährig)', text, re.IGNORECASE
+        )
         if _dur_m:
             result['contract_months'] = int(_dur_m.group(1))
         elif _dur_y:
             result['contract_months'] = int(_dur_y.group(1)) * 12
-        # Chargebee Plan-ID neu auflösen falls jetzt Laufzeit + Zahlweise vorhanden
+        # Chargebee Plan-ID neu auflösen falls jetzt alle Felder vorhanden
         if result.get('contract_months') and result.get('new_plan') and result.get('payment_type'):
             pid = resolve_chargebee_plan_id(
                 result['new_plan'], result['contract_months'], result['payment_type']
