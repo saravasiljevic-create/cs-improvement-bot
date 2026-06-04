@@ -457,15 +457,39 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
                 logger.info(f"Service-Paket IST: {pkg!r} (aus {ist_price_name!r})")
 
     # Mehrere Subscriptions → CS Admin fragen, noch keine Zusammenfassung
-    if subscription and subscription.get('multiple_links'):
+    admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
+    customer = parsed.get('customer_name', 'unbekannt')
+
+    # Keine Subscription gefunden → CS Admin nach Link fragen
+    if not subscription:
+        logger.info("VA: Keine Subscription gefunden — warte auf CS Admin Link")
+        say(
+            blocks=[{
+                'type': 'section',
+                'text': {
+                    'type': 'mrkdwn',
+                    'text': (
+                        f":{VA_DONE_EMOJI}: {admin_mentions}\n"
+                        f"Keine Chargebee-Subscription für *{customer}* gefunden.\n"
+                        "Bitte den richtigen Chargebee-Link in den Thread schreiben — "
+                        "ich erstelle danach die vollständige Zusammenfassung."
+                    ),
+                },
+            }],
+            text="Chargebee-Link fehlt — bitte CS Admin",
+            thread_ts=thread_ts,
+        )
+        return  # State bleibt aktiv bis CS Admin den Link schreibt
+
+    # Mehrere Subscriptions → CS Admin nach korrektem Link fragen
+    if subscription.get('multiple_links'):
         logger.info("VA: Mehrere Subscriptions — warte auf CS Admin Bestätigung")
         say(
             blocks=build_cs_admin_subscription_blocks(subscription),
             text="Mehrere Subscriptions gefunden — bitte CS Admin bestätigen",
             thread_ts=thread_ts,
         )
-        # State bleibt aktiv damit CS Admin antworten kann
-        return
+        return  # State bleibt aktiv damit CS Admin antworten kann
 
     # item_price Name aus Chargebee laden (für Zusammenfassung)
     if parsed.get('chargebee_plan_id') and CHARGEBEE_API_KEY and not parsed.get('chargebee_plan_name'):
@@ -474,10 +498,9 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
             parsed['chargebee_plan_name'] = name
             logger.info(f"item_price name: {name!r}")
 
-    # Eindeutige Subscription (oder keine) → direkt Zusammenfassung
+    # Vollständige Zusammenfassung mit allen Infos
     blocks = build_va_summary_blocks(parsed, subscription, user_name)
-    # CS Admin Team mit Buttons
-    admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
+    # CS Admin Buttons
     thread_ref = f"{channel}|||{thread_ts}"
     blocks.append({'type': 'divider'})
     blocks.append({
