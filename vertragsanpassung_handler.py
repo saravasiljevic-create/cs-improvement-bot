@@ -302,6 +302,23 @@ def parse_vertragsanpassung(text: str) -> dict:
         if m:
             result['new_plan'] = m.group(0).strip()
 
+    # Fallback: Laufzeit aus einfachem "N Monate" / "N Jahre" extrahieren
+    # (wenn der volle "Plan | N-Monatsvertrag [Zahlung]"-Format nicht gematcht hat)
+    if not result.get('contract_months'):
+        _dur_m = re.search(r'\b(\d+)\s*[-\s]?\s*monat(?:e|ig|svertrag)?\b', text, re.IGNORECASE)
+        _dur_y = re.search(r'\b(\d+)\s*[-\s]?\s*jahr(?:e|ig|esvertrag)?\b', text, re.IGNORECASE)
+        if _dur_m:
+            result['contract_months'] = int(_dur_m.group(1))
+        elif _dur_y:
+            result['contract_months'] = int(_dur_y.group(1)) * 12
+        # Chargebee Plan-ID neu auflösen falls jetzt Laufzeit + Zahlweise vorhanden
+        if result.get('contract_months') and result.get('new_plan') and result.get('payment_type'):
+            pid = resolve_chargebee_plan_id(
+                result['new_plan'], result['contract_months'], result['payment_type']
+            )
+            if pid:
+                result['chargebee_plan_id'] = pid
+
     m = _BERICHTSWESEN_RE.search(text)
     if m:
         raw_tier = int(m.group(1))
