@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=$(jq -r '.tool_input.file_path // empty' 2>/dev/null); if echo \"$FILE\" | grep -qE '\\.py$' && echo \"$FILE\" | grep -q 'cs-improvement-bot'; then cd /Users/sara.vasiljevic/Claude/cs-improvement-bot && python3 update_docs.py 2>/dev/null && git add README.md TOOLS.md 2>/dev/null; fi",
+            "timeout": 30,
+            "statusMessage": "Dokumentation wird aktualisiert..."
+          }
+        ]
+      }
+    ]
+  }
+}
