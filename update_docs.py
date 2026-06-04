@@ -132,7 +132,7 @@ Slack-Bot für das CS Admin Team bei Xentral. Verbindet Slack mit Jira (Improvem
 7. CS Admin schreibt Chargebee-URL → Bot lädt die richtige Subscription
 8. Zusammenfassung: IST-Zustand, SOLL-Änderungen, Chargebee `item_price_id`, Hinweise
 9. Buttons: „🙋 Mache ich — ich übernehme" / „✅ Geprüft — bitte ausführen"
-10. Abschluss: `:cs-admin-bot:` Emoji auf Root-Nachricht
+10. Abschluss: `:csadmin-bot:` Emoji auf Root-Nachricht
 
 **Datenquellen:** Chargebee (read-only), Planhat (optional, für Company-ID), Angebots-HTML
 
@@ -168,7 +168,7 @@ Slack-Bot für das CS Admin Team bei Xentral. Verbindet Slack mit Jira (Improvem
 | `JIRA_API_TOKEN` | ✅ | Jira API Token |
 | `CHARGEBEE_API_KEY` | ✅ | Chargebee API Key (xentral-dach, read-only) |
 | `PLANHAT_API_TOKEN` | optional | Planhat Service Account Token (für Company-ID-Lookup) |
-| `VA_DONE_EMOJI` | optional | Custom-Emoji nach VA-Abschluss (default: `cs-admin-bot`) |
+| `VA_DONE_EMOJI` | optional | Custom-Emoji nach VA-Abschluss (default: `csadmin-bot`) |
 
 ### CS Admin Team (Slack User IDs)
 

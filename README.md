@@ -47,7 +47,7 @@ Slack-Bot für das CS Admin Team bei Xentral. Verbindet Slack mit Jira (Improvem
 7. CS Admin schreibt Chargebee-URL → Bot lädt die richtige Subscription
 8. Zusammenfassung: IST-Zustand, SOLL-Änderungen, Chargebee `item_price_id`, Hinweise
 9. Buttons: „🙋 Mache ich — ich übernehme" / „✅ Geprüft — bitte ausführen"
-10. Abschluss: `:cs-admin-bot:` Emoji auf Root-Nachricht
+10. Abschluss: `:csadmin-bot:` Emoji auf Root-Nachricht
 
 **Datenquellen:** Chargebee (read-only), Planhat (optional, für Company-ID), Angebots-HTML
 
@@ -83,7 +83,7 @@ Slack-Bot für das CS Admin Team bei Xentral. Verbindet Slack mit Jira (Improvem
 | `JIRA_API_TOKEN` | ✅ | Jira API Token |
 | `CHARGEBEE_API_KEY` | ✅ | Chargebee API Key (xentral-dach, read-only) |
 | `PLANHAT_API_TOKEN` | optional | Planhat Service Account Token (für Company-ID-Lookup) |
-| `VA_DONE_EMOJI` | optional | Custom-Emoji nach VA-Abschluss (default: `cs-admin-bot`) |
+| `VA_DONE_EMOJI` | optional | Custom-Emoji nach VA-Abschluss (default: `csadmin-bot`) |
 
 ### CS Admin Team (Slack User IDs)
 
@@ -140,7 +140,7 @@ Benötigte OAuth-Scopes: `channels:history`, `groups:history`, `chat:write`, `re
 46ef536 Fix current plan + approval buttons + remove item_price name
 088c94e Fix IST plan + add va_take_over handler + remove item_price name
 659c862 Add Chargebee item_price name to VA summary
-37a9e54 Use :cs-admin-bot: emoji for VA summary completion
+37a9e54 Use :csadmin-bot: emoji for VA summary completion
 ```
 
 ---

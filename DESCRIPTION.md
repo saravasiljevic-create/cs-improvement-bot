@@ -263,7 +263,7 @@ Beide Buttons taggen @Mirjam, @Linda und @Sara, damit das Team informiert ist, w
 
 #### Schritt 8 — Abschluss
 
-Nach Klick auf einen der Buttons setzt der Bot das :cs-admin-bot:-Emoji auf die ursprüngliche Nachricht. Das signalisiert: "Flow abgeschlossen."
+Nach Klick auf einen der Buttons setzt der Bot das :csadmin-bot:-Emoji auf die ursprüngliche Nachricht. Das signalisiert: "Flow abgeschlossen."
 
 ---
 
@@ -355,7 +355,7 @@ Nein. Der manuelle Trigger `#vertragsanpassung` ist auf das CS Admin Team beschr
 |---|---|
 | 👀 | Bot hat die Nachricht erkannt und verarbeitet sie gerade |
 | ✅ | Improvement-Flow erfolgreich abgeschlossen |
-| :cs-admin-bot: | Vertragsanpassungs-Flow abgeschlossen |
+| :csadmin-bot: | Vertragsanpassungs-Flow abgeschlossen |
 
 ---
 

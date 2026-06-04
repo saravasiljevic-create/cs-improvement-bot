@@ -51,7 +51,7 @@ logger.info(f"Bot starting — version {_BOT_VERSION}")
 
 # Custom-Emoji für die VA-Zusammenfassung (Slack-Name ohne Doppelpunkte)
 # Sobald das Custom-Emoji erstellt ist, diesen Wert anpassen:
-VA_DONE_EMOJI = os.environ.get('VA_DONE_EMOJI', 'cs-admin-bot')
+VA_DONE_EMOJI = os.environ.get('VA_DONE_EMOJI', 'csadmin-bot')
 
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
@@ -1060,7 +1060,7 @@ def handle_va_take_over(ack, body, say, client):
     thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
     channel = body.get('channel', {}).get('id', '')
     say(
-        text=f":cs-admin-bot: *{user_name}* übernimmt die Umsetzung — bitte im Thread als ✅ done markieren wenn erledigt.",
+        text=f":csadmin-bot: *{user_name}* übernimmt die Umsetzung — bitte im Thread als ✅ done markieren wenn erledigt.",
         thread_ts=thread_ts,
     )
     _va_pending_approval.pop((channel, thread_ts), None)
@@ -1077,7 +1077,7 @@ def handle_va_approved(ack, body, say, client):
     thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
     channel = body.get('channel', {}).get('id', '')
     say(
-        text=f":cs-admin-bot: *{user_name}* hat geprüft und gibt das Go — Vertragsanpassung kann ausgeführt werden. :white_check_mark:",
+        text=f":csadmin-bot: *{user_name}* hat geprüft und gibt das Go — Vertragsanpassung kann ausgeführt werden. :white_check_mark:",
         thread_ts=thread_ts,
     )
     if channel and thread_ts:
