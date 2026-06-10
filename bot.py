@@ -572,6 +572,19 @@ def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id
                 say(text=f":warning: Download fehlgeschlagen für `{filename}`: HTTP {dl_resp.status_code} · URL: `{url[:80]}`", thread_ts=thread_ts)
                 continue
 
+            # HTML-Antwort abfangen (z.B. Login-Redirect statt echter Datei)
+            content_type = dl_resp.headers.get('Content-Type', '')
+            if 'text/html' in content_type:
+                say(
+                    text=(
+                        f":warning: Die URL `{url[:80]}` liefert eine HTML-Seite statt einer Datei "
+                        f"(vermutlich Login-Redirect oder abgelaufener Link).\n"
+                        "Bitte die Datei direkt in diesen Thread hochladen und dann `#planhat-upload` schreiben."
+                    ),
+                    thread_ts=thread_ts,
+                )
+                continue
+
             # Dateiname und Mimetype aus Response-Headern ableiten falls nicht bekannt
             if filename in ('angebot', '') or '.' not in filename:
                 cd = dl_resp.headers.get('Content-Disposition', '')
@@ -922,7 +935,18 @@ def _handle_message_core(event, say, client):
             return
 
         # --- Planhat-Link als Antwort auf _ask_for_planhat_link ---
+        # Auch ohne aktiven State reagieren (Bot-Neustart löscht State)
         ph_pending = _pending_planhat_link.get((channel, thread_ts))
+        ph_url_match_direct = re.search(r'https?://(?:app|ws)\.planhat\.com/\S+', text)
+        if ph_url_match_direct and user_id in CS_ADMIN_USER_IDS and not ph_pending:
+            # Kein aktiver State — kurze Hinweis-Nachricht dass #planhat-upload neu getriggert werden soll
+            say(
+                text=(
+                    ":wave: Planhat-Link erkannt. Falls der Bot neugestartet wurde, "
+                    "bitte nochmal `#planhat-upload` schreiben — der Link wird dann direkt verwendet."
+                ),
+                thread_ts=thread_ts,
+            )
         if ph_pending and user_id in CS_ADMIN_USER_IDS:
             ph_url_match = re.search(r'https?://(?:app|ws)\.planhat\.com/\S+', text)
             if ph_url_match:
