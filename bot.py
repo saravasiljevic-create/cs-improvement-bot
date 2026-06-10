@@ -1472,6 +1472,7 @@ def handle_va_approved(ack, body, say, client):
             ramp_id = ramp.get('id', '–')
             cb_sub_link = f"https://{CHARGEBEE_SITE}.chargebee.com/d/subscriptions/{sub_id}"
             cb_ramp_link = f"https://{CHARGEBEE_SITE}.chargebee.com/d/subscriptions/{sub_id}#ramps"
+            slack_thread_link = slack_message_link(channel, thread_ts)
             say(
                 text=(
                     f":white_check_mark: *Ramp angelegt* — freigegeben von *{user_name}*\n"
@@ -1483,6 +1484,35 @@ def handle_va_approved(ack, body, say, client):
                 thread_ts=thread_ts,
             )
             _add_reaction(client, channel, thread_ts, 'white_check_mark')
+
+            # Planhat Note erstellen
+            customer_name = parsed.get('customer_name', '')
+            if customer_name and PLANHAT_API_TOKEN:
+                ph_company = _planhat_search_company(customer_name)
+                if ph_company and ph_company.get('id'):
+                    old_plan = subscription.get('plan_id', '–') if subscription else '–'
+                    note_text = (
+                        f"Vertragsanpassung vorgenommen von {user_name}\n\n"
+                        f"Plan: {old_plan} → {new_plan_id}\n"
+                        f"Effective: {effective_date}\n"
+                        f"Ramp-ID: {ramp_id}\n"
+                        f"Chargebee: {cb_ramp_link}\n"
+                        f"Slack-Thread: {slack_thread_link}"
+                    )
+                    try:
+                        _req.post(
+                            'https://api.planhat.com/activities',
+                            headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
+                            json={
+                                'type': 'note',
+                                'companyId': ph_company['id'],
+                                'text': note_text,
+                            },
+                            timeout=10,
+                        )
+                        logger.info(f"Planhat note created for {customer_name}")
+                    except Exception as e:
+                        logger.warning(f"Planhat note failed: {e}")
         else:
             say(
                 text=(
