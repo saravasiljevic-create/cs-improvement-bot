@@ -1169,7 +1169,13 @@ def _handle_message_core(event, say, client):
                 f"Effective: {effective}",
                 f'Slack-Thread: <a href="{slack_link}">Thread öffnen</a>',
             ]
-            if all_files:
+
+            # Angebotslink: zuerst aus parsed_ctx, dann aus Datei-Liste
+            offer_link = parsed_ctx.get('offer_link', '')
+            if offer_link:
+                note_lines.append(f'\nAngebots-Dokument(e):')
+                note_lines.append(f'• <a href="{offer_link}">Angebotslink</a>')
+            elif all_files:
                 note_lines.append('\nAngebots-Dokument(e):')
                 for f in all_files:
                     raw = f.get('name', '')
