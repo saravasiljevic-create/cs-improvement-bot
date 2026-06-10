@@ -544,8 +544,10 @@ def _planhat_search_company(customer_name: str, debit_number: str = '') -> dict 
 
 def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id: str,
                               thread_ts: str, say) -> list[str]:
-    """Lädt Angebots-Dateien aus Slack zu Planhat hoch. Gibt Liste der hochgeladenen Dateinamen zurück."""
+    """Lädt Angebots-Dateien zu Planhat hoch. Postet Fehlerdetails direkt im Thread."""
     if not files or not planhat_company_id or not PLANHAT_API_TOKEN:
+        if say and thread_ts:
+            say(text=f":warning: Upload abgebrochen: files={bool(files)}, company_id={bool(planhat_company_id)}, token={bool(PLANHAT_API_TOKEN)}", thread_ts=thread_ts)
         return []
 
     uploaded = []
@@ -554,6 +556,7 @@ def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id
         filename = file_info.get('name', 'angebot')
         mimetype = file_info.get('mimetype', 'application/octet-stream')
         if not url:
+            say(text=f":warning: Datei `{filename}` hat keine Download-URL — übersprungen.", thread_ts=thread_ts)
             continue
         try:
             # Datei herunterladen — Slack-Anhänge brauchen Bot-Token, externe URLs nicht
@@ -562,20 +565,21 @@ def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id
                                        headers={'User-Agent': 'Mozilla/5.0 (compatible; CS-Admin-Bot/1.0)'})
             else:
                 dl_resp = requests.get(url, headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'}, timeout=30)
-            slack_resp = dl_resp
-            if not slack_resp.ok:
-                logger.warning(f"File download failed: {slack_resp.status_code} {filename}")
+
+            if not dl_resp.ok:
+                say(text=f":warning: Download fehlgeschlagen für `{filename}`: HTTP {dl_resp.status_code} · URL: `{url[:80]}`", thread_ts=thread_ts)
                 continue
+
             # Dateiname und Mimetype aus Response-Headern ableiten falls nicht bekannt
             if filename in ('angebot', '') or '.' not in filename:
-                cd = slack_resp.headers.get('Content-Disposition', '')
+                cd = dl_resp.headers.get('Content-Disposition', '')
                 cd_match = re.search(r'filename[^;=\n]*=[\'""]?([^\'""\n;]+)', cd)
                 if cd_match:
                     filename = cd_match.group(1).strip()
-                elif not filename or filename == 'angebot':
-                    ext = slack_resp.headers.get('Content-Type', '').split(';')[0].split('/')[-1]
+                else:
+                    ext = dl_resp.headers.get('Content-Type', '').split(';')[0].split('/')[-1]
                     filename = f"angebot.{ext}" if ext else 'angebot.pdf'
-            ct = slack_resp.headers.get('Content-Type', mimetype).split(';')[0].strip()
+            ct = dl_resp.headers.get('Content-Type', mimetype).split(';')[0].strip()
             mimetype = ct or mimetype
 
             # Zu Planhat hochladen via POST /assets
@@ -583,16 +587,23 @@ def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id
                 'https://api.planhat.com/assets',
                 headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
                 data={'companyId': planhat_company_id, 'name': filename},
-                files={'file': (filename, slack_resp.content, mimetype)},
+                files={'file': (filename, dl_resp.content, mimetype)},
                 timeout=30,
             )
             if planhat_resp.ok:
                 uploaded.append(filename)
-                logger.info(f"Planhat asset uploaded: {filename} for company {planhat_company_id}")
+                logger.info(f"Planhat asset uploaded: {filename} for {planhat_company_id}")
             else:
-                logger.warning(f"Planhat asset upload failed: {planhat_resp.status_code} {planhat_resp.text[:200]}")
+                say(
+                    text=(
+                        f":warning: Planhat-Upload fehlgeschlagen für `{filename}`:\n"
+                        f"HTTP {planhat_resp.status_code} · `{planhat_resp.text[:300]}`\n"
+                        f"company_id: `{planhat_company_id}`"
+                    ),
+                    thread_ts=thread_ts,
+                )
         except Exception as e:
-            logger.warning(f"Upload error for {filename}: {e}")
+            say(text=f":warning: Upload-Fehler für `{filename}`: `{e}`", thread_ts=thread_ts)
 
     return uploaded
 
