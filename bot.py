@@ -959,7 +959,7 @@ def _handle_message_core(event, say, client):
                     f"Vertragsanpassung — {ph_pending.get('user_name', user_name)}",
                     f"Plan: {old_plan} → {new_plan}",
                     f"Effective: {effective}",
-                    f"Slack-Thread: {slack_link}",
+                    f'Slack-Thread: <a href="{slack_link}">Thread öffnen</a>',
                 ]
                 if all_files_pending:
                     note_lines.append('\nAngebots-Dokument(e):')
@@ -1162,7 +1162,7 @@ def _handle_message_core(event, say, client):
                 f"Vertragsanpassung — {user_name}",
                 f"Plan: {old_plan} → {new_plan}",
                 f"Effective: {effective}",
-                f"Slack-Thread: {slack_link}",
+                f'Slack-Thread: <a href="{slack_link}">Thread öffnen</a>',
             ]
             if all_files:
                 note_lines.append('\nAngebots-Dokument(e):')
@@ -1755,7 +1755,7 @@ def handle_va_approved(ack, body, say, client):
                         f"Effective: {effective_date}\n"
                         f"Ramp-ID: {ramp_id}\n"
                         f"Chargebee: {cb_ramp_link}\n"
-                        f"Slack-Thread: {slack_thread_link}"
+                        f'Slack-Thread: <a href="{slack_thread_link}">Thread öffnen</a>'
                     )
                     try:
                         requests.post(
