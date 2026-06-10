@@ -477,15 +477,27 @@ def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id
         if not url:
             continue
         try:
-            # Datei von Slack herunterladen (Bot-Token als Auth)
-            slack_resp = requests.get(
-                url,
-                headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
-                timeout=30,
-            )
+            # Datei herunterladen — Slack-Anhänge brauchen Bot-Token, externe URLs nicht
+            if file_info.get('_no_slack_auth'):
+                dl_resp = requests.get(url, timeout=30,
+                                       headers={'User-Agent': 'Mozilla/5.0 (compatible; CS-Admin-Bot/1.0)'})
+            else:
+                dl_resp = requests.get(url, headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'}, timeout=30)
+            slack_resp = dl_resp
             if not slack_resp.ok:
-                logger.warning(f"Slack file download failed: {slack_resp.status_code} {filename}")
+                logger.warning(f"File download failed: {slack_resp.status_code} {filename}")
                 continue
+            # Dateiname und Mimetype aus Response-Headern ableiten falls nicht bekannt
+            if filename in ('angebot', '') or '.' not in filename:
+                cd = slack_resp.headers.get('Content-Disposition', '')
+                cd_match = re.search(r'filename[^;=\n]*=[\'""]?([^\'""\n;]+)', cd)
+                if cd_match:
+                    filename = cd_match.group(1).strip()
+                elif not filename or filename == 'angebot':
+                    ext = slack_resp.headers.get('Content-Type', '').split(';')[0].split('/')[-1]
+                    filename = f"angebot.{ext}" if ext else 'angebot.pdf'
+            ct = slack_resp.headers.get('Content-Type', mimetype).split(';')[0].strip()
+            mimetype = ct or mimetype
 
             # Zu Planhat hochladen via POST /assets
             planhat_resp = requests.post(
@@ -858,10 +870,11 @@ def _handle_message_core(event, say, client):
                 return
             # Dateien aus dieser Nachricht ODER Root-Nachricht sammeln (alle Typen inkl. PDF)
             current_files = extract_files(event.get('files')) or []
+            all_msgs = []
             try:
                 root_result = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
                 all_msgs = root_result.get('messages', [])
-                # Alle Dateien aus dem Thread einsammeln
+                # Alle Slack-Dateianhänge aus dem Thread einsammeln
                 thread_files = []
                 for msg in all_msgs:
                     thread_files.extend(extract_files(msg.get('files')) or [])
@@ -877,11 +890,30 @@ def _handle_message_core(event, say, client):
                 logger.warning(f"Thread files fetch failed: {e}")
                 all_files = current_files
 
+            # Fallback: URLs aus Thread-Nachrichten als Download-Quelle
+            if not all_files:
+                url_re = re.compile(r'https?://\S+', re.IGNORECASE)
+                seen_urls = set()
+                for msg in all_msgs:
+                    msg_text = msg.get('text', '')
+                    for url_match in url_re.finditer(msg_text):
+                        url_raw = url_match.group(0).rstrip('>')
+                        if url_raw not in seen_urls:
+                            seen_urls.add(url_raw)
+                            all_files.append({
+                                '_url_download': url_raw,
+                                'url_private_download': url_raw,
+                                'name': url_raw.split('/')[-1] or 'angebot',
+                                'mimetype': 'application/octet-stream',
+                                'id': url_raw,
+                                '_no_slack_auth': True,
+                            })
+
             if not all_files:
                 say(
                     text=(
-                        ":warning: Keine Dateien in diesem Thread gefunden. "
-                        "Bitte zuerst die Angebotsdatei in den Thread hochladen und dann `#planhat-upload` schreiben."
+                        ":warning: Keine Dateien oder Links in diesem Thread gefunden. "
+                        "Bitte zuerst die Angebotsdatei hochladen oder einen Link posten und dann `#planhat-upload` schreiben."
                     ),
                     thread_ts=thread_ts,
                 )
