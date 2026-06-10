@@ -74,6 +74,11 @@ _pending_vertragsanpassung: dict[tuple[str, str], dict] = {}
 _va_pending_approval: dict[tuple[str, str], dict] = {}
 VA_REMINDER_TTL = 48 * 3600  # 48 Stunden
 
+# Warten auf Planhat-Link nach fehlgeschlagener Company-Suche
+# (channel, thread_ts) -> {'action': 'upload'|'log', 'files': list, 'parsed': dict,
+#                           'subscription': dict|None, 'user_name': str}
+_pending_planhat_link: dict[tuple[str, str], dict] = {}
+
 JIRA_KEY_RE = re.compile(r'\b([A-Z]+-\d+)\b')
 PENDING_TTL = 72 * 3600  # 72 hours in seconds
 
@@ -518,6 +523,43 @@ def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id
     return uploaded
 
 
+def _ask_for_planhat_link(say, channel: str, thread_ts: str, customer_name: str,
+                           action: str, context: dict) -> None:
+    """Postet Nachfrage nach Planhat-Link mit Überspringen-Button und speichert Pending-State."""
+    thread_ref = f"{channel}|||{thread_ts}"
+    action_label = 'Angebots-Upload' if action == 'upload' else 'Log-Eintrag'
+    say(
+        blocks=[
+            {
+                'type': 'section',
+                'text': {
+                    'type': 'mrkdwn',
+                    'text': (
+                        f":mag: Kein Planhat-Eintrag für *{customer_name}* gefunden.\n"
+                        f"Bitte den Planhat-Link des Kunden hier in den Thread posten "
+                        f"um den {action_label} fortzuführen."
+                    ),
+                },
+            },
+            {
+                'type': 'actions',
+                'elements': [
+                    {
+                        'type': 'button',
+                        'text': {'type': 'plain_text', 'text': '❌ Überspringen'},
+                        'style': 'danger',
+                        'action_id': 'planhat_link_skip',
+                        'value': thread_ref,
+                    },
+                ],
+            },
+        ],
+        text=f"Planhat-Link für {customer_name} benötigt",
+        thread_ts=thread_ts,
+    )
+    _pending_planhat_link[(channel, thread_ts)] = {**context, 'action': action}
+
+
 def _cb_lookup(customer_name: str) -> dict | None:
     """Chargebee-Lookup per Kundenname (exakter Company-Match)."""
     if not customer_name or not CHARGEBEE_API_KEY:
@@ -792,6 +834,73 @@ def _handle_message_core(event, say, client):
                 )
             return
 
+        # --- Planhat-Link als Antwort auf _ask_for_planhat_link ---
+        ph_pending = _pending_planhat_link.get((channel, thread_ts))
+        if ph_pending and user_id in CS_ADMIN_USER_IDS:
+            ph_url_match = re.search(r'https?://(?:app|ws)\.planhat\.com/\S+', text)
+            if ph_url_match:
+                ph_url = ph_url_match.group(0).rstrip('>')
+                # Company-ID aus URL extrahieren (letztes Segment)
+                ph_id = ph_url.rstrip('/').split('/')[-1]
+                ph_name = ph_pending.get('customer_name', '')
+                action = ph_pending.get('action')
+
+                if action == 'upload':
+                    uploaded = _upload_offer_to_planhat(
+                        ph_pending.get('files', []), ph_name, ph_id, thread_ts, say,
+                    )
+                    if uploaded:
+                        say(
+                            text=(
+                                f":paperclip: *{len(uploaded)} Datei(en) in Planhat hinterlegt* "
+                                f"unter _{ph_name}_:\n"
+                                + "\n".join(f"• `{f}`" for f in uploaded)
+                            ),
+                            thread_ts=thread_ts,
+                        )
+                    else:
+                        say(text=":warning: Upload fehlgeschlagen — bitte manuell hinterlegen.",
+                            thread_ts=thread_ts)
+
+                elif action == 'log':
+                    parsed_ctx = ph_pending.get('parsed', {})
+                    sub_ctx = ph_pending.get('subscription')
+                    old_plan = sub_ctx.get('plan_id', '–') if sub_ctx else '–'
+                    new_plan = parsed_ctx.get('chargebee_plan_id') or parsed_ctx.get('new_plan') or '–'
+                    effective = parsed_ctx.get('effective_date') or '–'
+                    slack_link = slack_message_link(channel, thread_ts)
+                    note_text = (
+                        f"Vertragsanpassung vorgenommen von {ph_pending.get('user_name', user_name)}\n\n"
+                        f"Plan: {old_plan} → {new_plan}\n"
+                        f"Effective: {effective}\n"
+                        f"Slack-Thread: {slack_link}"
+                    )
+                    try:
+                        import requests as _req
+                        ph_resp = _req.post(
+                            'https://api.planhat.com/activities',
+                            headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
+                            json={'type': 'note', 'companyId': ph_id, 'text': note_text},
+                            timeout=10,
+                        )
+                        if ph_resp.ok:
+                            say(
+                                text=(
+                                    f":memo: *Planhat-Note erstellt* für _{ph_name}_\n"
+                                    f"• Plan: `{old_plan}` → `{new_plan}`\n"
+                                    f"• Effective: {effective}"
+                                ),
+                                thread_ts=thread_ts,
+                            )
+                        else:
+                            say(text=f":warning: Note fehlgeschlagen: `{ph_resp.status_code}`",
+                                thread_ts=thread_ts)
+                    except Exception as e:
+                        say(text=f":warning: Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
+
+                _pending_planhat_link.pop((channel, thread_ts), None)
+                return
+
         # --- Vertragsanpassung: CS Admin bestätigt Chargebee-Link ---
         # Akzeptiert jeden Chargebee-Link (Subscription ODER Customer) — egal ob in der Liste
         va_state = _pending_vertragsanpassung.get((channel, thread_ts))
@@ -950,13 +1059,9 @@ def _handle_message_core(event, say, client):
 
             ph_company = _planhat_search_company(customer_name)
             if not ph_company or not ph_company.get('id'):
-                say(
-                    text=(
-                        f":warning: Kein Planhat-Eintrag für *{customer_name}* gefunden. "
-                        "Bitte Datei manuell in Planhat hinterlegen."
-                    ),
-                    thread_ts=thread_ts,
-                )
+                _ask_for_planhat_link(say, channel, thread_ts, customer_name, 'upload', {
+                    'files': all_files, 'customer_name': customer_name, 'user_name': user_name,
+                })
                 return
 
             uploaded = _upload_offer_to_planhat(
@@ -1025,13 +1130,10 @@ def _handle_message_core(event, say, client):
 
             ph_company = _planhat_search_company(customer_name)
             if not ph_company or not ph_company.get('id'):
-                say(
-                    text=(
-                        f":warning: Kein Planhat-Eintrag für *{customer_name}* gefunden. "
-                        "Bitte Note manuell in Planhat anlegen."
-                    ),
-                    thread_ts=thread_ts,
-                )
+                _ask_for_planhat_link(say, channel, thread_ts, customer_name, 'log', {
+                    'customer_name': customer_name, 'user_name': user_name,
+                    'parsed': parsed_ctx, 'subscription': sub_ctx,
+                })
                 return
 
             # Note-Inhalt aus verfügbarem Kontext aufbauen
@@ -1662,6 +1764,23 @@ def handle_va_approved(ack, body, say, client):
         )
 
     _va_pending_approval.pop((channel, thread_ts), None)
+
+
+@app.action("planhat_link_skip")
+def handle_planhat_link_skip(ack, body, say):
+    """CS Admin überspringt Planhat-Upload oder Log."""
+    ack()
+    user_id = body.get('user', {}).get('id', '')
+    if user_id not in CS_ADMIN_USER_IDS:
+        return
+    thread_ref = body.get('actions', [{}])[0].get('value', '')
+    if '|||' in thread_ref:
+        ch, ts = thread_ref.split('|||', 1)
+        _pending_planhat_link.pop((ch, ts), None)
+    say(
+        text=":white_check_mark: Übersprungen — kein Planhat-Eintrag erstellt.",
+        thread_ts=body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts'),
+    )
 
 
 @app.action("create_ticket_button")
