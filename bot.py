@@ -1094,6 +1094,11 @@ def _handle_message_core(event, say, client):
                     customer_name = parse_vertragsanpassung(root_text).get('customer_name', '')
                 except Exception:
                     customer_name = ''
+            # Fallback: Kundenname direkt nach #planhat-upload angegeben
+            if not customer_name:
+                name_inline = re.sub(r'#planhat-upload\s*', '', text, flags=re.IGNORECASE).strip()
+                if name_inline:
+                    customer_name = name_inline
 
             if not customer_name:
                 say(
@@ -1103,12 +1108,11 @@ def _handle_message_core(event, say, client):
                     ),
                     thread_ts=thread_ts,
                 )
-                # Fallback: Kundenname aus dem Trigger-Text extrahieren
-                name_match = re.sub(r'#planhat-upload\s*', '', text, flags=re.IGNORECASE).strip()
-                if name_match:
-                    customer_name = name_match
-                else:
-                    return
+                return
+
+            # Falls keine Subscription im State: frischen CB-Lookup für Debitnummer
+            if not upload_subscription and CHARGEBEE_API_KEY:
+                upload_subscription = _cb_lookup(customer_name)
 
             ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(upload_subscription))
             if not ph_company or not ph_company.get('id'):
@@ -1180,6 +1184,10 @@ def _handle_message_core(event, say, client):
                     thread_ts=thread_ts,
                 )
                 return
+
+            # Falls keine Subscription im State: frischen CB-Lookup für Debitnummer
+            if not sub_ctx and CHARGEBEE_API_KEY:
+                sub_ctx = _cb_lookup(customer_name)
 
             ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(sub_ctx))
             if not ph_company or not ph_company.get('id'):
