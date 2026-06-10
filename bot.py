@@ -575,9 +575,9 @@ def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id
     note_text = '\n'.join(note_lines)
     try:
         resp = requests.post(
-            'https://api.planhat.com/notes',
+            'https://api.planhat.com/conversations',
             headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
-            json={'note': note_text, 'companyId': planhat_company_id},
+            json={'description': note_text, 'companyId': planhat_company_id},
             timeout=15,
         )
         if resp.ok:
@@ -964,9 +964,9 @@ def _handle_message_core(event, say, client):
 
                 try:
                     ph_resp = requests.post(
-                        'https://api.planhat.com/notes',
+                        'https://api.planhat.com/conversations',
                         headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
-                        json={'note': '\n'.join(note_lines), 'companyId': ph_id},
+                        json={'description': '\n'.join(note_lines), 'companyId': ph_id},
                         timeout=10,
                     )
                     if ph_resp.ok:
@@ -1167,9 +1167,9 @@ def _handle_message_core(event, say, client):
             note_text = '\n'.join(note_lines)
             try:
                 ph_resp = requests.post(
-                    'https://api.planhat.com/notes',
+                    'https://api.planhat.com/conversations',
                     headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
-                    json={'note': note_text, 'companyId': ph_company['id']},
+                    json={'description': note_text, 'companyId': ph_company['id']},
                     timeout=10,
                 )
                 if ph_resp.ok:
@@ -1751,10 +1751,10 @@ def handle_va_approved(ack, body, say, client):
                     )
                     try:
                         requests.post(
-                            'https://api.planhat.com/notes',
+                            'https://api.planhat.com/conversations',
                             headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
                             json={
-                                'note': note_text,
+                                'description': note_text,
                                 'companyId': ph_company['id'],
                             },
                             timeout=10,
