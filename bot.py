@@ -121,6 +121,11 @@ def extract_images(files) -> list[dict]:
     ]
 
 
+def extract_files(files) -> list[dict]:
+    """Alle Dateien aus einem Slack-Event — inkl. PDFs, Word-Docs, etc."""
+    return [f for f in (files or []) if f.get('id')]
+
+
 def parse_request(text: str) -> tuple[str | None, str | None]:
     """Extract title and use case from a message."""
     clean = re.sub(r'#improvement', '', text, flags=re.IGNORECASE).strip()
@@ -851,16 +856,15 @@ def _handle_message_core(event, say, client):
                     thread_ts=thread_ts,
                 )
                 return
-            # Dateien aus dieser Nachricht ODER Root-Nachricht sammeln
-            current_files = extract_images(event.get('files')) or []
+            # Dateien aus dieser Nachricht ODER Root-Nachricht sammeln (alle Typen inkl. PDF)
+            current_files = extract_files(event.get('files')) or []
             try:
                 root_result = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
                 all_msgs = root_result.get('messages', [])
-                root_files = extract_images(all_msgs[0].get('files')) if all_msgs else []
                 # Alle Dateien aus dem Thread einsammeln
                 thread_files = []
                 for msg in all_msgs:
-                    thread_files.extend(extract_images(msg.get('files')) or [])
+                    thread_files.extend(extract_files(msg.get('files')) or [])
                 # Deduplizieren per file id
                 seen_ids = set()
                 all_files = []
@@ -990,7 +994,7 @@ def _handle_message_core(event, say, client):
                 # Dateien aus Root-Nachricht mitgeben
                 try:
                     root_result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
-                    root_files = extract_images(root_result.get('messages', [{}])[0].get('files')) or []
+                    root_files = extract_files(root_result.get('messages', [{}])[0].get('files')) or []
                 except Exception:
                     root_files = []
                 _process_vertragsanpassung(say, client, channel, thread_ts, user_name, parsed, subscription,
@@ -1230,7 +1234,7 @@ def _handle_message_core(event, say, client):
                 thread_ts=ts,
             )
         else:
-            event_files = extract_images(event.get('files')) or None
+            event_files = extract_files(event.get('files')) or None
             _process_vertragsanpassung(say, client, channel, ts, user_name, parsed, subscription,
                                        files=event_files)
         return
