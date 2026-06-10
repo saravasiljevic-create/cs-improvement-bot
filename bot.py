@@ -566,7 +566,9 @@ def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id
 
     for file_info in files:
         url = file_info.get('url_private_download') or file_info.get('url_private') or file_info.get('_url_download', '')
-        filename = file_info.get('name', 'angebot')
+        raw_name = file_info.get('name', '')
+        # URL-Slugs und generische Namen durch lesbaren Label ersetzen
+        filename = raw_name if (raw_name and '.' in raw_name) else 'Angebotslink'
         if not url:
             continue
 
@@ -962,7 +964,8 @@ def _handle_message_core(event, say, client):
                 if all_files_pending:
                     note_lines.append('\nAngebots-Dokument(e):')
                     for f in all_files_pending:
-                        fname = f.get('name', 'angebot')
+                        raw = f.get('name', '')
+                        fname = raw if (raw and '.' in raw) else 'Angebotslink'
                         furl = f.get('url_private_download') or f.get('_url_download', '')
                         note_lines.append(f'• <a href="{furl}">{fname}</a>' if furl else f"• {fname}")
 
@@ -1143,7 +1146,7 @@ def _handle_message_core(event, say, client):
                             all_files.append({
                                 '_url_download': url_raw,
                                 'url_private_download': url_raw,
-                                'name': url_raw.split('/')[-1] or 'angebot',
+                                'name': 'Angebotslink',
                                 'mimetype': 'application/octet-stream',
                                 'id': url_raw,
                                 '_no_slack_auth': True,
@@ -1164,7 +1167,8 @@ def _handle_message_core(event, say, client):
             if all_files:
                 note_lines.append('\nAngebots-Dokument(e):')
                 for f in all_files:
-                    fname = f.get('name', 'angebot')
+                    raw = f.get('name', '')
+                    fname = raw if (raw and '.' in raw) else 'Angebotslink'
                     furl = f.get('url_private_download') or f.get('_url_download', '')
                     note_lines.append(f'• <a href="{furl}">{fname}</a>' if furl else f"• {fname}")
 
