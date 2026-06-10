@@ -1067,12 +1067,15 @@ def _handle_message_core(event, say, client):
                 )
                 return
 
-            # Kundenname aus VA-State oder Root-Nachricht ermitteln
-            va_state = _pending_vertragsanpassung.get((channel, thread_ts)) or {}
-            va_approval = _va_pending_approval.get((channel, thread_ts)) or {}
+            # Kundenname + Subscription aus VA-State oder Root-Nachricht ermitteln
+            va_state_up = _pending_vertragsanpassung.get((channel, thread_ts)) or {}
+            va_approval_up = _va_pending_approval.get((channel, thread_ts)) or {}
+            upload_subscription = (
+                va_state_up.get('subscription') or va_approval_up.get('subscription')
+            )
             customer_name = (
-                va_state.get('parsed', {}).get('customer_name')
-                or va_approval.get('parsed', {}).get('customer_name')
+                va_state_up.get('parsed', {}).get('customer_name')
+                or va_approval_up.get('parsed', {}).get('customer_name')
             )
             if not customer_name:
                 try:
@@ -1096,7 +1099,7 @@ def _handle_message_core(event, say, client):
                 else:
                     return
 
-            ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(subscription))
+            ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(upload_subscription))
             if not ph_company or not ph_company.get('id'):
                 _ask_for_planhat_link(say, channel, thread_ts, customer_name, 'upload', {
                     'files': all_files, 'customer_name': customer_name, 'user_name': user_name,
