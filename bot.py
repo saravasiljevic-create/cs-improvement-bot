@@ -4,6 +4,8 @@ import re
 import time
 from datetime import datetime, timezone
 
+import requests
+
 from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -972,8 +974,8 @@ def _handle_message_core(event, say, client):
                         f"Slack-Thread: {slack_link}"
                     )
                     try:
-                        import requests as _req
-                        ph_resp = _req.post(
+            
+                        ph_resp = requests.post(
                             'https://api.planhat.com/activities',
                             headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
                             json={'type': 'note', 'companyId': ph_id, 'text': note_text},
@@ -1255,8 +1257,8 @@ def _handle_message_core(event, say, client):
                 f"Slack-Thread: {slack_link}"
             )
             try:
-                import requests as _req
-                ph_resp = _req.post(
+    
+                ph_resp = requests.post(
                     'https://api.planhat.com/activities',
                     headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
                     json={
@@ -1808,7 +1810,7 @@ def handle_va_approved(ack, body, say, client):
 
     try:
         import requests as _req
-        resp = _req.post(url, auth=(CHARGEBEE_API_KEY, ''), data=data, timeout=15)
+        resp = requests.post(url, auth=(CHARGEBEE_API_KEY, ''), data=data, timeout=15)
         if resp.ok:
             ramp = resp.json().get('ramp', {})
             ramp_id = ramp.get('id', '–')
@@ -1842,7 +1844,7 @@ def handle_va_approved(ack, body, say, client):
                         f"Slack-Thread: {slack_thread_link}"
                     )
                     try:
-                        _req.post(
+                        requests.post(
                             'https://api.planhat.com/activities',
                             headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
                             json={
