@@ -495,52 +495,58 @@ def _debit_number_from_subscription(subscription: dict | None) -> str:
 
 
 def _planhat_search_company(customer_name: str, debit_number: str = '') -> dict | None:
-    """Sucht Planhat-Company. Strategie:
-    1. externalId = Debitorennummer (cf_debit_number aus Chargebee) — zuverlässigste Quelle
-    2. Namenssuche als Fallback
+    """Sucht Planhat-Company.
+
+    Planhat ignoriert URL-Filter-Parameter — die API gibt immer dieselben ersten
+    Companies zurück unabhängig von name/externalId. Deshalb: Ergebnisse auf
+    exakten Match prüfen. Kein Match → None (löst _ask_for_planhat_link aus).
+
+    Strategie:
+    1. Fetch-and-match per externalId (Debitorennummer)
+    2. Fetch-and-match per Name als Fallback
     """
     if not PLANHAT_API_TOKEN:
         return None
     headers = {'Authorization': f'Bearer {PLANHAT_API_TOKEN}'}
 
-    # 1. Suche per externalId (Debitorennummer)
-    if debit_number:
+    def _fetch_page(params: dict) -> list:
         try:
-            resp = requests.get(
-                'https://api.planhat.com/companies',
-                headers=headers,
-                params={'externalId': debit_number, 'limit': 1},
-                timeout=10,
-            )
-            if resp.ok:
-                companies = resp.json()
-                if isinstance(companies, list) and companies:
-                    c = companies[0]
-                    logger.info(f"Planhat: externalId={debit_number} → {c.get('name')}")
-                    return {'id': c.get('_id') or c.get('id'), 'name': c.get('name', '')}
+            resp = requests.get('https://api.planhat.com/companies',
+                                headers=headers, params=params, timeout=10)
+            if resp.ok and isinstance(resp.json(), list):
+                return resp.json()
         except Exception as e:
-            logger.warning(f"Planhat externalId search failed: {e}")
+            logger.warning(f"Planhat fetch failed: {e}")
+        return []
 
-    # 2. Namenssuche als Fallback
-    if not customer_name:
-        return None
-    try:
-        resp = requests.get(
-            'https://api.planhat.com/companies',
-            headers=headers,
-            params={'name': customer_name, 'limit': 5},
-            timeout=10,
-        )
-        if resp.ok:
-            companies = resp.json()
-            if isinstance(companies, list) and companies:
-                exact = next(
-                    (c for c in companies if c.get('name', '').lower() == customer_name.lower()),
-                    companies[0],
-                )
-                return {'id': exact.get('_id') or exact.get('id'), 'name': exact.get('name', '')}
-    except Exception as e:
-        logger.warning(f"Planhat name search failed: {e}")
+    # 1. Seiten durchsuchen bis externalId-Match gefunden (max 5 Seiten à 100)
+    if debit_number:
+        for offset in range(0, 500, 100):
+            page = _fetch_page({'limit': 100, 'offset': offset})
+            if not page:
+                break
+            match = next((c for c in page if str(c.get('externalId', '')) == debit_number), None)
+            if match:
+                logger.info(f"Planhat externalId match: {debit_number} → {match.get('name')}")
+                return {'id': match.get('_id') or match.get('id'), 'name': match.get('name', '')}
+            if len(page) < 100:
+                break  # letzte Seite
+
+    # 2. Namens-Match (exakter Vergleich, case-insensitive)
+    if customer_name:
+        for offset in range(0, 500, 100):
+            page = _fetch_page({'limit': 100, 'offset': offset})
+            if not page:
+                break
+            match = next(
+                (c for c in page if c.get('name', '').lower() == customer_name.lower()), None
+            )
+            if match:
+                logger.info(f"Planhat name match: {customer_name} → {match.get('_id')}")
+                return {'id': match.get('_id') or match.get('id'), 'name': match.get('name', '')}
+            if len(page) < 100:
+                break
+
     return None
 
 
