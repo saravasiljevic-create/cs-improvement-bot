@@ -940,60 +940,51 @@ def _handle_message_core(event, say, client):
                     or ph_url.rstrip('/').split('/')[-1]
                 )
                 ph_name = ph_pending.get('customer_name', '')
-                action = ph_pending.get('action')
+                parsed_ctx = ph_pending.get('parsed', {})
+                sub_ctx = ph_pending.get('subscription')
+                all_files_pending = ph_pending.get('files', [])
 
-                if action == 'upload':
-                    uploaded = _upload_offer_to_planhat(
-                        ph_pending.get('files', []), ph_name, ph_id, thread_ts, say,
+                old_plan = sub_ctx.get('plan_id', '–') if sub_ctx else '–'
+                new_plan = parsed_ctx.get('chargebee_plan_id') or parsed_ctx.get('new_plan') or '–'
+                effective = parsed_ctx.get('effective_date') or '–'
+                slack_link = slack_message_link(channel, thread_ts)
+
+                note_lines = [
+                    f"Vertragsanpassung — {ph_pending.get('user_name', user_name)}",
+                    f"Plan: {old_plan} → {new_plan}",
+                    f"Effective: {effective}",
+                    f"Slack-Thread: {slack_link}",
+                ]
+                if all_files_pending:
+                    note_lines.append('\nAngebots-Dokument(e):')
+                    for f in all_files_pending:
+                        fname = f.get('name', 'angebot')
+                        furl = f.get('url_private_download') or f.get('_url_download', '')
+                        note_lines.append(f"• {fname}: {furl}" if furl else f"• {fname}")
+
+                try:
+                    ph_resp = requests.post(
+                        'https://api.planhat.com/notes',
+                        headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
+                        json={'note': '\n'.join(note_lines), 'companyId': ph_id},
+                        timeout=10,
                     )
-                    if uploaded:
+                    if ph_resp.ok:
+                        file_info_str = f" + {len(all_files_pending)} Datei-Link(s)" if all_files_pending else ""
                         say(
                             text=(
-                                f":paperclip: *{len(uploaded)} Datei(en) in Planhat hinterlegt* "
-                                f"unter _{ph_name}_:\n"
-                                + "\n".join(f"• `{f}`" for f in uploaded)
+                                f":memo: *Planhat-Note erstellt* für _{ph_name}_"
+                                f"{file_info_str}\n"
+                                f"• Plan: `{old_plan}` → `{new_plan}`\n"
+                                f"• Effective: {effective}"
                             ),
                             thread_ts=thread_ts,
                         )
                     else:
-                        say(text=":warning: Upload fehlgeschlagen — bitte manuell hinterlegen.",
+                        say(text=f":warning: Note fehlgeschlagen: `{ph_resp.status_code} {ph_resp.text[:200]}`",
                             thread_ts=thread_ts)
-
-                elif action == 'log':
-                    parsed_ctx = ph_pending.get('parsed', {})
-                    sub_ctx = ph_pending.get('subscription')
-                    old_plan = sub_ctx.get('plan_id', '–') if sub_ctx else '–'
-                    new_plan = parsed_ctx.get('chargebee_plan_id') or parsed_ctx.get('new_plan') or '–'
-                    effective = parsed_ctx.get('effective_date') or '–'
-                    slack_link = slack_message_link(channel, thread_ts)
-                    note_text = (
-                        f"Vertragsanpassung vorgenommen von {ph_pending.get('user_name', user_name)}\n\n"
-                        f"Plan: {old_plan} → {new_plan}\n"
-                        f"Effective: {effective}\n"
-                        f"Slack-Thread: {slack_link}"
-                    )
-                    try:
-            
-                        ph_resp = requests.post(
-                            'https://api.planhat.com/notes',
-                            headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
-                            json={'note': note_text, 'companyId': ph_id},
-                            timeout=10,
-                        )
-                        if ph_resp.ok:
-                            say(
-                                text=(
-                                    f":memo: *Planhat-Note erstellt* für _{ph_name}_\n"
-                                    f"• Plan: `{old_plan}` → `{new_plan}`\n"
-                                    f"• Effective: {effective}"
-                                ),
-                                thread_ts=thread_ts,
-                            )
-                        else:
-                            say(text=f":warning: Note fehlgeschlagen: `{ph_resp.status_code}`",
-                                thread_ts=thread_ts)
-                    except Exception as e:
-                        say(text=f":warning: Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
+                except Exception as e:
+                    say(text=f":warning: Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
 
                 _pending_planhat_link.pop((channel, thread_ts), None)
                 return
@@ -1066,159 +1057,39 @@ def _handle_message_core(event, say, client):
                 )
             return
 
-        # --- Planhat-Upload: manueller Trigger (#planhat-upload) ---
-        if '#planhat-upload' in text.lower():
+        # --- Planhat Log + Upload kombiniert (#planhat-log) ---
+        # Erstellt eine Note in Planhat mit VA-Kontext + optionalen Datei-Links.
+        # Ersetzt #planhat-upload und #planhat-log. Auch #planhat-upload wird noch erkannt.
+        if '#planhat-log' in text.lower() or '#planhat-upload' in text.lower():
             if user_id not in CS_ADMIN_USER_IDS:
                 say(
-                    text=":no_entry: `#planhat-upload` kann nur vom CS Admin Team genutzt werden.",
+                    text=":no_entry: Dieser Befehl kann nur vom CS Admin Team genutzt werden.",
                     thread_ts=thread_ts,
                 )
                 return
-            # Dateien aus dieser Nachricht ODER Root-Nachricht sammeln (alle Typen inkl. PDF)
-            current_files = extract_files(event.get('files')) or []
+
+            # Thread-Nachrichten lesen
             all_msgs = []
             try:
                 root_result = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
                 all_msgs = root_result.get('messages', [])
-                # Alle Slack-Dateianhänge aus dem Thread einsammeln
-                thread_files = []
-                for msg in all_msgs:
-                    thread_files.extend(extract_files(msg.get('files')) or [])
-                # Deduplizieren per file id
-                seen_ids = set()
-                all_files = []
-                for f in (current_files + thread_files):
-                    fid = f.get('id')
-                    if fid and fid not in seen_ids:
-                        seen_ids.add(fid)
-                        all_files.append(f)
-            except Exception as e:
-                logger.warning(f"Thread files fetch failed: {e}")
-                all_files = current_files
-
-            # Fallback: URLs aus Thread-Nachrichten als Download-Quelle
-            if not all_files:
-                url_re = re.compile(r'https?://\S+', re.IGNORECASE)
-                seen_urls = set()
-                for msg in all_msgs:
-                    msg_text = msg.get('text', '')
-                    for url_match in url_re.finditer(msg_text):
-                        url_raw = url_match.group(0).rstrip('>')
-                        if url_raw not in seen_urls:
-                            seen_urls.add(url_raw)
-                            all_files.append({
-                                '_url_download': url_raw,
-                                'url_private_download': url_raw,
-                                'name': url_raw.split('/')[-1] or 'angebot',
-                                'mimetype': 'application/octet-stream',
-                                'id': url_raw,
-                                '_no_slack_auth': True,
-                            })
-
-            if not all_files:
-                say(
-                    text=(
-                        ":warning: Keine Dateien oder Links in diesem Thread gefunden. "
-                        "Bitte zuerst die Angebotsdatei hochladen oder einen Link posten und dann `#planhat-upload` schreiben."
-                    ),
-                    thread_ts=thread_ts,
-                )
-                return
-
-            # Kundenname + Subscription aus VA-State oder Root-Nachricht ermitteln
-            va_state_up = _pending_vertragsanpassung.get((channel, thread_ts)) or {}
-            va_approval_up = _va_pending_approval.get((channel, thread_ts)) or {}
-            upload_subscription = (
-                va_state_up.get('subscription') or va_approval_up.get('subscription')
-            )
-            customer_name = (
-                va_state_up.get('parsed', {}).get('customer_name')
-                or va_approval_up.get('parsed', {}).get('customer_name')
-            )
-            if not customer_name:
-                try:
-                    root_text = all_msgs[0].get('text', '') if all_msgs else ''
-                    customer_name = parse_vertragsanpassung(root_text).get('customer_name', '')
-                except Exception:
-                    customer_name = ''
-            # Fallback: Kundenname direkt nach #planhat-upload angegeben
-            if not customer_name:
-                name_inline = re.sub(r'#planhat-upload\s*', '', text, flags=re.IGNORECASE).strip()
-                if name_inline:
-                    customer_name = name_inline
-
-            if not customer_name:
-                say(
-                    text=(
-                        ":thinking_face: Kein Kundenname erkannt. "
-                        "Schreibe `#planhat-upload Kundenname GmbH` um den Kunden anzugeben."
-                    ),
-                    thread_ts=thread_ts,
-                )
-                return
-
-            # Falls keine Subscription im State: frischen CB-Lookup für Debitnummer
-            if not upload_subscription and CHARGEBEE_API_KEY:
-                upload_subscription = _cb_lookup(customer_name)
-
-            ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(upload_subscription))
-            if not ph_company or not ph_company.get('id'):
-                _ask_for_planhat_link(say, channel, thread_ts, customer_name, 'upload', {
-                    'files': all_files, 'customer_name': customer_name, 'user_name': user_name,
-                })
-                return
-
-            uploaded = _upload_offer_to_planhat(
-                all_files, customer_name, ph_company['id'], thread_ts, say,
-            )
-            if uploaded:
-                say(
-                    text=(
-                        f":paperclip: *{len(uploaded)} Datei(en) nachträglich in Planhat hinterlegt* "
-                        f"unter _{ph_company['name']}_:\n"
-                        + "\n".join(f"• `{f}`" for f in uploaded)
-                    ),
-                    thread_ts=thread_ts,
-                )
-            else:
-                say(
-                    text=":warning: Upload fehlgeschlagen — bitte Dateien manuell in Planhat hinterlegen.",
-                    thread_ts=thread_ts,
-                )
-            return
-
-        # --- Planhat Log: nachträgliche Note für Vertragsanpassung (#planhat-log) ---
-        if '#planhat-log' in text.lower():
-            if user_id not in CS_ADMIN_USER_IDS:
-                say(
-                    text=":no_entry: `#planhat-log` kann nur vom CS Admin Team genutzt werden.",
-                    thread_ts=thread_ts,
-                )
-                return
-
-            # Kontext aus VA-State oder Thread-Nachrichten zusammenbauen
-            va_state = _pending_vertragsanpassung.get((channel, thread_ts)) or {}
-            va_approval = _va_pending_approval.get((channel, thread_ts)) or {}
-            parsed_ctx = va_state.get('parsed') or va_approval.get('parsed') or {}
-            sub_ctx = va_state.get('subscription') or va_approval.get('subscription')
-
-            # Alle Thread-Nachrichten lesen falls noch kein Kontext
-            try:
-                root_result = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
-                all_msgs = root_result.get('messages', [])
-                root_text = all_msgs[0].get('text', '') if all_msgs else ''
             except Exception as e:
                 logger.warning(f"Thread read failed for planhat-log: {e}")
-                all_msgs = []
-                root_text = ''
 
+            root_text = all_msgs[0].get('text', '') if all_msgs else ''
+
+            # VA-Kontext aus State oder Thread
+            va_state_pl = _pending_vertragsanpassung.get((channel, thread_ts)) or {}
+            va_approval_pl = _va_pending_approval.get((channel, thread_ts)) or {}
+            parsed_ctx = va_state_pl.get('parsed') or va_approval_pl.get('parsed') or {}
+            sub_ctx = va_state_pl.get('subscription') or va_approval_pl.get('subscription')
             if not parsed_ctx and root_text:
                 parsed_ctx = parse_vertragsanpassung(root_text)
 
+            # Kundenname ermitteln
             customer_name = parsed_ctx.get('customer_name', '')
-            # Fallback: Name direkt nach #planhat-log angegeben
             if not customer_name:
-                name_inline = re.sub(r'#planhat-log\s*', '', text, flags=re.IGNORECASE).strip()
+                name_inline = re.sub(r'#planhat-(?:log|upload)\s*', '', text, flags=re.IGNORECASE).strip()
                 if name_inline:
                     customer_name = name_inline
 
@@ -1232,7 +1103,7 @@ def _handle_message_core(event, say, client):
                 )
                 return
 
-            # Falls keine Subscription im State: frischen CB-Lookup für Debitnummer
+            # CB-Lookup für Debitnummer falls kein State
             if not sub_ctx and CHARGEBEE_API_KEY:
                 sub_ctx = _cb_lookup(customer_name)
 
@@ -1244,32 +1115,69 @@ def _handle_message_core(event, say, client):
                 })
                 return
 
-            # Note-Inhalt aus verfügbarem Kontext aufbauen
+            # Dateien aus Thread einsammeln (Slack-Anhänge + URLs)
+            current_files = extract_files(event.get('files')) or []
+            thread_files = []
+            for msg in all_msgs:
+                thread_files.extend(extract_files(msg.get('files')) or [])
+            seen_ids: set = set()
+            all_files = []
+            for f in (current_files + thread_files):
+                fid = f.get('id')
+                if fid and fid not in seen_ids:
+                    seen_ids.add(fid)
+                    all_files.append(f)
+            # URL-Fallback
+            if not all_files:
+                url_re_pl = re.compile(r'https?://\S+', re.IGNORECASE)
+                seen_urls: set = set()
+                for msg in all_msgs:
+                    for url_match in url_re_pl.finditer(msg.get('text', '')):
+                        url_raw = url_match.group(0).rstrip('>')
+                        if url_raw not in seen_urls and 'planhat' not in url_raw:
+                            seen_urls.add(url_raw)
+                            all_files.append({
+                                '_url_download': url_raw,
+                                'url_private_download': url_raw,
+                                'name': url_raw.split('/')[-1] or 'angebot',
+                                'mimetype': 'application/octet-stream',
+                                'id': url_raw,
+                                '_no_slack_auth': True,
+                            })
+
+            # Note aufbauen: VA-Kontext + optionale Datei-Links
             old_plan = sub_ctx.get('plan_id', '–') if sub_ctx else '–'
             new_plan = parsed_ctx.get('chargebee_plan_id') or parsed_ctx.get('new_plan') or '–'
             effective = parsed_ctx.get('effective_date') or '–'
             slack_link = slack_message_link(channel, thread_ts)
-            note_text = (
-                f"Vertragsanpassung vorgenommen von {user_name}\n\n"
-                f"Plan: {old_plan} → {new_plan}\n"
-                f"Effective: {effective}\n"
-                f"Slack-Thread: {slack_link}"
-            )
+
+            note_lines = [
+                f"Vertragsanpassung — {user_name}",
+                f"Plan: {old_plan} → {new_plan}",
+                f"Effective: {effective}",
+                f"Slack-Thread: {slack_link}",
+            ]
+            if all_files:
+                note_lines.append('\nAngebots-Dokument(e):')
+                for f in all_files:
+                    fname = f.get('name', 'angebot')
+                    furl = f.get('url_private_download') or f.get('_url_download', '')
+                    note_lines.append(f"• {fname}: {furl}" if furl else f"• {fname}")
+
+            note_text = '\n'.join(note_lines)
             try:
-    
                 ph_resp = requests.post(
                     'https://api.planhat.com/notes',
                     headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
-                    json={
-                        'note': note_text,
-                        'companyId': ph_company['id'],
-                    },
+                    json={'note': note_text, 'companyId': ph_company['id']},
                     timeout=10,
                 )
                 if ph_resp.ok:
+                    file_info_str = f" + {len(all_files)} Datei-Link(s)" if all_files else ""
                     say(
                         text=(
-                            f":memo: *Planhat-Note erstellt* für _{ph_company['name']}_\n"
+                            f":memo: *Planhat-Note erstellt* für _{ph_company['name']}_"
+                            f"{file_info_str}\n"
                             f"• Plan: `{old_plan}` → `{new_plan}`\n"
                             f"• Effective: {effective}"
                         ),
