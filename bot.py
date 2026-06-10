@@ -880,7 +880,18 @@ def _handle_message_core(event, say, client):
             if ph_url_match:
                 ph_url = ph_url_match.group(0).rstrip('>')
                 # Company-ID aus URL extrahieren (letztes Segment)
-                ph_id = ph_url.rstrip('/').split('/')[-1]
+                # Company-ID aus verschiedenen Planhat-URL-Formaten extrahieren:
+                # app.planhat.com/customer/62f68edfd9448f71ee7757c3
+                # ws.planhat.com/.../task?profile=Company.62f68edfd9448f71ee7757c3
+                _ph_profile = re.search(r'profile=Company\.([a-f0-9]+)', ph_url)
+                _ph_customer = re.search(r'/customer/([a-f0-9]+)', ph_url)
+                _ph_segment = re.search(r'/([a-f0-9]{24})(?:[/?]|$)', ph_url)
+                ph_id = (
+                    (_ph_profile and _ph_profile.group(1))
+                    or (_ph_customer and _ph_customer.group(1))
+                    or (_ph_segment and _ph_segment.group(1))
+                    or ph_url.rstrip('/').split('/')[-1]
+                )
                 ph_name = ph_pending.get('customer_name', '')
                 action = ph_pending.get('action')
 
