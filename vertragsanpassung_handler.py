@@ -34,6 +34,16 @@ _PAYMENT_SLUG: dict[str, str] = {
     'quartalsweise': 'quarterly', 'quarterly': 'quarterly',
 }
 
+# Version-Suffix pro Service-Paket (v1–v9: Standard S/M/L, Growth S/M/L, Premium S/M/L).
+# Gilt für Pro 25 und Business 25 Pläne. Andere Tier-Slugs haben kein Versions-Suffix.
+_SERVICE_PACKAGE_VERSION: dict[str, str] = {
+    'standard s': 'v1', 'standard m': 'v2', 'standard l': 'v3',
+    'growth s': 'v4',   'growth m': 'v5',   'growth l': 'v6',
+    'premium s': 'v7',  'premium m': 'v8',  'premium l': 'v9',
+}
+# Plan-Slugs die Versions-Suffixe unterstützen
+_VERSIONED_SLUGS = {'pro', 'pro-25', 'business', 'business-25', 'scale', 'launch'}
+
 
 def extract_service_package(plan_name: str) -> str:
     """Extrahiert das Service-Paket aus einem Plan-Namen (z.B. 'Premium L' aus 'Pro 25 | ... inkl. Premium L')."""
@@ -43,6 +53,12 @@ def extract_service_package(plan_name: str) -> str:
 
 def fetch_item_price_name(item_price_id: str, api_key: str, site: str) -> str:
     """Lädt den offiziellen Chargebee-Namen einer item_price_id."""
+    data = fetch_item_price(item_price_id, api_key, site)
+    return data.get('name', '')
+
+
+def fetch_item_price(item_price_id: str, api_key: str, site: str) -> dict:
+    """Lädt Name und Preis einer item_price_id aus Chargebee."""
     from urllib.parse import quote as _q
     try:
         resp = requests.get(
@@ -51,26 +67,36 @@ def fetch_item_price_name(item_price_id: str, api_key: str, site: str) -> str:
             timeout=10,
         )
         if resp.ok:
-            return resp.json().get('item_price', {}).get('name', '')
+            ip = resp.json().get('item_price', {})
+            return {'name': ip.get('name', ''), 'price': ip.get('price')}
     except Exception as e:
-        logger.warning(f"fetch_item_price_name({item_price_id}) failed: {e}")
-    return ''
+        logger.warning(f"fetch_item_price({item_price_id}) failed: {e}")
+    return {}
 
 
-def resolve_chargebee_plan_id(plan_name: str, contract_months: int, payment_type: str) -> str | None:
-    """Leitet die Chargebee item_price_id ab.
+def resolve_chargebee_plan_id(
+    plan_name: str,
+    contract_months: int,
+    payment_type: str,
+    service_package: str = '',
+) -> str | None:
+    """Leitet die Chargebee item_price_id ab inkl. Versions-Suffix für das Service-Paket.
 
-    Beispiel: ('Pro 25', 24, 'jährlich') → 'pro-biennial-contract-annual-payment'
+    Beispiel: ('Pro 25', 24, 'monatlich', 'Growth S') → 'pro-biennial-contract-monthly-payment-v4'
     """
     slug = _PLAN_SLUG.get(plan_name.lower().strip())
     if not slug:
-        # Fallback: kebab-case des Namens
         slug = re.sub(r'\s+', '-', plan_name.lower().strip())
     duration = _DURATION_SLUG.get(contract_months)
     payment = _PAYMENT_SLUG.get(payment_type.lower().strip())
     if not duration or not payment:
         return None
-    return f"{slug}-{duration}-contract-{payment}-payment"
+    base = f"{slug}-{duration}-contract-{payment}-payment"
+    if slug in _VERSIONED_SLUGS and service_package:
+        version = _SERVICE_PACKAGE_VERSION.get(service_package.lower().strip())
+        if version:
+            return f"{base}-{version}"
+    return base
 
 
 # CS Admin Slack User IDs für @-Mentions in der Subscription-Warnung
@@ -294,9 +320,12 @@ def parse_vertragsanpassung(text: str) -> dict:
         if _dur:
             n = int(_dur.group(1))
             result['contract_months'] = n * 12 if 'Jahres' in contract_raw else n
-        # Chargebee plan_id auflösen
+        # Chargebee plan_id auflösen (inkl. Versions-Suffix aus Service-Paket)
         if result.get('payment_type') and result.get('contract_months'):
-            pid = resolve_chargebee_plan_id(plan_base, result['contract_months'], result['payment_type'])
+            pid = resolve_chargebee_plan_id(
+                plan_base, result['contract_months'], result['payment_type'],
+                service_package=result.get('service_package', ''),
+            )
             if pid:
                 result['chargebee_plan_id'] = pid
     else:
@@ -321,7 +350,8 @@ def parse_vertragsanpassung(text: str) -> dict:
         # Chargebee Plan-ID neu auflösen falls jetzt alle Felder vorhanden
         if result.get('contract_months') and result.get('new_plan') and result.get('payment_type'):
             pid = resolve_chargebee_plan_id(
-                result['new_plan'], result['contract_months'], result['payment_type']
+                result['new_plan'], result['contract_months'], result['payment_type'],
+                service_package=result.get('service_package', ''),
             )
             if pid:
                 result['chargebee_plan_id'] = pid
@@ -494,7 +524,10 @@ def fetch_offer_data(url: str) -> dict:
                 months = n * 12 if 'Jahres' in contract_raw else n
                 result['contract_months'] = months
                 if result.get('payment_type'):
-                    pid = resolve_chargebee_plan_id(plan_raw, months, result['payment_type'])
+                    pid = resolve_chargebee_plan_id(
+                        plan_raw, months, result['payment_type'],
+                        service_package=result.get('service_package', ''),
+                    )
                     if pid:
                         result['chargebee_plan_id'] = pid
 
@@ -1025,9 +1058,18 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
         plan_display = parsed.get('plan_full_name') or parsed['new_plan']
         arrow = f" _(war: `{old}`)_" if old and old.lower() not in (parsed['new_plan'].lower(), plan_display.lower()) else ''
         soll_lines.append(f"• Neuer Plan: {plan_display}{arrow}")
-        # Chargebee item_price_id (für Automatisierung)
+        # Chargebee item_price_id + Listenpreis
         if parsed.get('chargebee_plan_id'):
-            soll_lines.append(f"  → `item_price_id`: `{parsed['chargebee_plan_id']}`")
+            price_line = f"  → `item_price_id`: `{parsed['chargebee_plan_id']}`"
+            list_price = parsed.get('chargebee_plan_list_price')
+            negotiated_price = parsed.get('negotiated_price')
+            if list_price is not None:
+                eur_list = f"EUR {list_price / 100:,.2f}"
+                price_line += f"  ·  Listenpreis: *{eur_list}/mo*"
+                if negotiated_price is not None and negotiated_price != list_price:
+                    eur_neg = f"EUR {negotiated_price / 100:,.2f}"
+                    price_line += f"\n  ⚠️ *Verhandelter Preis: {eur_neg}/mo* — Price Override nötig!"
+            soll_lines.append(price_line)
         # Service-Paket (IST → SOLL Vergleich)
         soll_pkg = parsed.get('service_package', '')
         ist_pkg = subscription.get('service_package', '') if subscription else ''
@@ -1069,21 +1111,45 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
         )
     if parsed.get('effective_date'):
         dt = _try_parse_date(parsed['effective_date'])
-        if dt and dt.date() > datetime.now(timezone.utc).date():
-            warnings.append(
-                f"⚠️ *Ramp nötig:* Vertragsbeginn ({parsed['effective_date']}) liegt in der Zukunft "
-                "→ in Chargebee über Tab \"Ramps\" → \"Add Ramp\" anlegen"
-            )
+        if dt:
+            today = datetime.now(timezone.utc).date()
+            if dt.date() > today:
+                warnings.append(
+                    f"⚠️ *Ramp nötig:* Vertragsbeginn ({parsed['effective_date']}) liegt in der Zukunft "
+                    "→ wird automatisch über *✅ Geprüft — bitte ausführen* angelegt"
+                )
+            elif dt.date() <= today:
+                warnings.append(
+                    f"⚠️ *Effective Date heute oder Vergangenheit ({parsed['effective_date']})* "
+                    "→ Ramp kann nicht automatisch angelegt werden — bitte *manuell in Chargebee* eintragen"
+                )
     # Discount-Hinweis bewusst weggelassen (wird manuell behandelt)
 
     # Kontextuelle Hinweise aus Chargebee-Daten
     suggestions = _build_suggestions(parsed, subscription) if subscription else []
 
-    next_steps = (
-        "1. Subscription in Chargebee öffnen (Link oben)\n"
-        "2. Plan & Add-Ons laut Zusammenfassung eintragen\n"
-        "3. Im Thread als ✅ done markieren"
-    )
+    # Nächste Schritte — immer beide Optionen anzeigen
+    effective_date = parsed.get('effective_date')
+    dt = _try_parse_date(effective_date) if effective_date else None
+    is_future = dt and dt.date() > datetime.now(timezone.utc).date()
+    if is_future:
+        next_steps = (
+            "*Option A — Automatisch:*\n"
+            "1. Zusammenfassung prüfen\n"
+            "2. *✅ Geprüft — bitte ausführen* klicken → Ramp wird automatisch angelegt\n"
+            "3. Bei Preisabweichung: vorher Price Override in Chargebee manuell setzen\n\n"
+            "*Option B — Manuell:*\n"
+            "1. Subscription in Chargebee öffnen (Link oben)\n"
+            "2. *🙋 Mache ich — ich übernehme* klicken\n"
+            "3. Ramp manuell in Chargebee anlegen & im Thread als ✅ done markieren"
+        )
+    else:
+        next_steps = (
+            "⚠️ Effective Date heute → kein automatischer Ramp möglich\n\n"
+            "1. Subscription in Chargebee öffnen (Link oben)\n"
+            "2. Änderungen manuell eintragen\n"
+            "3. Im Thread als ✅ done markieren"
+        )
 
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": header}},

@@ -28,6 +28,7 @@ from vertragsanpassung_handler import (
     build_va_summary_blocks,
     detect_vertragsanpassung,
     extract_service_package,
+    fetch_item_price,
     fetch_item_price_name,
     fetch_offer_data,
     lookup_chargebee_subscription,
@@ -406,12 +407,17 @@ def _enrich_from_offer(parsed: dict) -> dict:
         return parsed
     try:
         offer_data = fetch_offer_data(url)
-        for key, value in offer_data.items():
-            if value and not parsed.get(key):  # nur fehlende Felder ergänzen
-                parsed[key] = value
-                logger.info(f"Offer enrichment: {key}={value!r}")
+        if offer_data:
+            for key, value in offer_data.items():
+                if value and not parsed.get(key):  # nur fehlende Felder ergänzen
+                    parsed[key] = value
+                    logger.info(f"Offer enrichment: {key}={value!r}")
+        else:
+            # Leere Antwort = URL nicht lesbar
+            parsed['offer_fetch_failed'] = True
     except Exception as e:
         logger.warning(f"Offer enrichment failed: {e}")
+        parsed['offer_fetch_failed'] = True
     return parsed
 
 
@@ -427,6 +433,74 @@ def _inherit_from_subscription(parsed: dict, subscription: dict | None) -> dict:
     return parsed
 
 
+def _planhat_search_company(customer_name: str) -> dict | None:
+    """Sucht Planhat-Company per Name. Gibt {'id': ..., 'name': ...} oder None zurück."""
+    if not PLANHAT_API_TOKEN or not customer_name:
+        return None
+    try:
+        resp = requests.get(
+            'https://api.planhat.com/companies',
+            headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
+            params={'name': customer_name, 'limit': 5},
+            timeout=10,
+        )
+        if resp.ok:
+            companies = resp.json()
+            if isinstance(companies, list) and companies:
+                # Exakter Name-Match bevorzugen
+                exact = next(
+                    (c for c in companies if c.get('name', '').lower() == customer_name.lower()),
+                    companies[0],
+                )
+                return {'id': exact.get('_id') or exact.get('id'), 'name': exact.get('name', '')}
+    except Exception as e:
+        logger.warning(f"Planhat company search failed: {e}")
+    return None
+
+
+def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id: str,
+                              thread_ts: str, say) -> list[str]:
+    """Lädt Angebots-Dateien aus Slack zu Planhat hoch. Gibt Liste der hochgeladenen Dateinamen zurück."""
+    if not files or not planhat_company_id or not PLANHAT_API_TOKEN:
+        return []
+
+    uploaded = []
+    for file_info in files:
+        url = file_info.get('url_private_download') or file_info.get('url_private')
+        filename = file_info.get('name', 'angebot')
+        mimetype = file_info.get('mimetype', 'application/octet-stream')
+        if not url:
+            continue
+        try:
+            # Datei von Slack herunterladen (Bot-Token als Auth)
+            slack_resp = requests.get(
+                url,
+                headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
+                timeout=30,
+            )
+            if not slack_resp.ok:
+                logger.warning(f"Slack file download failed: {slack_resp.status_code} {filename}")
+                continue
+
+            # Zu Planhat hochladen via POST /assets
+            planhat_resp = requests.post(
+                'https://api.planhat.com/assets',
+                headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
+                data={'companyId': planhat_company_id, 'name': filename},
+                files={'file': (filename, slack_resp.content, mimetype)},
+                timeout=30,
+            )
+            if planhat_resp.ok:
+                uploaded.append(filename)
+                logger.info(f"Planhat asset uploaded: {filename} for company {planhat_company_id}")
+            else:
+                logger.warning(f"Planhat asset upload failed: {planhat_resp.status_code} {planhat_resp.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Upload error for {filename}: {e}")
+
+    return uploaded
+
+
 def _cb_lookup(customer_name: str) -> dict | None:
     """Chargebee-Lookup per Kundenname (exakter Company-Match)."""
     if not customer_name or not CHARGEBEE_API_KEY:
@@ -438,7 +512,8 @@ def _cb_lookup(customer_name: str) -> dict | None:
 
 def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
                                 user_name: str, parsed: dict,
-                                subscription: dict | None = None):
+                                subscription: dict | None = None,
+                                files: list | None = None):
     """Alle Felder vollständig — entweder Zusammenfassung oder CS-Admin-Warnung."""
     if subscription is None:
         subscription = _cb_lookup(parsed.get('customer_name', ''))
@@ -491,12 +566,14 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
         )
         return  # State bleibt aktiv damit CS Admin antworten kann
 
-    # item_price Name aus Chargebee laden (für Zusammenfassung)
+    # item_price Name + Listenpreis aus Chargebee laden (für Zusammenfassung + Preischeck)
     if parsed.get('chargebee_plan_id') and CHARGEBEE_API_KEY and not parsed.get('chargebee_plan_name'):
-        name = fetch_item_price_name(parsed['chargebee_plan_id'], CHARGEBEE_API_KEY, CHARGEBEE_SITE)
-        if name:
-            parsed['chargebee_plan_name'] = name
-            logger.info(f"item_price name: {name!r}")
+        ip_data = fetch_item_price(parsed['chargebee_plan_id'], CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+        if ip_data.get('name'):
+            parsed['chargebee_plan_name'] = ip_data['name']
+        if ip_data.get('price') is not None:
+            parsed['chargebee_plan_list_price'] = ip_data['price']
+        logger.info(f"item_price: {ip_data!r}")
 
     # Vollständige Zusammenfassung mit allen Infos
     blocks = build_va_summary_blocks(parsed, subscription, user_name)
@@ -533,8 +610,47 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
     _remove_reaction(client, channel, thread_ts, 'eyes')
     _add_reaction(client, channel, thread_ts, VA_DONE_EMOJI)
     _pending_vertragsanpassung.pop((channel, thread_ts), None)
-    # 48h Reminder registrieren
-    _va_pending_approval[(channel, thread_ts)] = {'sent_at': time.time(), 'reminded': False}
+    # 48h Reminder + Ramp-Kontext speichern
+    _va_pending_approval[(channel, thread_ts)] = {
+        'sent_at': time.time(),
+        'reminded': False,
+        'parsed': parsed,
+        'subscription': subscription,
+    }
+
+    # Angebots-Dateien zu Planhat hochladen (wenn vorhanden)
+    if files and PLANHAT_API_TOKEN:
+        customer_name = parsed.get('customer_name', '')
+        ph_company = _planhat_search_company(customer_name)
+        if ph_company and ph_company.get('id'):
+            uploaded = _upload_offer_to_planhat(
+                files, customer_name, ph_company['id'], thread_ts, say,
+            )
+            if uploaded:
+                say(
+                    text=(
+                        f":paperclip: *{len(uploaded)} Datei(en) in Planhat hinterlegt* "
+                        f"unter _{ph_company['name']}_:\n"
+                        + "\n".join(f"• `{f}`" for f in uploaded)
+                    ),
+                    thread_ts=thread_ts,
+                )
+            else:
+                say(
+                    text=(
+                        ":warning: Dateien konnten nicht zu Planhat hochgeladen werden. "
+                        "Bitte manuell unter dem Kunden hinterlegen."
+                    ),
+                    thread_ts=thread_ts,
+                )
+        elif customer_name:
+            say(
+                text=(
+                    f":warning: Kein Planhat-Eintrag für *{customer_name}* gefunden — "
+                    "Dateien bitte manuell beim Kunden in Planhat hinterlegen."
+                ),
+                thread_ts=thread_ts,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +692,89 @@ def _handle_message_core(event, say, client):
     # THREAD REPLY
     # -----------------------------------------------------------------------
     if thread_ts:
+        # --- ? Hilfe-Trigger: ein oder mehrere Fragezeichen → Bot erklärt was zu tun ist ---
+        if re.fullmatch(r'\?+', text.strip()):
+            va_state_check = _pending_vertragsanpassung.get((channel, thread_ts))
+            imp_state_check = _pending.get((channel, thread_ts))
+            va_approval_check = _va_pending_approval.get((channel, thread_ts))
+            similar_check = _similar_shown.get((channel, thread_ts))
+
+            if va_state_check or va_approval_check:
+                # Vertragsanpassungs-Flow aktiv
+                if va_state_check:
+                    missing = missing_va_fields(va_state_check.get('parsed', {}))
+                    if missing:
+                        say(
+                            text=(
+                                ":wave: Der Bot wartet noch auf fehlende Informationen zur Vertragsanpassung:\n"
+                                + "\n".join(f"• {m}" for m in missing)
+                                + "\nBitte ergänze die fehlenden Angaben direkt hier im Thread."
+                            ),
+                            thread_ts=thread_ts,
+                        )
+                    else:
+                        say(
+                            text=(
+                                ":wave: Die Zusammenfassung wurde erstellt. "
+                                "Bitte prüfe sie und klicke dann:\n"
+                                "• *✅ Geprüft — bitte ausführen* → Ramp wird automatisch angelegt\n"
+                                "• *🙋 Mache ich — ich übernehme* → du erledigst es manuell in Chargebee"
+                            ),
+                            thread_ts=thread_ts,
+                        )
+                elif va_approval_check:
+                    say(
+                        text=(
+                            ":wave: Die Vertragsanpassungs-Zusammenfassung wurde gepostet. "
+                            "Bitte klicke auf einen der Buttons:\n"
+                            "• *✅ Geprüft — bitte ausführen* → Ramp wird automatisch angelegt\n"
+                            "• *🙋 Mache ich — ich übernehme* → du erledigst es manuell in Chargebee"
+                        ),
+                        thread_ts=thread_ts,
+                    )
+            elif imp_state_check:
+                # Improvement-Flow aktiv
+                missing_imp = missing_info(imp_state_check.get('title'), imp_state_check.get('use_case'))
+                if missing_imp:
+                    say(
+                        text=(
+                            ":wave: Der Bot wartet auf fehlende Infos für den Improvement Request:\n"
+                            + "\n".join(f"• {m}" for m in missing_imp)
+                            + "\nEinfach hier im Thread antworten und die Infos ergänzen."
+                        ),
+                        thread_ts=thread_ts,
+                    )
+                else:
+                    say(
+                        text=(
+                            ":wave: Klicke auf einen der Buttons:\n"
+                            "• Ticket-Nummer schreiben (z.B. `CS-42`) → Bot upvotet automatisch\n"
+                            "• *Kein Ticket passt* → neues Jira-Ticket wird erstellt\n"
+                            "• *❌ Kein Ticket nötig* → Flow wird abgebrochen"
+                        ),
+                        thread_ts=thread_ts,
+                    )
+            elif similar_check:
+                say(
+                    text=(
+                        ":wave: Ähnliche Tickets wurden gefunden. Bitte:\n"
+                        "• Schreibe die Ticket-Nummer (z.B. `CS-42`) um es upzuvoten\n"
+                        "• Klicke *Kein Ticket passt* um ein neues Ticket zu erstellen\n"
+                        "• Klicke *❌ Kein Ticket nötig* um den Vorgang abzubrechen"
+                    ),
+                    thread_ts=thread_ts,
+                )
+            else:
+                say(
+                    text=(
+                        ":wave: Kein aktiver Bot-Flow in diesem Thread.\n"
+                        "• Für Vertragsanpassungen: `#vertragsanpassung` hier posten (nur CS Admin)\n"
+                        "• Für Feature-Anfragen: `#improvement` in einer neuen Nachricht schreiben"
+                    ),
+                    thread_ts=thread_ts,
+                )
+            return
+
         # --- Vertragsanpassung: CS Admin bestätigt Chargebee-Link ---
         # Akzeptiert jeden Chargebee-Link (Subscription ODER Customer) — egal ob in der Liste
         va_state = _pending_vertragsanpassung.get((channel, thread_ts))
@@ -644,6 +843,105 @@ def _handle_message_core(event, say, client):
                 )
             return
 
+        # --- Planhat-Upload: manueller Trigger (#planhat-upload) ---
+        if '#planhat-upload' in text.lower():
+            if user_id not in CS_ADMIN_USER_IDS:
+                say(
+                    text=":no_entry: `#planhat-upload` kann nur vom CS Admin Team genutzt werden.",
+                    thread_ts=thread_ts,
+                )
+                return
+            # Dateien aus dieser Nachricht ODER Root-Nachricht sammeln
+            current_files = extract_images(event.get('files')) or []
+            try:
+                root_result = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
+                all_msgs = root_result.get('messages', [])
+                root_files = extract_images(all_msgs[0].get('files')) if all_msgs else []
+                # Alle Dateien aus dem Thread einsammeln
+                thread_files = []
+                for msg in all_msgs:
+                    thread_files.extend(extract_images(msg.get('files')) or [])
+                # Deduplizieren per file id
+                seen_ids = set()
+                all_files = []
+                for f in (current_files + thread_files):
+                    fid = f.get('id')
+                    if fid and fid not in seen_ids:
+                        seen_ids.add(fid)
+                        all_files.append(f)
+            except Exception as e:
+                logger.warning(f"Thread files fetch failed: {e}")
+                all_files = current_files
+
+            if not all_files:
+                say(
+                    text=(
+                        ":warning: Keine Dateien in diesem Thread gefunden. "
+                        "Bitte zuerst die Angebotsdatei in den Thread hochladen und dann `#planhat-upload` schreiben."
+                    ),
+                    thread_ts=thread_ts,
+                )
+                return
+
+            # Kundenname aus VA-State oder Root-Nachricht ermitteln
+            va_state = _pending_vertragsanpassung.get((channel, thread_ts)) or {}
+            va_approval = _va_pending_approval.get((channel, thread_ts)) or {}
+            customer_name = (
+                va_state.get('parsed', {}).get('customer_name')
+                or va_approval.get('parsed', {}).get('customer_name')
+            )
+            if not customer_name:
+                try:
+                    root_text = all_msgs[0].get('text', '') if all_msgs else ''
+                    customer_name = parse_vertragsanpassung(root_text).get('customer_name', '')
+                except Exception:
+                    customer_name = ''
+
+            if not customer_name:
+                say(
+                    text=(
+                        ":thinking_face: Kein Kundenname erkannt. "
+                        "Schreibe `#planhat-upload Kundenname GmbH` um den Kunden anzugeben."
+                    ),
+                    thread_ts=thread_ts,
+                )
+                # Fallback: Kundenname aus dem Trigger-Text extrahieren
+                name_match = re.sub(r'#planhat-upload\s*', '', text, flags=re.IGNORECASE).strip()
+                if name_match:
+                    customer_name = name_match
+                else:
+                    return
+
+            ph_company = _planhat_search_company(customer_name)
+            if not ph_company or not ph_company.get('id'):
+                say(
+                    text=(
+                        f":warning: Kein Planhat-Eintrag für *{customer_name}* gefunden. "
+                        "Bitte Datei manuell in Planhat hinterlegen."
+                    ),
+                    thread_ts=thread_ts,
+                )
+                return
+
+            uploaded = _upload_offer_to_planhat(
+                all_files, customer_name, ph_company['id'], thread_ts, say,
+            )
+            if uploaded:
+                say(
+                    text=(
+                        f":paperclip: *{len(uploaded)} Datei(en) nachträglich in Planhat hinterlegt* "
+                        f"unter _{ph_company['name']}_:\n"
+                        + "\n".join(f"• `{f}`" for f in uploaded)
+                    ),
+                    thread_ts=thread_ts,
+                )
+            else:
+                say(
+                    text=":warning: Upload fehlgeschlagen — bitte Dateien manuell in Planhat hinterlegen.",
+                    thread_ts=thread_ts,
+                )
+            return
+
         # --- Vertragsanpassung: manual thread trigger (CS Admin only) ---
         if '#vertragsanpassung' in text.lower():
             if user_id not in CS_ADMIN_USER_IDS:
@@ -661,6 +959,17 @@ def _handle_message_core(event, say, client):
                 root_text = ''
             _set_eyes(client, channel, thread_ts)
             parsed = _enrich_from_offer(parse_vertragsanpassung(root_text or text))
+            if parsed.get('offer_fetch_failed'):
+                say(
+                    text=(
+                        ":warning: Der verlinkte Angebots-Link konnte nicht geöffnet werden "
+                        f"(`{parsed.get('offer_link', '?')}`).\n"
+                        "Bitte entweder:\n"
+                        "• Einen neuen/öffentlich zugänglichen Link hier posten, *oder*\n"
+                        "• Die Infos manuell ergänzen: *Plan*, *Laufzeit*, *Zahlweise*, *Vertragsbeginn*, *Service-Paket*"
+                    ),
+                    thread_ts=thread_ts,
+                )
             subscription = _cb_lookup(parsed.get('customer_name', ''))
             parsed = _inherit_from_subscription(parsed, subscription)
             missing = missing_va_fields(parsed)
@@ -678,7 +987,14 @@ def _handle_message_core(event, say, client):
                     thread_ts=thread_ts,
                 )
             else:
-                _process_vertragsanpassung(say, client, channel, thread_ts, user_name, parsed, subscription)
+                # Dateien aus Root-Nachricht mitgeben
+                try:
+                    root_result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
+                    root_files = extract_images(root_result.get('messages', [{}])[0].get('files')) or []
+                except Exception:
+                    root_files = []
+                _process_vertragsanpassung(say, client, channel, thread_ts, user_name, parsed, subscription,
+                                           files=root_files or None)
             return
 
         state = _pending.get((channel, thread_ts))
@@ -886,6 +1202,17 @@ def _handle_message_core(event, say, client):
     if _in_va and detect_vertragsanpassung(text):
         _set_eyes(client, channel, ts)
         parsed = _enrich_from_offer(parse_vertragsanpassung(text))
+        if parsed.get('offer_fetch_failed'):
+            say(
+                text=(
+                    ":warning: Der verlinkte Angebots-Link konnte nicht geöffnet werden "
+                    f"(`{parsed.get('offer_link', '?')}`).\n"
+                    "Bitte entweder:\n"
+                    "• Einen neuen/öffentlich zugänglichen Link hier posten, *oder*\n"
+                    "• Die Infos manuell ergänzen: *Plan*, *Laufzeit*, *Zahlweise*, *Vertragsbeginn*, *Service-Paket*"
+                ),
+                thread_ts=ts,
+            )
         subscription = _cb_lookup(parsed.get('customer_name', ''))
         parsed = _inherit_from_subscription(parsed, subscription)
         missing = missing_va_fields(parsed)
@@ -903,7 +1230,9 @@ def _handle_message_core(event, say, client):
                 thread_ts=ts,
             )
         else:
-            _process_vertragsanpassung(say, client, channel, ts, user_name, parsed, subscription)
+            event_files = extract_images(event.get('files')) or None
+            _process_vertragsanpassung(say, client, channel, ts, user_name, parsed, subscription,
+                                       files=event_files)
         return
 
     # --- Improvement: only react to #improvement tag ---
@@ -1068,7 +1397,7 @@ def handle_va_take_over(ack, body, say, client):
 
 @app.action("va_approved")
 def handle_va_approved(ack, body, say, client):
-    """CS Admin hat geprüft und gibt das Go — nur für CS Admin Team."""
+    """CS Admin hat geprüft und gibt das Go — Ramp in Chargebee anlegen."""
     ack()
     user_id = body.get('user', {}).get('id', '')
     if user_id not in CS_ADMIN_USER_IDS:
@@ -1076,12 +1405,99 @@ def handle_va_approved(ack, body, say, client):
     user_name = get_user_name(client, user_id)
     thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
     channel = body.get('channel', {}).get('id', '')
-    say(
-        text=f":csadmin-bot: *{user_name}* hat geprüft und gibt das Go — Vertragsanpassung kann ausgeführt werden. :white_check_mark:",
-        thread_ts=thread_ts,
-    )
-    if channel and thread_ts:
-        _add_reaction(client, channel, thread_ts, 'white_check_mark')
+
+    state = _va_pending_approval.get((channel, thread_ts), {})
+    parsed = state.get('parsed', {})
+    subscription = state.get('subscription', {})
+
+    sub_id = subscription.get('subscription_id') if subscription else None
+    new_plan_id = parsed.get('chargebee_plan_id')
+    old_plan_id = subscription.get('plan_id') if subscription else None
+    effective_date = parsed.get('effective_date')  # datetime oder None
+
+    # Effective Date = heute → manuell nötig
+    today = datetime.now(timezone.utc).date()
+    if effective_date and getattr(effective_date, 'date', lambda: effective_date)() <= today:
+        say(
+            text=(
+                f":csadmin-bot: *{user_name}* hat geprüft — "
+                "⛔ Effective Date ist heute oder in der Vergangenheit. "
+                "Bitte die Ramp manuell in Chargebee anlegen (Tab 'Ramps' > 'Add Ramp')."
+            ),
+            thread_ts=thread_ts,
+        )
+        _va_pending_approval.pop((channel, thread_ts), None)
+        return
+
+    # Prüfen ob alle nötigen Infos vorhanden
+    if not sub_id or not new_plan_id or not old_plan_id or not effective_date or not CHARGEBEE_API_KEY:
+        say(
+            text=(
+                f":csadmin-bot: *{user_name}* hat geprüft — "
+                "⚠️ Ramp kann nicht automatisch angelegt werden: fehlende Daten "
+                f"(sub_id={sub_id!r}, new_plan={new_plan_id!r}, effective_date={effective_date!r}). "
+                "Bitte manuell in Chargebee anlegen."
+            ),
+            thread_ts=thread_ts,
+        )
+        _va_pending_approval.pop((channel, thread_ts), None)
+        return
+
+    # Unix-Timestamp für effective_from berechnen
+    if hasattr(effective_date, 'timestamp'):
+        effective_from = int(effective_date.timestamp())
+    else:
+        from datetime import datetime as _dt
+        effective_from = int(_dt(effective_date.year, effective_date.month, effective_date.day,
+                                 tzinfo=timezone.utc).timestamp())
+
+    # Ramp-Call aufbauen
+    url = f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2/subscriptions/{sub_id}/create_ramp"
+    data = {
+        'effective_from': effective_from,
+        'items_to_add[item_price_id][0]': new_plan_id,
+        'items_to_add[quantity][0]': '1',
+        'items_to_remove[0]': old_plan_id,
+    }
+    # Service-Paket: altes entfernen wenn vorhanden und neu (inkl. im Plan)
+    old_service = subscription.get('service_package_addon_id', '')
+    if old_service:
+        data['items_to_remove[1]'] = old_service
+
+    try:
+        import requests as _req
+        resp = _req.post(url, auth=(CHARGEBEE_API_KEY, ''), data=data, timeout=15)
+        if resp.ok:
+            ramp = resp.json().get('ramp', {})
+            ramp_id = ramp.get('id', '–')
+            cb_sub_link = f"https://{CHARGEBEE_SITE}.chargebee.com/d/subscriptions/{sub_id}"
+            cb_ramp_link = f"https://{CHARGEBEE_SITE}.chargebee.com/d/subscriptions/{sub_id}#ramps"
+            say(
+                text=(
+                    f":white_check_mark: *Ramp angelegt* — freigegeben von *{user_name}*\n"
+                    f"• Ramp-ID: `{ramp_id}`\n"
+                    f"• Effective: `{effective_date}`\n"
+                    f"• Neuer Plan: `{new_plan_id}`\n\n"
+                    f"<{cb_ramp_link}|Ramp in Chargebee öffnen> · <{cb_sub_link}|Subscription öffnen>"
+                ),
+                thread_ts=thread_ts,
+            )
+            _add_reaction(client, channel, thread_ts, 'white_check_mark')
+        else:
+            say(
+                text=(
+                    f":warning: *Ramp-Anlage fehlgeschlagen* (freigegeben von *{user_name}*)\n"
+                    f"HTTP {resp.status_code}: `{resp.text[:500]}`\n"
+                    "Bitte Ramp manuell in Chargebee anlegen."
+                ),
+                thread_ts=thread_ts,
+            )
+    except Exception as e:
+        say(
+            text=f":warning: *Ramp-Anlage fehlgeschlagen* — Exception: `{e}`\nBitte manuell anlegen.",
+            thread_ts=thread_ts,
+        )
+
     _va_pending_approval.pop((channel, thread_ts), None)
 
 
