@@ -978,6 +978,103 @@ def _handle_message_core(event, say, client):
                 )
             return
 
+        # --- Planhat Log: nachträgliche Note für Vertragsanpassung (#planhat-log) ---
+        if '#planhat-log' in text.lower():
+            if user_id not in CS_ADMIN_USER_IDS:
+                say(
+                    text=":no_entry: `#planhat-log` kann nur vom CS Admin Team genutzt werden.",
+                    thread_ts=thread_ts,
+                )
+                return
+
+            # Kontext aus VA-State oder Thread-Nachrichten zusammenbauen
+            va_state = _pending_vertragsanpassung.get((channel, thread_ts)) or {}
+            va_approval = _va_pending_approval.get((channel, thread_ts)) or {}
+            parsed_ctx = va_state.get('parsed') or va_approval.get('parsed') or {}
+            sub_ctx = va_state.get('subscription') or va_approval.get('subscription')
+
+            # Alle Thread-Nachrichten lesen falls noch kein Kontext
+            try:
+                root_result = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
+                all_msgs = root_result.get('messages', [])
+                root_text = all_msgs[0].get('text', '') if all_msgs else ''
+            except Exception as e:
+                logger.warning(f"Thread read failed for planhat-log: {e}")
+                all_msgs = []
+                root_text = ''
+
+            if not parsed_ctx and root_text:
+                parsed_ctx = parse_vertragsanpassung(root_text)
+
+            customer_name = parsed_ctx.get('customer_name', '')
+            # Fallback: Name direkt nach #planhat-log angegeben
+            if not customer_name:
+                name_inline = re.sub(r'#planhat-log\s*', '', text, flags=re.IGNORECASE).strip()
+                if name_inline:
+                    customer_name = name_inline
+
+            if not customer_name:
+                say(
+                    text=(
+                        ":thinking_face: Kein Kundenname erkannt. "
+                        "Schreibe `#planhat-log Kundenname GmbH` um den Kunden anzugeben."
+                    ),
+                    thread_ts=thread_ts,
+                )
+                return
+
+            ph_company = _planhat_search_company(customer_name)
+            if not ph_company or not ph_company.get('id'):
+                say(
+                    text=(
+                        f":warning: Kein Planhat-Eintrag für *{customer_name}* gefunden. "
+                        "Bitte Note manuell in Planhat anlegen."
+                    ),
+                    thread_ts=thread_ts,
+                )
+                return
+
+            # Note-Inhalt aus verfügbarem Kontext aufbauen
+            old_plan = sub_ctx.get('plan_id', '–') if sub_ctx else '–'
+            new_plan = parsed_ctx.get('chargebee_plan_id') or parsed_ctx.get('new_plan') or '–'
+            effective = parsed_ctx.get('effective_date') or '–'
+            slack_link = slack_message_link(channel, thread_ts)
+            note_text = (
+                f"Vertragsanpassung vorgenommen von {user_name}\n\n"
+                f"Plan: {old_plan} → {new_plan}\n"
+                f"Effective: {effective}\n"
+                f"Slack-Thread: {slack_link}"
+            )
+            try:
+                import requests as _req
+                ph_resp = _req.post(
+                    'https://api.planhat.com/activities',
+                    headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
+                    json={
+                        'type': 'note',
+                        'companyId': ph_company['id'],
+                        'text': note_text,
+                    },
+                    timeout=10,
+                )
+                if ph_resp.ok:
+                    say(
+                        text=(
+                            f":memo: *Planhat-Note erstellt* für _{ph_company['name']}_\n"
+                            f"• Plan: `{old_plan}` → `{new_plan}`\n"
+                            f"• Effective: {effective}"
+                        ),
+                        thread_ts=thread_ts,
+                    )
+                else:
+                    say(
+                        text=f":warning: Planhat-Note fehlgeschlagen: `{ph_resp.status_code} {ph_resp.text[:200]}`",
+                        thread_ts=thread_ts,
+                    )
+            except Exception as e:
+                say(text=f":warning: Planhat-Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
+            return
+
         # --- Vertragsanpassung: manual thread trigger (CS Admin only) ---
         if '#vertragsanpassung' in text.lower():
             if user_id not in CS_ADMIN_USER_IDS:
