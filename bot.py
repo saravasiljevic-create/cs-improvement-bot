@@ -444,17 +444,52 @@ def _inherit_from_subscription(parsed: dict, subscription: dict | None) -> dict:
 
 
 def _debit_number_from_subscription(subscription: dict | None) -> str:
-    """Liest cf_debit_number aus dem Subscription-Dict oder dem _raw_sub."""
+    """Liest cf_debit_number aus dem Subscription-Dict oder dem _raw_sub.
+
+    cf_debit_number liegt in Chargebee auf dem Customer-Objekt, nicht auf der
+    Subscription. Es kann an verschiedenen Stellen auftauchen je nach API-Aufruf.
+    """
     if not subscription:
         return ''
-    # Direkt im aufgelösten Dict (neu)
-    direct = str(subscription.get('cf_debit_number', '')).strip()
-    if direct.isdigit():
-        return direct
-    # Fallback: _raw_sub
+
+    def _extract(d: dict) -> str:
+        val = str(d.get('cf_debit_number', '')).strip()
+        return val if val.isdigit() else ''
+
+    # 1. Direkt im aufgelösten Dict
+    v = _extract(subscription)
+    if v:
+        return v
+
+    # 2. Im _raw_sub (Subscription-Objekt direkt von Chargebee)
     raw = subscription.get('_raw_sub') or {}
-    val = str(raw.get('cf_debit_number', '')).strip()
-    return val if val.isdigit() else ''
+    v = _extract(raw)
+    if v:
+        return v
+
+    # 3. Im eingebetteten Customer-Objekt (Chargebee bettet customer manchmal ein)
+    customer = raw.get('customer') or subscription.get('customer') or {}
+    v = _extract(customer)
+    if v:
+        return v
+
+    # 4. Über customer_id direkt aus Chargebee nachladen
+    customer_id = subscription.get('customer_id') or raw.get('customer_id', '')
+    if customer_id and CHARGEBEE_API_KEY:
+        try:
+            resp = requests.get(
+                f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2/customers/{customer_id}",
+                auth=(CHARGEBEE_API_KEY, ''),
+                timeout=8,
+            )
+            if resp.ok:
+                v = _extract(resp.json().get('customer', {}))
+                if v:
+                    return v
+        except Exception as e:
+            logger.warning(f"Customer lookup for debit_number failed: {e}")
+
+    return ''
 
 
 def _planhat_search_company(customer_name: str, debit_number: str = '') -> dict | None:
