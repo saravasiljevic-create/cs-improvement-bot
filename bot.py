@@ -443,28 +443,67 @@ def _inherit_from_subscription(parsed: dict, subscription: dict | None) -> dict:
     return parsed
 
 
-def _planhat_search_company(customer_name: str) -> dict | None:
-    """Sucht Planhat-Company per Name. Gibt {'id': ..., 'name': ...} oder None zurück."""
-    if not PLANHAT_API_TOKEN or not customer_name:
+def _debit_number_from_subscription(subscription: dict | None) -> str:
+    """Liest cf_debit_number aus dem Subscription-Dict oder dem _raw_sub."""
+    if not subscription:
+        return ''
+    # Direkt im aufgelösten Dict (neu)
+    direct = str(subscription.get('cf_debit_number', '')).strip()
+    if direct.isdigit():
+        return direct
+    # Fallback: _raw_sub
+    raw = subscription.get('_raw_sub') or {}
+    val = str(raw.get('cf_debit_number', '')).strip()
+    return val if val.isdigit() else ''
+
+
+def _planhat_search_company(customer_name: str, debit_number: str = '') -> dict | None:
+    """Sucht Planhat-Company. Strategie:
+    1. externalId = Debitorennummer (cf_debit_number aus Chargebee) — zuverlässigste Quelle
+    2. Namenssuche als Fallback
+    """
+    if not PLANHAT_API_TOKEN:
+        return None
+    headers = {'Authorization': f'Bearer {PLANHAT_API_TOKEN}'}
+
+    # 1. Suche per externalId (Debitorennummer)
+    if debit_number:
+        try:
+            resp = requests.get(
+                'https://api.planhat.com/companies',
+                headers=headers,
+                params={'externalId': debit_number, 'limit': 1},
+                timeout=10,
+            )
+            if resp.ok:
+                companies = resp.json()
+                if isinstance(companies, list) and companies:
+                    c = companies[0]
+                    logger.info(f"Planhat: externalId={debit_number} → {c.get('name')}")
+                    return {'id': c.get('_id') or c.get('id'), 'name': c.get('name', '')}
+        except Exception as e:
+            logger.warning(f"Planhat externalId search failed: {e}")
+
+    # 2. Namenssuche als Fallback
+    if not customer_name:
         return None
     try:
         resp = requests.get(
             'https://api.planhat.com/companies',
-            headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
+            headers=headers,
             params={'name': customer_name, 'limit': 5},
             timeout=10,
         )
         if resp.ok:
             companies = resp.json()
             if isinstance(companies, list) and companies:
-                # Exakter Name-Match bevorzugen
                 exact = next(
                     (c for c in companies if c.get('name', '').lower() == customer_name.lower()),
                     companies[0],
                 )
                 return {'id': exact.get('_id') or exact.get('id'), 'name': exact.get('name', '')}
     except Exception as e:
-        logger.warning(f"Planhat company search failed: {e}")
+        logger.warning(f"Planhat name search failed: {e}")
     return None
 
 
@@ -680,7 +719,7 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
     # Angebots-Dateien zu Planhat hochladen (wenn vorhanden)
     if files and PLANHAT_API_TOKEN:
         customer_name = parsed.get('customer_name', '')
-        ph_company = _planhat_search_company(customer_name)
+        ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(subscription))
         if ph_company and ph_company.get('id'):
             uploaded = _upload_offer_to_planhat(
                 files, customer_name, ph_company['id'], thread_ts, say,
@@ -1057,7 +1096,7 @@ def _handle_message_core(event, say, client):
                 else:
                     return
 
-            ph_company = _planhat_search_company(customer_name)
+            ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(subscription))
             if not ph_company or not ph_company.get('id'):
                 _ask_for_planhat_link(say, channel, thread_ts, customer_name, 'upload', {
                     'files': all_files, 'customer_name': customer_name, 'user_name': user_name,
@@ -1128,7 +1167,7 @@ def _handle_message_core(event, say, client):
                 )
                 return
 
-            ph_company = _planhat_search_company(customer_name)
+            ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(sub_ctx))
             if not ph_company or not ph_company.get('id'):
                 _ask_for_planhat_link(say, channel, thread_ts, customer_name, 'log', {
                     'customer_name': customer_name, 'user_name': user_name,
@@ -1723,7 +1762,7 @@ def handle_va_approved(ack, body, say, client):
             # Planhat Note erstellen
             customer_name = parsed.get('customer_name', '')
             if customer_name and PLANHAT_API_TOKEN:
-                ph_company = _planhat_search_company(customer_name)
+                ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(subscription))
                 if ph_company and ph_company.get('id'):
                     old_plan = subscription.get('plan_id', '–') if subscription else '–'
                     note_text = (

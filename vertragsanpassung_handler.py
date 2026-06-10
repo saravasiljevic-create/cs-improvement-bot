@@ -749,6 +749,7 @@ def _build_subscription_result(sub: dict, site: str) -> dict:
         'trial_end': _ts_to_date(sub.get('trial_end')),
         'coupons': coupons,
         'url': f"https://{site}.chargebee.com/d/subscriptions/{sub_id}",
+        'cf_debit_number': str(sub.get('cf_debit_number', '')),
         '_raw_sub': sub,  # für IST-Plan-Fallback
     }
 
