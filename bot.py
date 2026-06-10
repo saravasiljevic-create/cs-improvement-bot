@@ -1090,6 +1090,50 @@ def handle_create_ticket(ack, body, say):
     ack()
 
 
+@app.event("reaction_added")
+def handle_reaction_added(event, say, client):
+    """Wenn jemand außerhalb des CS Admin Teams mit 👀 oder ✅ auf eine Nachricht reagiert,
+    informiert der Bot das CS Admin Team im Thread."""
+    reaction = event.get('reaction', '')
+    if reaction not in ('eyes', 'white_check_mark'):
+        return
+
+    user_id = event.get('user', '')
+    # Bot-eigene Reaktionen ignorieren (vermeidet Endlosschleifen)
+    if not user_id or user_id == event.get('item_user', ''):
+        return
+
+    # CS Admin Team reagiert → ignorieren (die setzen Reaktionen selbst)
+    if user_id in CS_ADMIN_USER_IDS:
+        return
+
+    item = event.get('item', {})
+    if item.get('type') != 'message':
+        return
+
+    channel = item.get('channel', '')
+    if channel != SLACK_CHANNEL_ID:
+        return
+
+    ts = item.get('ts', '')
+    if not ts:
+        return
+
+    user_name = get_user_name(client, user_id)
+    admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
+    emoji = '👀' if reaction == 'eyes' else '✅'
+
+    logger.info(f"Reaction {reaction!r} by {user_name} ({user_id}) on {channel}/{ts}")
+
+    say(
+        text=(
+            f"{admin_mentions} — <@{user_id}> hat mit {emoji} auf diese Nachricht reagiert.\n"
+            "Bitte prüfen und ggf. übernehmen."
+        ),
+        thread_ts=ts,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Flask routes
 # ---------------------------------------------------------------------------
