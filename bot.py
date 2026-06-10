@@ -583,7 +583,7 @@ def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id
         resp = requests.post(
             'https://api.planhat.com/conversations',
             headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
-            json={'description': note_text, 'companyId': planhat_company_id},
+            json={'subject': 'Vertragsanpassung', 'description': note_text, 'companyId': planhat_company_id, 'type': 'note'},
             timeout=15,
         )
         if resp.ok:
@@ -973,7 +973,7 @@ def _handle_message_core(event, say, client):
                     ph_resp = requests.post(
                         'https://api.planhat.com/conversations',
                         headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
-                        json={'description': '\n'.join(note_lines), 'companyId': ph_id},
+                        json={'subject': 'Vertragsanpassung', 'description': '\n'.join(note_lines), 'companyId': ph_id, 'type': 'note'},
                         timeout=10,
                     )
                     if ph_resp.ok:
@@ -1134,23 +1134,28 @@ def _handle_message_core(event, say, client):
                 if fid and fid not in seen_ids:
                     seen_ids.add(fid)
                     all_files.append(f)
-            # URL-Fallback
-            if not all_files:
-                url_re_pl = re.compile(r'https?://\S+', re.IGNORECASE)
-                seen_urls: set = set()
-                for msg in all_msgs:
-                    for url_match in url_re_pl.finditer(msg.get('text', '')):
-                        url_raw = url_match.group(0).rstrip('>')
-                        if url_raw not in seen_urls and 'planhat' not in url_raw:
-                            seen_urls.add(url_raw)
-                            all_files.append({
-                                '_url_download': url_raw,
-                                'url_private_download': url_raw,
-                                'name': 'Angebotslink',
-                                'mimetype': 'application/octet-stream',
-                                'id': url_raw,
-                                '_no_slack_auth': True,
-                            })
+            # Angebots-URLs aus Thread-Text sammeln (immer, nicht nur als Fallback)
+            # Ignoriert: Planhat, Slack-interne Links, Chargebee, Bot-eigene Links
+            _ignore = ('planhat.com', 'slack.com/archives', 'chargebee.com',
+                       'xentral-dach', 'slack.com/files')
+            url_re_pl = re.compile(r'https?://[^\s<>]+', re.IGNORECASE)
+            seen_urls: set = set()
+            for msg in all_msgs:
+                for url_match in url_re_pl.finditer(msg.get('text', '')):
+                    url_raw = url_match.group(0).rstrip('>).,"\'')
+                    if url_raw in seen_urls:
+                        continue
+                    if any(ign in url_raw for ign in _ignore):
+                        continue
+                    seen_urls.add(url_raw)
+                    all_files.append({
+                        '_url_download': url_raw,
+                        'url_private_download': url_raw,
+                        'name': 'Angebotslink',
+                        'mimetype': 'application/octet-stream',
+                        'id': url_raw,
+                        '_no_slack_auth': True,
+                    })
 
             # Note aufbauen: VA-Kontext + optionale Datei-Links
             old_plan = sub_ctx.get('plan_id', '–') if sub_ctx else '–'
@@ -1177,7 +1182,7 @@ def _handle_message_core(event, say, client):
                 ph_resp = requests.post(
                     'https://api.planhat.com/conversations',
                     headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
-                    json={'description': note_text, 'companyId': ph_company['id']},
+                    json={'subject': 'Vertragsanpassung', 'description': note_text, 'companyId': ph_company['id'], 'type': 'note'},
                     timeout=10,
                 )
                 if ph_resp.ok:
@@ -1762,8 +1767,10 @@ def handle_va_approved(ack, body, say, client):
                             'https://api.planhat.com/conversations',
                             headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
                             json={
+                                'subject': 'Vertragsanpassung',
                                 'description': note_text,
                                 'companyId': ph_company['id'],
+                                'type': 'note',
                             },
                             timeout=10,
                         )
