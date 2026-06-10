@@ -570,9 +570,7 @@ def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id
         if not url:
             continue
 
-        # HTML-Links (Login-Redirects) erkennbar machen
-        is_external = file_info.get('_no_slack_auth', False)
-        note_lines.append(f"• {filename}: {url}")
+        note_lines.append(f'• <a href="{url}">{filename}</a>')
         logged.append(filename)
 
     if not logged:
@@ -966,7 +964,7 @@ def _handle_message_core(event, say, client):
                     for f in all_files_pending:
                         fname = f.get('name', 'angebot')
                         furl = f.get('url_private_download') or f.get('_url_download', '')
-                        note_lines.append(f"• {fname}: {furl}" if furl else f"• {fname}")
+                        note_lines.append(f'• <a href="{furl}">{fname}</a>' if furl else f"• {fname}")
 
                 try:
                     ph_resp = requests.post(
@@ -1168,7 +1166,7 @@ def _handle_message_core(event, say, client):
                 for f in all_files:
                     fname = f.get('name', 'angebot')
                     furl = f.get('url_private_download') or f.get('_url_download', '')
-                    note_lines.append(f"• {fname}: {furl}" if furl else f"• {fname}")
+                    note_lines.append(f'• <a href="{furl}">{fname}</a>' if furl else f"• {fname}")
 
             note_text = '\n'.join(note_lines)
             try:
