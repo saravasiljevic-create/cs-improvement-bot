@@ -1095,17 +1095,23 @@ def handle_reaction_added(event, say, client):
     """Wenn jemand außerhalb des CS Admin Teams mit 👀 oder ✅ auf eine Nachricht reagiert,
     informiert der Bot das CS Admin Team im Thread."""
     reaction = event.get('reaction', '')
+    # Nur 👀 und ✅ überwachen (csadmin-bot ist ausschließlich für Bot-interne Nutzung)
     if reaction not in ('eyes', 'white_check_mark'):
         return
 
     user_id = event.get('user', '')
-    # Bot-eigene Reaktionen ignorieren (vermeidet Endlosschleifen)
-    if not user_id or user_id == event.get('item_user', ''):
+    if not user_id:
         return
 
-    # CS Admin Team reagiert → ignorieren (die setzen Reaktionen selbst)
+    # CS Admin Team + Bot-User ignorieren
     if user_id in CS_ADMIN_USER_IDS:
         return
+    try:
+        info = client.users_info(user=user_id)
+        if info['user'].get('is_bot') or info['user'].get('is_app_user'):
+            return  # Bot-Reaktionen (auch unsere eigenen) ignorieren
+    except Exception:
+        pass
 
     item = event.get('item', {})
     if item.get('type') != 'message':
