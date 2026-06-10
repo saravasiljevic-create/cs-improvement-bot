@@ -1000,9 +1000,9 @@ def _handle_message_core(event, say, client):
                     try:
             
                         ph_resp = requests.post(
-                            'https://api.planhat.com/activities',
+                            'https://api.planhat.com/notes',
                             headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
-                            json={'type': 'note', 'companyId': ph_id, 'text': note_text},
+                            json={'note': note_text, 'companyId': ph_id},
                             timeout=10,
                         )
                         if ph_resp.ok:
@@ -1283,12 +1283,11 @@ def _handle_message_core(event, say, client):
             try:
     
                 ph_resp = requests.post(
-                    'https://api.planhat.com/activities',
+                    'https://api.planhat.com/notes',
                     headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
                     json={
-                        'type': 'note',
+                        'note': note_text,
                         'companyId': ph_company['id'],
-                        'text': note_text,
                     },
                     timeout=10,
                 )
@@ -1869,12 +1868,11 @@ def handle_va_approved(ack, body, say, client):
                     )
                     try:
                         requests.post(
-                            'https://api.planhat.com/activities',
+                            'https://api.planhat.com/notes',
                             headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
                             json={
-                                'type': 'note',
+                                'note': note_text,
                                 'companyId': ph_company['id'],
-                                'text': note_text,
                             },
                             timeout=10,
                         )
