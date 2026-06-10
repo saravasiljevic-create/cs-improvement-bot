@@ -546,81 +546,56 @@ def _planhat_search_company(customer_name: str, debit_number: str = '') -> dict 
 
 def _upload_offer_to_planhat(files: list, customer_name: str, planhat_company_id: str,
                               thread_ts: str, say) -> list[str]:
-    """Lädt Angebots-Dateien zu Planhat hoch. Postet Fehlerdetails direkt im Thread."""
+    """Hinterlegt Angebots-Dateien in Planhat als Note mit Link.
+
+    Statt Binärdatei-Upload (Planhat /assets erfordert S3-Presigned-URL-Flow)
+    wird eine Note mit Dateiname + Link erstellt — zuverlässiger und ausreichend
+    für den Audit-Trail.
+    """
     if not files or not planhat_company_id or not PLANHAT_API_TOKEN:
-        if say and thread_ts:
-            say(text=f":warning: Upload abgebrochen: files={bool(files)}, company_id={bool(planhat_company_id)}, token={bool(PLANHAT_API_TOKEN)}", thread_ts=thread_ts)
         return []
 
-    uploaded = []
+    logged = []
+    note_lines = [f"Angebots-Dokument(e) aus Slack — hinterlegt von CS Admin Bot:"]
+
     for file_info in files:
-        url = file_info.get('url_private_download') or file_info.get('url_private')
+        url = file_info.get('url_private_download') or file_info.get('url_private') or file_info.get('_url_download', '')
         filename = file_info.get('name', 'angebot')
-        mimetype = file_info.get('mimetype', 'application/octet-stream')
         if not url:
-            say(text=f":warning: Datei `{filename}` hat keine Download-URL — übersprungen.", thread_ts=thread_ts)
             continue
-        try:
-            # Datei herunterladen — Slack-Anhänge brauchen Bot-Token, externe URLs nicht
-            if file_info.get('_no_slack_auth'):
-                dl_resp = requests.get(url, timeout=30,
-                                       headers={'User-Agent': 'Mozilla/5.0 (compatible; CS-Admin-Bot/1.0)'})
-            else:
-                dl_resp = requests.get(url, headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'}, timeout=30)
 
-            if not dl_resp.ok:
-                say(text=f":warning: Download fehlgeschlagen für `{filename}`: HTTP {dl_resp.status_code} · URL: `{url[:80]}`", thread_ts=thread_ts)
-                continue
+        # HTML-Links (Login-Redirects) erkennbar machen
+        is_external = file_info.get('_no_slack_auth', False)
+        note_lines.append(f"• {filename}: {url}")
+        logged.append(filename)
 
-            # HTML-Antwort abfangen (z.B. Login-Redirect statt echter Datei)
-            content_type = dl_resp.headers.get('Content-Type', '')
-            if 'text/html' in content_type:
-                say(
-                    text=(
-                        f":warning: Die URL `{url[:80]}` liefert eine HTML-Seite statt einer Datei "
-                        f"(vermutlich Login-Redirect oder abgelaufener Link).\n"
-                        "Bitte die Datei direkt in diesen Thread hochladen und dann `#planhat-upload` schreiben."
-                    ),
-                    thread_ts=thread_ts,
-                )
-                continue
+    if not logged:
+        return []
 
-            # Dateiname und Mimetype aus Response-Headern ableiten falls nicht bekannt
-            if filename in ('angebot', '') or '.' not in filename:
-                cd = dl_resp.headers.get('Content-Disposition', '')
-                cd_match = re.search(r'filename[^;=\n]*=[\'""]?([^\'""\n;]+)', cd)
-                if cd_match:
-                    filename = cd_match.group(1).strip()
-                else:
-                    ext = dl_resp.headers.get('Content-Type', '').split(';')[0].split('/')[-1]
-                    filename = f"angebot.{ext}" if ext else 'angebot.pdf'
-            ct = dl_resp.headers.get('Content-Type', mimetype).split(';')[0].strip()
-            mimetype = ct or mimetype
-
-            # Zu Planhat hochladen via POST /assets
-            planhat_resp = requests.post(
-                'https://api.planhat.com/assets',
-                headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
-                data={'companyId': planhat_company_id, 'name': filename},
-                files={'file': (filename, dl_resp.content, mimetype)},
-                timeout=30,
+    note_text = '\n'.join(note_lines)
+    try:
+        resp = requests.post(
+            'https://api.planhat.com/notes',
+            headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
+            json={'note': note_text, 'companyId': planhat_company_id},
+            timeout=15,
+        )
+        if resp.ok:
+            logger.info(f"Planhat note with file links created for {planhat_company_id}")
+            return logged
+        else:
+            say(
+                text=(
+                    f":warning: Planhat-Note fehlgeschlagen:\n"
+                    f"HTTP {resp.status_code} · `{resp.text[:300]}`\n"
+                    f"company_id: `{planhat_company_id}`"
+                ),
+                thread_ts=thread_ts,
             )
-            if planhat_resp.ok:
-                uploaded.append(filename)
-                logger.info(f"Planhat asset uploaded: {filename} for {planhat_company_id}")
-            else:
-                say(
-                    text=(
-                        f":warning: Planhat-Upload fehlgeschlagen für `{filename}`:\n"
-                        f"HTTP {planhat_resp.status_code} · `{planhat_resp.text[:300]}`\n"
-                        f"company_id: `{planhat_company_id}`"
-                    ),
-                    thread_ts=thread_ts,
-                )
-        except Exception as e:
-            say(text=f":warning: Upload-Fehler für `{filename}`: `{e}`", thread_ts=thread_ts)
-
-    return uploaded
+            return []
+    except Exception as e:
+        say(text=f":warning: Planhat-Note Fehler: `{e}`", thread_ts=thread_ts)
+        return []
 
 
 def _ask_for_planhat_link(say, channel: str, thread_ts: str, customer_name: str,
