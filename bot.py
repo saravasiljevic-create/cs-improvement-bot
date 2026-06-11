@@ -816,6 +816,19 @@ def _handle_message_core(event, say, client):
 
     if event.get('bot_id'):
         return
+
+    # --- DMs direkt an den Bot → Chat ---
+    if event.get('channel_type') == 'im':
+        user_id = event.get('user', '')
+        if user_id and user_id in CS_ADMIN_USER_IDS:
+            text = event.get('text', '') or ''
+            ts = event.get('ts', '')
+            user_name = get_user_name(client, user_id)
+            _handle_chat(text, user_id, user_name, say, thread_ts=ts, is_dm=True)
+        elif user_id:
+            say(text="Die Chat-Funktion ist aktuell nur für das CS Admin Team verfügbar.")
+        return
+
     # Allow messages from the improvement channel OR the vertragsanpassung channel
     _in_improvement = (event.get('channel') == SLACK_CHANNEL_ID)
     _in_va = (VERTRAGSANPASSUNG_CHANNEL_ID and event.get('channel') == VERTRAGSANPASSUNG_CHANNEL_ID)
@@ -1922,24 +1935,8 @@ def handle_app_mention(event, say, client):
     )
 
 
-@app.event("message")
-def handle_dm(event, say, client):
-    """Direkte Nachrichten an den Bot → Chat."""
-    # Nur DMs (channel_type = 'im')
-    if event.get('channel_type') != 'im':
-        return
-    if event.get('bot_id') or event.get('subtype'):
-        return
 
-    user_id = event.get('user', '')
-    if not user_id or user_id not in CS_ADMIN_USER_IDS:
-        say(text="Die Chat-Funktion ist aktuell nur für das CS Admin Team verfügbar.")
-        return
-
-    text = event.get('text', '')
-    ts = event.get('ts', '')
-    user_name = get_user_name(client, user_id)
-    _handle_chat(text, user_id, user_name, say, thread_ts=ts, is_dm=True)
+# DM-Handler ist jetzt in _handle_message_core integriert (channel_type == 'im' Check)
 
 
 @app.event("reaction_added")
