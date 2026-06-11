@@ -1949,6 +1949,75 @@ def handle_planhat_link_skip(ack, body, say):
     )
 
 
+@app.action("va_select_service_package")
+def handle_va_select_service_package(ack, body, say, client):
+    """Dropdown-Auswahl: Service-Paket für Vertragsanpassung."""
+    ack()
+    user_id = body.get('user', {}).get('id', '')
+    selected = body.get('actions', [{}])[0].get('selected_option', {}).get('value', '')
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    if not selected or not thread_ts:
+        return
+    state = _pending_vertragsanpassung.get((channel, thread_ts))
+    if not state:
+        say(text=f":wave: Service-Paket *{selected}* notiert — kein aktiver VA-Flow mehr. Bitte `#vertragsanpassung` neu triggern.", thread_ts=thread_ts)
+        return
+    state['parsed']['service_package'] = selected
+    # Plan-ID neu auflösen mit Service-Paket
+    from vertragsanpassung_handler import resolve_chargebee_plan_id
+    if state['parsed'].get('new_plan') and state['parsed'].get('contract_months') and state['parsed'].get('payment_type'):
+        pid = resolve_chargebee_plan_id(
+            state['parsed']['new_plan'], state['parsed']['contract_months'],
+            state['parsed']['payment_type'], service_package=selected,
+        )
+        if pid:
+            state['parsed']['chargebee_plan_id'] = pid
+    missing = missing_va_fields(state['parsed'])
+    if missing:
+        say(
+            blocks=ask_for_va_info_blocks(user_id, missing, state['parsed'], state.get('subscription')),
+            text="Weitere Infos benötigt",
+            thread_ts=thread_ts,
+        )
+    else:
+        _process_vertragsanpassung(say, client, channel, thread_ts,
+                                    state['user_name'], state['parsed'], state.get('subscription'))
+
+
+@app.action("va_select_plan")
+def handle_va_select_plan(ack, body, say, client):
+    """Dropdown-Auswahl: Plan + Laufzeit für Vertragsanpassung."""
+    ack()
+    user_id = body.get('user', {}).get('id', '')
+    selected = body.get('actions', [{}])[0].get('selected_option', {}).get('value', '')
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    if not selected or not thread_ts:
+        return
+    state = _pending_vertragsanpassung.get((channel, thread_ts))
+    if not state:
+        say(text=":wave: Kein aktiver VA-Flow — bitte `#vertragsanpassung` neu triggern.", thread_ts=thread_ts)
+        return
+    # Format: "Plan|Monate|Zahlung" z.B. "Pro 25|24|monatlich"
+    parts = selected.split('|')
+    if len(parts) == 3:
+        plan_name, months_str, payment = parts
+        state['parsed']['new_plan'] = plan_name.strip()
+        state['parsed']['contract_months'] = int(months_str)
+        state['parsed']['payment_type'] = payment.strip()
+    missing = missing_va_fields(state['parsed'])
+    if missing:
+        say(
+            blocks=ask_for_va_info_blocks(user_id, missing, state['parsed'], state.get('subscription')),
+            text="Weitere Infos benötigt",
+            thread_ts=thread_ts,
+        )
+    else:
+        _process_vertragsanpassung(say, client, channel, thread_ts,
+                                    state['user_name'], state['parsed'], state.get('subscription'))
+
+
 @app.action("create_ticket_button")
 def handle_create_ticket(ack, body, say):
     ack()

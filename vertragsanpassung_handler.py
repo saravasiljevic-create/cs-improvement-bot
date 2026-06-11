@@ -949,6 +949,23 @@ def _format_found_fields(parsed: dict, subscription: dict | None = None) -> str:
     return '\n'.join(lines)
 
 
+_SERVICE_PACKAGE_OPTIONS = [
+    'Standard S', 'Standard M', 'Standard L',
+    'Growth S', 'Growth M', 'Growth L',
+    'Premium S', 'Premium M', 'Premium L',
+]
+
+_PLAN_DURATION_OPTIONS = [
+    ('Pro 25 | 12M monatlich', 'Pro 25|12|monatlich'),
+    ('Pro 25 | 12M jährlich',  'Pro 25|12|jährlich'),
+    ('Pro 25 | 24M monatlich', 'Pro 25|24|monatlich'),
+    ('Pro 25 | 24M jährlich',  'Pro 25|24|jährlich'),
+    ('Scale | 12M monatlich',  'Scale|12|monatlich'),
+    ('Scale | 24M monatlich',  'Scale|24|monatlich'),
+    ('Launch | 24M monatlich', 'Launch|24|monatlich'),
+]
+
+
 def ask_for_va_info_blocks(
     user_id: str,
     missing: list[str],
@@ -957,21 +974,60 @@ def ask_for_va_info_blocks(
 ) -> list[dict]:
     parsed = parsed or {}
     found = _format_found_fields(parsed, subscription)
-    missing_items = '\n'.join(f'• {m}' for m in missing)
 
     text = f"Hey <@{user_id}> :wave: Ich habe eine *Vertragsanpassungs-Anfrage* erkannt.\n\n"
     if found:
         text += f"*Bereits erkannt:*\n{found}\n\n"
 
-    # Jira-Quellen anzeigen wenn Infos daraus ergänzt wurden
     jira_sources = parsed.get('_jira_sources', [])
     if jira_sources:
         links = ', '.join(f"<{t['url']}|{t['key']}>" for t in jira_sources[:3])
         text += f"_Infos aus Jira ergänzt: {links}_\n\n"
 
-    if missing_items:
-        text += f"*Mir fehlen noch:*\n{missing_items}\n\nBitte ergänze diese Informationen hier im Thread."
-    return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
+    # Textfelder die kein Dropdown haben
+    text_missing = [m for m in missing if 'Service-Paket' not in m and 'Plan' not in m]
+    dropdown_missing_pkg = any('Service-Paket' in m for m in missing)
+    dropdown_missing_plan = any('Plan' in m for m in missing)
+
+    if text_missing:
+        text += f"*Mir fehlen noch:*\n" + '\n'.join(f'• {m}' for m in text_missing)
+        text += '\n\nBitte ergänze diese Informationen hier im Thread.'
+
+    blocks: list[dict] = [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
+
+    # Dropdown für Service-Paket
+    if dropdown_missing_pkg:
+        blocks.append({
+            'type': 'section',
+            'text': {'type': 'mrkdwn', 'text': '*Service-Paket wählen* _(bestimmt die Preis-Variante)_'},
+            'accessory': {
+                'type': 'static_select',
+                'placeholder': {'type': 'plain_text', 'text': 'Service-Paket auswählen…'},
+                'action_id': 'va_select_service_package',
+                'options': [
+                    {'text': {'type': 'plain_text', 'text': pkg}, 'value': pkg}
+                    for pkg in _SERVICE_PACKAGE_OPTIONS
+                ],
+            },
+        })
+
+    # Dropdown für Plan + Laufzeit
+    if dropdown_missing_plan:
+        blocks.append({
+            'type': 'section',
+            'text': {'type': 'mrkdwn', 'text': '*Plan & Laufzeit wählen*'},
+            'accessory': {
+                'type': 'static_select',
+                'placeholder': {'type': 'plain_text', 'text': 'Plan auswählen…'},
+                'action_id': 'va_select_plan',
+                'options': [
+                    {'text': {'type': 'plain_text', 'text': label}, 'value': value}
+                    for label, value in _PLAN_DURATION_OPTIONS
+                ],
+            },
+        })
+
+    return blocks
 
 
 def build_cs_admin_subscription_blocks(subscription: dict) -> list[dict]:
