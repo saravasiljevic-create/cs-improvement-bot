@@ -157,9 +157,18 @@ def parse_request(text: str) -> tuple[str | None, str | None]:
     if not title and not use_case:
         lines = [l.strip() for l in clean.split('\n') if l.strip()]
         if lines:
-            title = lines[0]
-        if len(lines) > 1:
-            use_case = '\n'.join(lines[1:]).strip()
+            first = lines[0]
+            rest = '\n'.join(lines[1:]).strip() if len(lines) > 1 else ''
+            # Langer einzelner Absatz (>80 Zeichen, kein expliziter Titel) →
+            # komplett als Use Case behandeln, Titel muss separat angegeben werden.
+            # Das vermeidet, dass Bot title == use_case meldet wenn jemand den
+            # vollen Kontext in einer Nachricht schreibt.
+            if len(first) > 80 and not rest:
+                use_case = first
+            else:
+                title = first
+                if rest:
+                    use_case = rest
 
     return title or None, use_case or None
 
@@ -1285,7 +1294,16 @@ def _handle_message_core(event, say, client):
                 state['title'] = title_parsed or text.split('\n')[0].strip()
 
             if not state.get('use_case'):
-                state['use_case'] = uc_parsed or text.strip()
+                # Nur uc_parsed verwenden — kein text.strip() Fallback.
+                # Wenn jemand "Titel: X" schreibt, soll das NICHT als Use Case landen.
+                # Use Case muss explizit angegeben oder aus parse_request extrahiert werden.
+                if uc_parsed:
+                    state['use_case'] = uc_parsed
+                elif not has_explicit_title:
+                    # Freier Text ohne Label → als Use Case werten (wenn >20 Zeichen)
+                    stripped = text.strip()
+                    if len(stripped) > 20:
+                        state['use_case'] = stripped
 
             still_missing = missing_info(state.get('title'), state.get('use_case'))
             if still_missing:
@@ -1821,6 +1839,48 @@ def handle_planhat_link_skip(ack, body, say):
 @app.action("create_ticket_button")
 def handle_create_ticket(ack, body, say):
     ack()
+
+
+@app.event("app_mention")
+def handle_app_mention(event, say, client):
+    """Wenn @CS Admin Bot erwähnt wird ohne klaren Kontext, Optionen anzeigen."""
+    text = (event.get('text') or '').lower()
+    channel = event.get('channel', '')
+    thread_ts = event.get('thread_ts') or event.get('ts')
+    user_id = event.get('user', '')
+
+    # Improvement/VA-Keywords im Text → kein Menü nötig, Message-Handler übernimmt
+    if any(kw in text for kw in ('#improvement', '#vertragsanpassung')):
+        return
+    # Bot-Nachrichten ignorieren
+    if event.get('bot_id'):
+        return
+
+    user_name = get_user_name(client, user_id)
+    say(
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"Hey <@{user_id}> :wave: Ich bin der *CS Admin Bot* — hier sind die Dinge, bei denen ich helfen kann:\n\n"
+                        "*🎫 Feature-Request / Improvement*\n"
+                        "Schreib einfach `#improvement` gefolgt von deiner Idee in diesen Channel. "
+                        "Ich suche nach ähnlichen Jira-Tickets und erstelle ggf. ein neues.\n\n"
+                        "*📄 Vertragsanpassung*\n"
+                        "Beschreibe die gewünschte Vertragsänderung direkt im Channel "
+                        "(z.B. 'Kunde X moechte auf Pro 25 wechseln, 24 Monate jaehrlich'). "
+                        "Ich erkenne das automatisch und bereite eine Zusammenfassung für das CS Admin Team vor.\n\n"
+                        "*❓ Allgemeine Fragen oder Anfragen an das CS Admin Team*\n"
+                        "Schreib deine Frage direkt in den Channel — das Team liest mit und meldet sich."
+                    ),
+                },
+            }
+        ],
+        text="Was kann ich für dich tun?",
+        thread_ts=thread_ts,
+    )
 
 
 @app.event("reaction_added")
