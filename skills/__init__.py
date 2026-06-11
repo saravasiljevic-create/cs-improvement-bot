@@ -53,6 +53,8 @@ def load_all() -> list[dict]:
 
 def execute(tool_name: str, params: dict, context: dict) -> str:
     """Führt ein Tool aus und gibt das Ergebnis als String zurück."""
+    if not _registry:  # Lazy-load beim ersten Aufruf
+        load_all()
     if tool_name not in _registry:
         return f"Unbekanntes Tool: {tool_name}"
     mod, _ = _registry[tool_name]
