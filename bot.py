@@ -1858,46 +1858,88 @@ def handle_create_ticket(ack, body, say):
     ack()
 
 
+def _handle_chat(text: str, user_id: str, user_name: str, say, thread_ts: str,
+                  is_dm: bool = False):
+    """Leitet eine Frage an den Chat-Handler weiter und postet die Antwort."""
+    # Nur CS Admin Team (im Channel) — in DMs erstmal offen lassen
+    if not is_dm and user_id not in CS_ADMIN_USER_IDS:
+        say(
+            text=(
+                f"Hey <@{user_id}> :wave: Die Chat-Funktion ist aktuell nur für das CS Admin Team verfügbar.\n"
+                "Für Feature-Requests: `#improvement` | Für Vertragsanpassungen: einfach beschreiben."
+            ),
+            thread_ts=thread_ts,
+        )
+        return
+
+    # Frage bereinigen (Bot-Mention entfernen)
+    import re
+    clean_text = re.sub(r'<@[A-Z0-9]+>', '', text).strip()
+    if not clean_text:
+        say(text="Was möchtest du wissen? :thinking_face:", thread_ts=thread_ts)
+        return
+
+    say(text=":thinking_face: Ich schaue nach...", thread_ts=thread_ts)
+    try:
+        from chat_handler import answer
+        response = answer(clean_text, user_name=user_name)
+        say(text=response, thread_ts=thread_ts)
+    except Exception as e:
+        logger.warning(f"Chat failed: {e}")
+        say(text=f":warning: Fehler: {e}", thread_ts=thread_ts)
+
+
 @app.event("app_mention")
 def handle_app_mention(event, say, client):
-    """Wenn @CS Admin Bot erwähnt wird ohne klaren Kontext, Optionen anzeigen."""
-    text = (event.get('text') or '').lower()
-    channel = event.get('channel', '')
+    """@CS Admin Bot Erwähnung — Chat oder Hilfe-Menü."""
+    raw_text = (event.get('text') or '')
+    text_lower = raw_text.lower()
     thread_ts = event.get('thread_ts') or event.get('ts')
     user_id = event.get('user', '')
 
-    # Improvement/VA-Keywords im Text → kein Menü nötig, Message-Handler übernimmt
-    if any(kw in text for kw in ('#improvement', '#vertragsanpassung')):
-        return
-    # Bot-Nachrichten ignorieren
     if event.get('bot_id'):
+        return
+    # Improvement/VA → Message-Handler übernimmt
+    if any(kw in text_lower for kw in ('#improvement', '#vertragsanpassung')):
         return
 
     user_name = get_user_name(client, user_id)
+
+    # CS Admin: Chat nutzen
+    if user_id in CS_ADMIN_USER_IDS:
+        _handle_chat(raw_text, user_id, user_name, say, thread_ts, is_dm=False)
+        return
+
+    # Alle anderen: Hilfe-Menü
     say(
-        blocks=[
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"Hey <@{user_id}> :wave: Ich bin der *CS Admin Bot* — hier sind die Dinge, bei denen ich helfen kann:\n\n"
-                        "*🎫 Feature-Request / Improvement*\n"
-                        "Schreib einfach `#improvement` gefolgt von deiner Idee in diesen Channel. "
-                        "Ich suche nach ähnlichen Jira-Tickets und erstelle ggf. ein neues.\n\n"
-                        "*📄 Vertragsanpassung*\n"
-                        "Beschreibe die gewünschte Vertragsänderung direkt im Channel "
-                        "(z.B. 'Kunde X moechte auf Pro 25 wechseln, 24 Monate jaehrlich'). "
-                        "Ich erkenne das automatisch und bereite eine Zusammenfassung für das CS Admin Team vor.\n\n"
-                        "*❓ Allgemeine Fragen oder Anfragen an das CS Admin Team*\n"
-                        "Schreib deine Frage direkt in den Channel — das Team liest mit und meldet sich."
-                    ),
-                },
-            }
-        ],
-        text="Was kann ich für dich tun?",
+        text=(
+            f"Hey <@{user_id}> :wave: Ich bin der *CS Admin Bot*. Hier sind meine Funktionen:\n\n"
+            "*🎫 Feature-Request:* `#improvement` + Beschreibung\n"
+            "*📄 Vertragsanpassung:* Anfrage direkt im Channel beschreiben\n"
+            "*❓ Fragen:* Direkt im Channel stellen — das CS Admin Team liest mit."
+        ),
         thread_ts=thread_ts,
     )
+
+
+@app.event("message")
+def handle_dm(event, say, client):
+    """Direkte Nachrichten an den Bot → Chat."""
+    # Nur DMs (channel_type = 'im')
+    if event.get('channel_type') != 'im':
+        return
+    if event.get('bot_id') or event.get('subtype'):
+        return
+
+    user_id = event.get('user', '')
+    if not user_id or user_id not in CS_ADMIN_USER_IDS:
+        say(text="Die Chat-Funktion ist aktuell nur für das CS Admin Team verfügbar.")
+        return
+
+    text = event.get('text', '')
+    ts = event.get('ts', '')
+    user_name = get_user_name(client, user_id)
+    _handle_chat(text, user_id, user_name, say, thread_ts=ts, is_dm=True)
 
 
 @app.event("reaction_added")
