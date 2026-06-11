@@ -1048,7 +1048,7 @@ def _handle_message_core(event, say, client):
                         return
 
         # --- Vertragsanpassung: follow-up to pending state ---
-        if va_state and va_state.get('user_id') == user_id:
+        if va_state and (va_state.get('user_id') == user_id or user_id in CS_ADMIN_USER_IDS):
             new_parsed = _enrich_from_offer(parse_vertragsanpassung(text))
             # Merge: only fill empty fields from the follow-up reply
             for k, v in new_parsed.items():

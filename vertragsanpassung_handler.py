@@ -177,7 +177,8 @@ _ASAP_RE = re.compile(
 )
 
 _DATE_RE = re.compile(
-    r'\b(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})\b'
+    r'\b(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})\b'          # DD.MM.YYYY
+    r'|\b(\d{1,2}[.\-/]\d{1,2}\.?)\b'                     # DD.MM. ohne Jahr (z.B. "1.7.")
     r'|\b(\d{1,2}\.\s*'
     r'(?:januar|februar|märz|april|mai|juni|juli|august|september|oktober|november|dezember'
     r'|jan|feb|mär|apr|jun|jul|aug|sep|okt|nov|dez)\w*\.?\s*\d{2,4})\b',
@@ -254,7 +255,18 @@ def parse_vertragsanpassung(text: str) -> dict:
                 start = i + 1  # dieses Wort überspringen
             else:
                 break  # erstes Nicht-SKIP-Wort → Firmenname beginnt hier
-        return ' '.join(words[start:]).strip() or name.strip()
+        name = ' '.join(words[start:]).strip() or name.strip()
+
+        # Zusätzlich: bei Kontext-Präpositionen abschneiden
+        # "Heavn Lights ab dem 1.7. auf einen 2-Jahresvertrag" → "Heavn Lights"
+        ctx_match = re.search(
+            r'\s+(?:ab|seit|bis|zum?|auf\s+(?:einen?|das?)|mit|von|nach|in)\s+',
+            name, re.IGNORECASE,
+        )
+        if ctx_match:
+            name = name[:ctx_match.start()].strip()
+
+        return name
 
     _trim_to_company_suffix = _clean_company_name  # alias
 
@@ -274,7 +286,7 @@ def parse_vertragsanpassung(text: str) -> dict:
 
     m = _DATE_RE.search(text)
     if m:
-        result['effective_date'] = (m.group(1) or m.group(2) or '').strip()
+        result['effective_date'] = (m.group(1) or m.group(2) or m.group(3) or '').strip()
     elif _ASAP_RE.search(text):
         result['effective_date'] = 'ASAP'  # wird durch next_billing_at aus Chargebee ersetzt
 
@@ -373,6 +385,11 @@ def parse_vertragsanpassung(text: str) -> dict:
 
     if re.search(r'\bdiscount\b|\brabatt\b|\bnachlass\b|\bgutschrift\b', text, re.IGNORECASE):
         result['has_discount'] = True
+
+    # Leistungsbeschreibung YYYY (z.B. "Leistungsbeschreibung 2026")
+    lb_match = re.search(r'leistungsbeschreibung\s*(\d{4})', text, re.IGNORECASE)
+    if lb_match:
+        result['leistungsbeschreibung'] = lb_match.group(1)
 
     return result
 
@@ -1101,6 +1118,8 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
         soll_lines.append(f"• Berichtswesen-Tier: `{parsed['berichtswesen_tier']}`")
     if parsed.get('offer_link'):
         soll_lines.append(f"• Angebot: {parsed['offer_link']}")
+    if parsed.get('leistungsbeschreibung'):
+        soll_lines.append(f"• Leistungsbeschreibung: *{parsed['leistungsbeschreibung']}* _(Kunde wechselt in die aktuelle Leistungsbeschreibung)_")
 
     # Warnungen
     warnings = []
