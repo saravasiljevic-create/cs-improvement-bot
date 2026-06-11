@@ -84,6 +84,47 @@ _pending_planhat_link: dict[tuple[str, str], dict] = {}
 JIRA_KEY_RE = re.compile(r'\b([A-Z]+-\d+)\b')
 PENDING_TTL = 72 * 3600  # 72 hours in seconds
 
+# Plan-ID → lesbarer Name (für Planhat-Notes)
+_PLAN_DISPLAY_NAME: dict[str, str] = {
+    # Pro 25 | 24M monatlich
+    'pro-biennial-contract-monthly-payment-v1': 'Pro 25 | 24-Monatsvertrag (monatl.) inkl. Standard S',
+    'pro-biennial-contract-monthly-payment-v2': 'Pro 25 | 24-Monatsvertrag (monatl.) inkl. Standard M',
+    'pro-biennial-contract-monthly-payment-v3': 'Pro 25 | 24-Monatsvertrag (monatl.) inkl. Standard L',
+    'pro-biennial-contract-monthly-payment-v4': 'Pro 25 | 24-Monatsvertrag (monatl.) inkl. Growth S',
+    'pro-biennial-contract-monthly-payment-v5': 'Pro 25 | 24-Monatsvertrag (monatl.) inkl. Growth M',
+    'pro-biennial-contract-monthly-payment-v6': 'Pro 25 | 24-Monatsvertrag (monatl.) inkl. Growth L',
+    'pro-biennial-contract-monthly-payment-v7': 'Pro 25 | 24-Monatsvertrag (monatl.) inkl. Premium S',
+    'pro-biennial-contract-monthly-payment-v8': 'Pro 25 | 24-Monatsvertrag (monatl.) inkl. Premium M',
+    'pro-biennial-contract-monthly-payment-v9': 'Pro 25 | 24-Monatsvertrag (monatl.) inkl. Premium L',
+    # Pro 25 | 24M jährlich
+    'pro-biennial-contract-annual-payment-v1': 'Pro 25 | 24-Monatsvertrag (jährl.) inkl. Standard S',
+    'pro-biennial-contract-annual-payment-v2': 'Pro 25 | 24-Monatsvertrag (jährl.) inkl. Standard M',
+    'pro-biennial-contract-annual-payment-v3': 'Pro 25 | 24-Monatsvertrag (jährl.) inkl. Standard L',
+    'pro-biennial-contract-annual-payment-v4': 'Pro 25 | 24-Monatsvertrag (jährl.) inkl. Growth S',
+    'pro-biennial-contract-annual-payment-v5': 'Pro 25 | 24-Monatsvertrag (jährl.) inkl. Growth M',
+    'pro-biennial-contract-annual-payment-v6': 'Pro 25 | 24-Monatsvertrag (jährl.) inkl. Growth L',
+    'pro-biennial-contract-annual-payment-v7': 'Pro 25 | 24-Monatsvertrag (jährl.) inkl. Premium S',
+    'pro-biennial-contract-annual-payment-v8': 'Pro 25 | 24-Monatsvertrag (jährl.) inkl. Premium M',
+    'pro-biennial-contract-annual-payment-v9': 'Pro 25 | 24-Monatsvertrag (jährl.) inkl. Premium L',
+    # Pro 25 | 12M monatlich
+    'pro-annual-contract-monthly-payment-v2': 'Pro 25 | 12-Monatsvertrag (monatl.) inkl. Standard M',
+    'pro-annual-contract-monthly-payment-v3': 'Pro 25 | 12-Monatsvertrag (monatl.) inkl. Standard L',
+    'pro-annual-contract-monthly-payment-v4': 'Pro 25 | 12-Monatsvertrag (monatl.) inkl. Growth S',
+    'pro-annual-contract-monthly-payment-v5': 'Pro 25 | 12-Monatsvertrag (monatl.) inkl. Growth M',
+    'pro-annual-contract-monthly-payment-v6': 'Pro 25 | 12-Monatsvertrag (monatl.) inkl. Growth L',
+    'pro-annual-contract-monthly-payment-v7': 'Pro 25 | 12-Monatsvertrag (monatl.) inkl. Premium S',
+    'pro-annual-contract-monthly-payment-v8': 'Pro 25 | 12-Monatsvertrag (monatl.) inkl. Premium M',
+    'pro-annual-contract-monthly-payment-v9': 'Pro 25 | 12-Monatsvertrag (monatl.) inkl. Premium L',
+    # Legacy
+    'pro23-annual-contract-monthly-payment': 'Pro 23 | 12-Monatsvertrag (monatl.)',
+    'pro-annual-contract-monthly-payment': 'Pro 25 | 12-Monatsvertrag (monatl.)',
+    'pro-monthly-contract-monthly-payment': 'Pro 25 | Monatsvertrag',
+}
+
+def _plan_display(plan_id: str) -> str:
+    """Gibt lesbaren Plannamen zurück, Fallback auf plan_id."""
+    return _PLAN_DISPLAY_NAME.get(plan_id, plan_id)
+
 REJECTION_RE = re.compile(
     r'passen?\s+nicht|passt?\s+nicht|nicht\s+passend|'
     r'trifft?\s+nicht\s+zu|stimmt?\s+nicht|'
@@ -994,7 +1035,7 @@ def _handle_message_core(event, say, client):
 
                 note_lines = [
                     f"Vertragsanpassung — {ph_pending.get('user_name', user_name)}",
-                    f"Plan: {old_plan} → {new_plan}",
+                    f"Plan: {_plan_display(old_plan)} → {_plan_display(new_plan)}",
                     f"Effective: {effective}",
                     f'Slack-Thread: <a href="{slack_link}">Thread öffnen</a>',
                 ]
@@ -1202,7 +1243,7 @@ def _handle_message_core(event, say, client):
 
             note_lines = [
                 f"Vertragsanpassung — {user_name}",
-                f"Plan: {old_plan} → {new_plan}",
+                f"Plan: {_plan_display(old_plan)} → {_plan_display(new_plan)}",
                 f"Effective: {effective}",
                 f'Slack-Thread: <a href="{slack_link}">Thread öffnen</a>',
             ]
@@ -1825,7 +1866,7 @@ def handle_va_approved(ack, body, say, client):
                     old_plan = subscription.get('plan_id', '–') if subscription else '–'
                     note_text = (
                         f"Vertragsanpassung vorgenommen von {user_name}\n\n"
-                        f"Plan: {old_plan} → {new_plan_id}\n"
+                        f"Plan: {_plan_display(old_plan)} → {_plan_display(new_plan_id)}\n"
                         f"Effective: {effective_date}\n"
                         f"Ramp-ID: {ramp_id}\n"
                         f"Chargebee: {cb_ramp_link}\n"
