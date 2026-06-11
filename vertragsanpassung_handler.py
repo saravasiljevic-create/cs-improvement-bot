@@ -962,6 +962,13 @@ def ask_for_va_info_blocks(
     text = f"Hey <@{user_id}> :wave: Ich habe eine *Vertragsanpassungs-Anfrage* erkannt.\n\n"
     if found:
         text += f"*Bereits erkannt:*\n{found}\n\n"
+
+    # Jira-Quellen anzeigen wenn Infos daraus ergänzt wurden
+    jira_sources = parsed.get('_jira_sources', [])
+    if jira_sources:
+        links = ', '.join(f"<{t['url']}|{t['key']}>" for t in jira_sources[:3])
+        text += f"_Infos aus Jira ergänzt: {links}_\n\n"
+
     if missing_items:
         text += f"*Mir fehlen noch:*\n{missing_items}\n\nBitte ergänze diese Informationen hier im Thread."
     return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]

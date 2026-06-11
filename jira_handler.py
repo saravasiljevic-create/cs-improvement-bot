@@ -65,6 +65,60 @@ def search_similar_tickets(title: str, use_case: str = ''):
     return results
 
 
+def search_customer_contract_tickets(customer_name: str) -> list[dict]:
+    """Sucht Jira-Tickets zum Kunden die Vertragsanpassungen betreffen.
+
+    Gibt bis zu 5 Tickets zurück mit Summary, Description, Link und Datum.
+    """
+    if not customer_name or len(customer_name) < 3:
+        return []
+
+    # Ersten 2 signifikanten Wörter des Kundennamens für die Suche
+    import re as _re
+    _STOPWORDS = {'gmbh', 'ag', 'kg', 'ug', 'ltd', 'inc', 'und', 'the', 'und'}
+    name_words = [
+        w for w in _re.findall(r'\b\w{3,}\b', customer_name.lower())
+        if w not in _STOPWORDS
+    ][:2]
+
+    if not name_words:
+        return []
+
+    name_conditions = ' AND '.join(
+        f'(summary ~ "{w}" OR description ~ "{w}")'
+        for w in name_words
+    )
+    contract_keywords = (
+        '(summary ~ "Vertrag" OR description ~ "Vertrag" '
+        'OR summary ~ "Contract" OR description ~ "Contract" '
+        'OR summary ~ "Vertragsanpassung" OR description ~ "Vertragsanpassung" '
+        'OR summary ~ "Upgrade" OR description ~ "Upgrade" '
+        'OR summary ~ "Plan" OR description ~ "Plan")'
+    )
+    jql = (
+        f'project = CS AND {name_conditions} AND {contract_keywords} '
+        f'ORDER BY created DESC'
+    )
+
+    try:
+        issues = _get_client().search_issues(jql, maxResults=5, fields='summary,description,created,status')
+        results = []
+        for issue in issues:
+            desc = getattr(issue.fields, 'description', '') or ''
+            results.append({
+                'key': issue.key,
+                'summary': issue.fields.summary,
+                'description': desc[:2000],  # max 2000 Zeichen
+                'status': issue.fields.status.name,
+                'url': f'{JIRA_SERVER_URL}/browse/{issue.key}',
+                'created': issue.fields.created,
+            })
+        return results
+    except Exception as e:
+        print(f"search_customer_contract_tickets failed: {e}")
+        return []
+
+
 def add_vote(issue_key: str, user_name: str = 'CS Team') -> dict:
     """Record a CS-team upvote on a Jira issue.
 
