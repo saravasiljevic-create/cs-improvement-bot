@@ -820,13 +820,28 @@ def _handle_message_core(event, say, client):
     # --- DMs direkt an den Bot → Chat ---
     if event.get('channel_type') == 'im':
         user_id = event.get('user', '')
-        if user_id and user_id in CS_ADMIN_USER_IDS:
-            text = event.get('text', '') or ''
-            ts = event.get('ts', '')
-            user_name = get_user_name(client, user_id)
-            _handle_chat(text, user_id, user_name, say, thread_ts=ts, is_dm=True)
-        elif user_id:
+        if not user_id:
+            return
+        if user_id not in CS_ADMIN_USER_IDS:
             say(text="Die Chat-Funktion ist aktuell nur für das CS Admin Team verfügbar.")
+            return
+        text = event.get('text', '') or ''
+        channel = event.get('channel', '')
+        user_name = get_user_name(client, user_id)
+        # In DMs kein thread_ts — direkt in den DM-Channel antworten
+        import re as _re
+        clean = _re.sub(r'<@[A-Z0-9]+>', '', text).strip()
+        if not clean:
+            say(text="Was möchtest du wissen? :thinking_face:")
+            return
+        try:
+            client.chat_postMessage(channel=channel, text=":thinking_face: Ich schaue nach...")
+            from chat_handler import answer
+            response = answer(clean, user_name=user_name)
+            client.chat_postMessage(channel=channel, text=response)
+        except Exception as e:
+            logger.warning(f"DM chat error: {e}")
+            client.chat_postMessage(channel=channel, text=f":warning: Fehler: {e}")
         return
 
     # Allow messages from the improvement channel OR the vertragsanpassung channel
