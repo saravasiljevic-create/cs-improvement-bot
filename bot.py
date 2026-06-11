@@ -1228,15 +1228,32 @@ def _handle_message_core(event, say, client):
                     thread_ts=thread_ts,
                 )
                 return
-            # Read root message of the thread for context
+            # Alle Thread-Nachrichten lesen (Root + Replies) für maximalen Kontext
+            root_text = ''
+            thread_texts = []
             try:
-                result = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)
-                root_text = result.get('messages', [{}])[0].get('text', '')
+                result = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
+                messages = result.get('messages', [])
+                if messages:
+                    root_text = messages[0].get('text', '')
+                    # Alle nicht-Bot-Replies sammeln (außer der aktuellen #vertragsanpassung)
+                    for msg in messages[1:]:
+                        if not msg.get('bot_id') and msg.get('text') and '#vertragsanpassung' not in msg.get('text', '').lower():
+                            thread_texts.append(msg.get('text', ''))
+                logger.info(f"VA manual trigger: root + {len(thread_texts)} thread replies")
             except Exception as e:
                 logger.warning(f"conversations_replies failed in VA trigger: {e}")
-                root_text = ''
             _set_eyes(client, channel, thread_ts)
+
+            # Root-Nachricht parsen
             parsed = _enrich_from_offer(parse_vertragsanpassung(root_text or text))
+            # Fehlende Felder aus Thread-Replies ergänzen
+            for reply_text in thread_texts:
+                reply_parsed = parse_vertragsanpassung(reply_text)
+                for k, v in reply_parsed.items():
+                    if v and not parsed.get(k):
+                        parsed[k] = v
+                        logger.info(f"VA trigger: '{k}' aus Reply ergänzt: {v!r}")
             if parsed.get('offer_fetch_failed'):
                 say(
                     text=(
