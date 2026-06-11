@@ -404,13 +404,49 @@ def missing_va_fields(parsed: dict) -> list[str]:
         out.append('*Zahlweise* — jährlich oder monatlich?')
     if not parsed.get('effective_date'):
         out.append('*Vertragsbeginn / Effective Date* — ab wann gilt die Änderung? (oder: ASAP/sofort)')
-    # offer_link ist optional — wird in der Summary angezeigt wenn vorhanden
+    # Service-Paket Pflicht wenn neuer Plan ein versionierter Slug ist (Pro 25, Business 25 etc.)
+    plan_name = (parsed.get('new_plan') or '').lower()
+    is_versioned_plan = any(s in plan_name for s in ('pro 25', 'pro25', 'business 25', 'business25', 'scale', 'launch'))
+    if is_versioned_plan and not parsed.get('service_package'):
+        out.append('*Service-Paket* — z.B. "Standard S", "Growth M", "Premium L" (bestimmt die Preis-Variante!)')
     return out
 
 
 # ---------------------------------------------------------------------------
 # Offer-Page Parser
 # ---------------------------------------------------------------------------
+
+def enrich_from_jira_tickets(parsed: dict, tickets: list[dict]) -> tuple[dict, list[dict]]:
+    """Versucht fehlende Felder aus gefundenen Jira-Tickets zu ergänzen.
+
+    Gibt (updated_parsed, relevant_tickets) zurück. relevant_tickets sind
+    die Tickets aus denen Informationen extrahiert wurden.
+    """
+    if not tickets or not parsed.get('customer_name'):
+        return parsed, []
+
+    relevant = []
+    for ticket in tickets:
+        text = f"{ticket.get('summary', '')} {ticket.get('description', '')}"
+        if not text.strip():
+            continue
+
+        # Parsen des Ticket-Textes mit demselben Parser
+        ticket_parsed = parse_vertragsanpassung(text)
+        found_something = False
+
+        for key in ('new_plan', 'payment_type', 'effective_date', 'contract_months',
+                    'service_package', 'plan_full_name', 'chargebee_plan_id'):
+            if ticket_parsed.get(key) and not parsed.get(key):
+                parsed[key] = ticket_parsed[key]
+                found_something = True
+                logger.info(f"Jira {ticket['key']}: {key}={ticket_parsed[key]!r} übernommen")
+
+        if found_something:
+            relevant.append(ticket)
+
+    return parsed, relevant
+
 
 def fetch_offer_data(url: str) -> dict:
     """Lädt eine Xentral-Angebots-URL und extrahiert Vertragsinformationen.
@@ -1088,16 +1124,20 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
                     eur_neg = f"EUR {negotiated_price / 100:,.2f}"
                     price_line += f"\n  ⚠️ *Verhandelter Preis: {eur_neg}/mo* — Price Override nötig!"
             soll_lines.append(price_line)
-        # Service-Paket (IST → SOLL Vergleich)
+        # Service-Paket (IST → SOLL Vergleich) — Pflichtfeld für versionierte Pläne
         soll_pkg = parsed.get('service_package', '')
         ist_pkg = subscription.get('service_package', '') if subscription else ''
+        plan_name_lower = (parsed.get('new_plan') or '').lower()
+        is_versioned = any(s in plan_name_lower for s in ('pro 25', 'pro25', 'business 25', 'business25', 'scale', 'launch'))
         if soll_pkg:
-            pkg_line = f"• Service-Paket (SOLL): *{soll_pkg}*"
+            pkg_line = f"• Service-Paket: *{soll_pkg}*"
             if ist_pkg and ist_pkg.lower() != soll_pkg.lower():
                 pkg_line += f" _(war: {ist_pkg})_"
             soll_lines.append(pkg_line)
         elif ist_pkg:
             soll_lines.append(f"• Service-Paket: {ist_pkg} _(unverändert — bitte prüfen)_")
+        elif is_versioned:
+            soll_lines.append("• Service-Paket: ⚠️ *nicht angegeben* — bestimmt die Preis-Variante! (Standard S/M/L, Growth S/M/L, Premium S/M/L)")
     if parsed.get('payment_type'):
         pay_line = f"• Zahlweise: {parsed['payment_type']}"
         if parsed.get('payment_type_inherited'):

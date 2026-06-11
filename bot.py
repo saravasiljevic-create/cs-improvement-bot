@@ -21,7 +21,7 @@ from config import (
     SLACK_SIGNING_SECRET,
     VERTRAGSANPASSUNG_CHANNEL_ID,
 )
-from jira_handler import add_vote, create_ticket, search_similar_tickets
+from jira_handler import add_vote, create_ticket, search_similar_tickets, search_customer_contract_tickets
 from optimizer import optimize_ticket
 from slack_utils import format_error, format_ticket_created
 from vertragsanpassung_handler import (
@@ -29,6 +29,7 @@ from vertragsanpassung_handler import (
     build_cs_admin_subscription_blocks,
     build_va_summary_blocks,
     detect_vertragsanpassung,
+    enrich_from_jira_tickets,
     extract_service_package,
     fetch_item_price,
     fetch_item_price_name,
@@ -461,6 +462,25 @@ def _process_request(say, client, channel, thread_ts, user_id, user_name, reques
 # ---------------------------------------------------------------------------
 # Vertragsanpassungs-Flow helpers
 # ---------------------------------------------------------------------------
+
+def _enrich_from_jira(parsed: dict) -> tuple[dict, list[dict]]:
+    """Sucht Jira-Tickets zum Kunden und ergänzt fehlende Felder."""
+    customer = parsed.get('customer_name', '')
+    if not customer or len(customer) < 3:
+        return parsed, []
+    missing = missing_va_fields(parsed)
+    if not missing:
+        return parsed, []  # Nichts zu ergänzen
+    try:
+        tickets = search_customer_contract_tickets(customer)
+        if tickets:
+            logger.info(f"Jira: {len(tickets)} Tickets für '{customer}' gefunden")
+            parsed, relevant = enrich_from_jira_tickets(parsed, tickets)
+            return parsed, relevant
+    except Exception as e:
+        logger.warning(f"Jira enrichment failed: {e}")
+    return parsed, []
+
 
 def _enrich_from_offer(parsed: dict) -> dict:
     """Lädt Vertragsdaten aus der Angebots-URL und ergänzt fehlende Felder."""
@@ -1336,6 +1356,9 @@ def _handle_message_core(event, say, client):
                 )
             subscription = _cb_lookup(parsed.get('customer_name', ''))
             parsed = _inherit_from_subscription(parsed, subscription)
+            parsed, jira_tickets = _enrich_from_jira(parsed)
+            if jira_tickets:
+                parsed['_jira_sources'] = jira_tickets
             missing = missing_va_fields(parsed)
             if missing:
                 _pending_vertragsanpassung[(channel, thread_ts)] = {
@@ -1588,6 +1611,10 @@ def _handle_message_core(event, say, client):
             )
         subscription = _cb_lookup(parsed.get('customer_name', ''))
         parsed = _inherit_from_subscription(parsed, subscription)
+        # Jira-Tickets zum Kunden nach fehlenden Infos durchsuchen
+        parsed, jira_tickets = _enrich_from_jira(parsed)
+        if jira_tickets:
+            parsed['_jira_sources'] = jira_tickets
         missing = missing_va_fields(parsed)
         if missing:
             _pending_vertragsanpassung[(channel, ts)] = {
