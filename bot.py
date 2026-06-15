@@ -1313,6 +1313,24 @@ def _handle_message_core(event, say, client):
                 say(text=f":warning: Planhat-Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
             return
 
+        # --- Admin-Befehl: Bot entfernt eigene Reaktionen von der Root-Nachricht ---
+        if '#bot-remove' in text.lower():
+            if user_id not in CS_ADMIN_USER_IDS:
+                say(text=":no_entry: `#bot-remove` kann nur vom CS Admin Team genutzt werden.", thread_ts=thread_ts)
+                return
+            removed = []
+            for emoji in ('eyes', 'white_check_mark', 'x', VA_DONE_EMOJI):
+                try:
+                    client.reactions_remove(channel=channel, name=emoji, timestamp=thread_ts)
+                    removed.append(f":{emoji}:")
+                except Exception:
+                    pass  # Reaktion war nicht gesetzt → ignorieren
+            if removed:
+                say(text=f":broom: Reaktionen entfernt: {' '.join(removed)}", thread_ts=thread_ts)
+            else:
+                say(text=":broom: Keine eigenen Reaktionen auf der Nachricht gefunden.", thread_ts=thread_ts)
+            return
+
         # --- Vertragsanpassung: manual thread trigger (CS Admin only) ---
         if '#vertragsanpassung' in text.lower():
             if user_id not in CS_ADMIN_USER_IDS:
