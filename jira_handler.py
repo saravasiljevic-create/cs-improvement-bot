@@ -152,6 +152,52 @@ def add_vote(issue_key: str, user_name: str = 'CS Team') -> dict:
     }
 
 
+def remove_vote(issue_key: str) -> dict:
+    """Entfernt den Bot-Vote und den Bot-Upvote-Kommentar vom Jira-Ticket."""
+    client = _get_client()
+    result = {'key': issue_key, 'vote_removed': False, 'comment_removed': False}
+
+    # Vote entfernen
+    try:
+        url = f"{JIRA_SERVER_URL}/rest/api/2/issue/{issue_key}/votes"
+        client._session.delete(url)
+        result['vote_removed'] = True
+    except Exception as e:
+        print(f"remove_vote({issue_key}): {e}")
+
+    # Bot-Kommentar (Upvote-Kommentar) suchen und löschen
+    try:
+        issue = client.issue(issue_key, fields='comment,summary')
+        result['summary'] = issue.fields.summary
+        result['url'] = f'{JIRA_SERVER_URL}/browse/{issue_key}'
+        for comment in issue.fields.comment.comments:
+            if 'Upvote' in (comment.body or '') and ('CS Team' in (comment.body or '') or 'Upvote von' in (comment.body or '')):
+                client.delete_comment(issue_key, comment)
+                result['comment_removed'] = True
+                break
+    except Exception as e:
+        print(f"remove_vote comment({issue_key}): {e}")
+
+    return result
+
+
+def delete_ticket(issue_key: str) -> dict:
+    """Löscht ein Jira-Ticket das vom Bot erstellt wurde."""
+    client = _get_client()
+    try:
+        issue = client.issue(issue_key, fields='summary,creator')
+        summary = issue.fields.summary
+        issue.delete()
+        return {
+            'key': issue_key,
+            'summary': summary,
+            'deleted': True,
+        }
+    except Exception as e:
+        print(f"delete_ticket({issue_key}): {e}")
+        raise
+
+
 def _attach_images(issue_key: str, images: list, slack_token: str):
     """Download images from Slack and attach them to the Jira issue.
 

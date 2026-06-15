@@ -21,7 +21,7 @@ from config import (
     SLACK_SIGNING_SECRET,
     VERTRAGSANPASSUNG_CHANNEL_ID,
 )
-from jira_handler import add_vote, create_ticket, search_similar_tickets, search_customer_contract_tickets
+from jira_handler import add_vote, create_ticket, delete_ticket, remove_vote, search_similar_tickets, search_customer_contract_tickets
 from optimizer import optimize_ticket
 from slack_utils import format_error, format_ticket_created
 from vertragsanpassung_handler import (
@@ -1313,22 +1313,57 @@ def _handle_message_core(event, say, client):
                 say(text=f":warning: Planhat-Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
             return
 
-        # --- Admin-Befehl: Bot entfernt eigene Reaktionen von der Root-Nachricht ---
+        # --- Admin-Befehl: #bot-remove [delete] [JIRA-KEY] ---
         if '#bot-remove' in text.lower():
             if user_id not in CS_ADMIN_USER_IDS:
                 say(text=":no_entry: `#bot-remove` kann nur vom CS Admin Team genutzt werden.", thread_ts=thread_ts)
                 return
-            removed = []
-            for emoji in ('eyes', 'white_check_mark', 'x', VA_DONE_EMOJI):
-                try:
-                    client.reactions_remove(channel=channel, name=emoji, timestamp=thread_ts)
-                    removed.append(f":{emoji}:")
-                except Exception:
-                    pass  # Reaktion war nicht gesetzt → ignorieren
-            if removed:
-                say(text=f":broom: Reaktionen entfernt: {' '.join(removed)}", thread_ts=thread_ts)
+
+            # Jira-Key im Text suchen (z.B. CS-123)
+            jira_match = JIRA_KEY_RE.search(text.upper())
+            is_delete = bool(re.search(r'\bdelete\b', text, re.IGNORECASE))
+
+            if jira_match:
+                issue_key = jira_match.group(1)
+                if is_delete:
+                    # Ticket löschen
+                    try:
+                        result = delete_ticket(issue_key)
+                        say(
+                            text=f":wastebasket: Ticket *{issue_key}* (__{result.get('summary', '')}__) wurde gelöscht.",
+                            thread_ts=thread_ts,
+                        )
+                    except Exception as e:
+                        say(text=f":x: Ticket `{issue_key}` konnte nicht gelöscht werden: {str(e)}", thread_ts=thread_ts)
+                else:
+                    # Upvote (Vote + Kommentar) entfernen
+                    try:
+                        result = remove_vote(issue_key)
+                        parts = []
+                        if result.get('vote_removed'):
+                            parts.append("Vote entfernt")
+                        if result.get('comment_removed'):
+                            parts.append("Upvote-Kommentar gelöscht")
+                        if parts:
+                            summary = result.get('summary', issue_key)
+                            say(text=f":broom: *{issue_key}* ({summary}): {', '.join(parts)}.", thread_ts=thread_ts)
+                        else:
+                            say(text=f":broom: Kein Bot-Upvote auf `{issue_key}` gefunden.", thread_ts=thread_ts)
+                    except Exception as e:
+                        say(text=f":x: Fehler bei `{issue_key}`: {str(e)}", thread_ts=thread_ts)
             else:
-                say(text=":broom: Keine eigenen Reaktionen auf der Nachricht gefunden.", thread_ts=thread_ts)
+                # Kein Jira-Key → Bot-Reaktionen von Root-Nachricht entfernen
+                removed = []
+                for emoji in ('eyes', 'white_check_mark', 'x', VA_DONE_EMOJI):
+                    try:
+                        client.reactions_remove(channel=channel, name=emoji, timestamp=thread_ts)
+                        removed.append(f":{emoji}:")
+                    except Exception:
+                        pass
+                if removed:
+                    say(text=f":broom: Reaktionen entfernt: {' '.join(removed)}", thread_ts=thread_ts)
+                else:
+                    say(text=":broom: Keine eigenen Reaktionen auf der Nachricht gefunden.", thread_ts=thread_ts)
             return
 
         # --- Vertragsanpassung: manual thread trigger (CS Admin only) ---
