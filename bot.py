@@ -54,8 +54,12 @@ _BOT_VERSION = "v2.4"
 logger.info(f"Bot starting — version {_BOT_VERSION}")
 
 # Custom-Emoji für die VA-Zusammenfassung (Slack-Name ohne Doppelpunkte)
-# Sobald das Custom-Emoji erstellt ist, diesen Wert anpassen:
 VA_DONE_EMOJI = os.environ.get('VA_DONE_EMOJI', 'csadmin-bot')
+
+# Feedback-Emoji: Mit diesem Emoji auf Bot-Nachrichten reagieren um einen Fehler zu melden
+FEEDBACK_EMOJI = os.environ.get('FEEDBACK_EMOJI', 'sos')
+# Channel für Feedback-Berichte (Slack Channel-ID)
+FEEDBACK_CHANNEL_ID = os.environ.get('FEEDBACK_CHANNEL_ID', '')
 
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 flask_app = Flask(__name__)
@@ -2099,24 +2103,21 @@ def handle_app_mention(event, say, client):
 
 @app.event("reaction_added")
 def handle_reaction_added(event, say, client):
-    """Wenn jemand außerhalb des CS Admin Teams mit 👀 oder ✅ auf eine Nachricht reagiert,
-    informiert der Bot das CS Admin Team im Thread."""
-    reaction = event.get('reaction', '')
-    # Nur 👀 und ✅ überwachen (csadmin-bot ist ausschließlich für Bot-interne Nutzung)
-    if reaction not in ('eyes', 'white_check_mark'):
-        return
+    """Verarbeitet Reaktionen auf Nachrichten im CS Admin Channel.
 
+    - 👀 / ✅ von Nicht-Admins → benachrichtigt CS Admin Team im Thread
+    - 🆘 (sos) auf Bot-Nachrichten → Fehler-Feedback sammeln und loggen
+    """
+    reaction = event.get('reaction', '')
     user_id = event.get('user', '')
     if not user_id:
         return
 
-    # CS Admin Team + Bot-User ignorieren
-    if user_id in CS_ADMIN_USER_IDS:
-        return
+    # Bot-eigene Reaktionen ignorieren
     try:
         info = client.users_info(user=user_id)
         if info['user'].get('is_bot') or info['user'].get('is_app_user'):
-            return  # Bot-Reaktionen (auch unsere eigenen) ignorieren
+            return
     except Exception:
         pass
 
@@ -2125,11 +2126,62 @@ def handle_reaction_added(event, say, client):
         return
 
     channel = item.get('channel', '')
-    if channel != SLACK_CHANNEL_ID:
-        return
-
     ts = item.get('ts', '')
     if not ts:
+        return
+
+    # --- Feedback-Emoji: 🆘 auf Bot-Nachrichten → Fehler melden ---
+    if reaction == FEEDBACK_EMOJI:
+        user_name = get_user_name(client, user_id)
+        logger.info(f"FEEDBACK: :{FEEDBACK_EMOJI}: by {user_name} ({user_id}) on {channel}/{ts}")
+
+        # Originaltext der betroffenen Nachricht laden
+        msg_text = ''
+        msg_user = ''
+        try:
+            hist = client.conversations_history(channel=channel, latest=ts, limit=1, inclusive=True)
+            msgs = hist.get('messages', [])
+            if msgs:
+                msg_text = msgs[0].get('text', '')[:300]
+                msg_user = msgs[0].get('user', '')
+        except Exception:
+            pass
+
+        # Link zur Nachricht
+        msg_link = slack_message_link(channel, ts)
+        admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
+
+        # Feedback im Thread bestätigen
+        say(
+            text=f":sos: Danke für das Feedback! Wir schauen uns das an, <@{user_id}>.",
+            thread_ts=ts,
+        )
+
+        # Strukturierten Bericht in Feedback-Channel posten (falls konfiguriert)
+        report = (
+            f":sos: *Bot-Fehler gemeldet* von <@{user_id}> ({user_name})\n"
+            f"• *Nachricht:* <{msg_link}|Link>\n"
+            f"• *Bot-Antwort:* {msg_text[:200] if msg_text else '(nicht geladen)'}\n"
+            f"• *Zeitpunkt:* <!date^{int(float(ts))}^{{date_short}} {{time}}|{ts}>\n"
+            f"{admin_mentions}"
+        )
+        if FEEDBACK_CHANNEL_ID:
+            try:
+                client.chat_postMessage(channel=FEEDBACK_CHANNEL_ID, text=report)
+                logger.info(f"Feedback report posted to {FEEDBACK_CHANNEL_ID}")
+            except Exception as e:
+                logger.warning(f"Could not post to feedback channel: {e}")
+        else:
+            # Kein Channel konfiguriert → nur im selben Thread loggen
+            logger.warning(f"FEEDBACK_CHANNEL_ID not set — feedback only in log. Report: {report}")
+        return
+
+    # --- 👀 / ✅ von Nicht-Admins → CS Admin Team benachrichtigen ---
+    if reaction not in ('eyes', 'white_check_mark'):
+        return
+    if user_id in CS_ADMIN_USER_IDS:
+        return
+    if channel != SLACK_CHANNEL_ID:
         return
 
     user_name = get_user_name(client, user_id)
