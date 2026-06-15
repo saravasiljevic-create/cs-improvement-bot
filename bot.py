@@ -1445,7 +1445,13 @@ def _handle_message_core(event, say, client):
             return
 
         # --- Jira ticket number posted → auto-upvote ---
-        jira_match = JIRA_KEY_RE.search(text.upper())
+        # NUR wenn der Bot vorher für diesen Thread ähnliche Tickets gezeigt hat
+        # (verhindert false positives wie Chargebee-Nummern "CN-3418" o.ä.)
+        _in_improvement_flow = (
+            (channel, thread_ts) in _similar_shown
+            or (channel, thread_ts) in _ticket_data
+        )
+        jira_match = JIRA_KEY_RE.search(text.upper()) if _in_improvement_flow else None
         if jira_match:
             issue_key = jira_match.group(1)
             try:
