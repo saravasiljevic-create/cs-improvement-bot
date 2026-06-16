@@ -3,7 +3,10 @@ import sys
 
 SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN')
 SLACK_SIGNING_SECRET = os.environ.get('SLACK_SIGNING_SECRET')
-SLACK_CHANNEL_ID = os.environ.get('SLACK_CHANNEL_ID')
+SLACK_CHANNEL_ID = os.environ.get('SLACK_CHANNEL_ID', '').split(',')[0].strip()
+SLACK_CHANNEL_IDS: set[str] = {
+    cid.strip() for cid in os.environ.get('SLACK_CHANNEL_ID', '').split(',') if cid.strip()
+}
 SLACK_CHANNEL_NAME = os.environ.get('SLACK_CHANNEL_NAME')
 JIRA_SERVER_URL = os.environ.get('JIRA_SERVER_URL', '')
 if JIRA_SERVER_URL and not JIRA_SERVER_URL.startswith('http'):
@@ -30,7 +33,7 @@ CS_ADMIN_USER_IDS: set[str] = set(
 required_credentials = {
     'SLACK_BOT_TOKEN': SLACK_BOT_TOKEN,
     'SLACK_SIGNING_SECRET': SLACK_SIGNING_SECRET,
-    'SLACK_CHANNEL_ID': SLACK_CHANNEL_ID,
+    'SLACK_CHANNEL_ID': SLACK_CHANNEL_ID or None,
     'SLACK_CHANNEL_NAME': SLACK_CHANNEL_NAME,
     'JIRA_SERVER_URL': JIRA_SERVER_URL,
     'JIRA_USER_EMAIL': JIRA_USER_EMAIL,

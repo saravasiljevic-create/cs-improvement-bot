@@ -18,6 +18,7 @@ from config import (
     PLANHAT_WORKSPACE_URL,
     SLACK_BOT_TOKEN,
     SLACK_CHANNEL_ID,
+    SLACK_CHANNEL_IDS,
     SLACK_SIGNING_SECRET,
     VERTRAGSANPASSUNG_CHANNEL_ID,
 )
@@ -910,7 +911,7 @@ def _handle_message_core(event, say, client):
         return
 
     # Allow messages from the improvement channel OR the vertragsanpassung channel
-    _in_improvement = (event.get('channel') == SLACK_CHANNEL_ID)
+    _in_improvement = (event.get('channel') in SLACK_CHANNEL_IDS)
     _in_va = (VERTRAGSANPASSUNG_CHANNEL_ID and event.get('channel') == VERTRAGSANPASSUNG_CHANNEL_ID)
     if not _in_improvement and not _in_va:
         return
@@ -2261,7 +2262,7 @@ def handle_reaction_added(event, say, client):
         return
     if user_id in CS_ADMIN_USER_IDS:
         return
-    if channel != SLACK_CHANNEL_ID:
+    if channel not in SLACK_CHANNEL_IDS:
         return
 
     user_name = get_user_name(client, user_id)
