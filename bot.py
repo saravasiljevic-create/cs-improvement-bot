@@ -17,6 +17,7 @@ from config import (
     PLANHAT_API_TOKEN,
     PLANHAT_WORKSPACE_URL,
     SLACK_BOT_TOKEN,
+    SLACK_CANVAS_ID,
     SLACK_CHANNEL_ID,
     SLACK_CHANNEL_IDS,
     SLACK_SIGNING_SECRET,
@@ -63,6 +64,102 @@ FEEDBACK_EMOJI = os.environ.get('FEEDBACK_EMOJI', 'sos')
 FEEDBACK_CHANNEL_ID = os.environ.get('FEEDBACK_CHANNEL_ID', '')
 
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
+
+
+# ---------------------------------------------------------------------------
+# Docs Canvas
+# ---------------------------------------------------------------------------
+
+def _build_canvas_markdown() -> str:
+    """Generates the full bot documentation as Slack Canvas markdown."""
+    now = datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')
+    return f"""# CS Admin Bot — Dokumentation
+*Zuletzt aktualisiert: {now} UTC*
+
+---
+
+## Feature-Requests
+
+Schreib **#improvement** + Titel und Beschreibung im Channel.
+
+Der Bot erkennt das, setzt 👀, sucht ähnliche offene Jira-Tickets und erstellt bei Bedarf automatisch ein neues im CS-Board. Andere können mit `CS-123` im Thread upvoten — der Bot übernimmt Vote + Kommentar.
+
+---
+
+## Vertragsanpassungen
+
+Beschreib die Änderung direkt im Channel — der Bot erkennt das automatisch.
+
+**Beispiele:**
+- *Bitte für Firma GmbH auf Business 25 Jahresvertrag upgraden*
+- *Firma AG soll auf monatliche Zahlung wechseln ab 01.07.2026*
+
+Der Bot sucht die Chargebee-Subscription, zeigt IST/SOLL-Zusammenfassung und legt nach CS Admin Freigabe die Ramp direkt in Chargebee an. Danach erscheint eine Note in Chargebee und Planhat mit Approver-Name.
+
+Manuell starten: **#vertragsanpassung** im Thread schreiben (nur CS Admin).
+
+---
+
+## Chargebee-Fragen (CS Admin)
+
+Direkt im Channel an den Bot richten:
+
+- `@CS Admin Bot Welchen Plan hat Firma GmbH?`
+- `@CS Admin Bot Zeig mir die Subscription von Firma GmbH`
+
+---
+
+## Admin-Befehle (nur CS Admin Team)
+
+| Befehl | Was passiert |
+|---|---|
+| `#bot-remove` | Bot-Reaktionen vom Root-Post entfernen |
+| `#bot-remove CS-123` | Bot-Upvote von Ticket entfernen |
+| `#bot-remove delete CS-123` | Ticket CS-123 löschen |
+| `#bot-stop` | Thread stummschalten + erstelltes Ticket löschen |
+| `#bot-update-docs` | Dieses Canvas aktualisieren |
+
+---
+
+## Konfiguration
+
+**Deployment:** Google Cloud Run `cs-improvement-bot` (europe-west1)
+**CI/CD:** Push auf `main` Branch → automatisches Deployment
+
+Secrets in GCP Secret Manager: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID` (komma-getrennt für mehrere Channels), `JIRA_SERVER_URL`, `JIRA_USER_EMAIL`, `JIRA_API_TOKEN`, `CHARGEBEE_API_KEY`, `CS_ADMIN_USER_IDS` (komma-getrennte Slack User IDs), `SLACK_CANVAS_ID`, `PLANHAT_API_TOKEN` (optional), `VA_DONE_EMOJI` (optional)
+"""
+
+
+def _update_docs_canvas(client) -> bool:
+    """Replaces the documentation Canvas content with the current bot feature overview."""
+    canvas_id = SLACK_CANVAS_ID
+    if not canvas_id:
+        logger.warning("SLACK_CANVAS_ID not set — skipping Canvas update")
+        return False
+    try:
+        # Find all existing sections so we can delete them first
+        lookup = client.canvases_sections_lookup(
+            canvas_id=canvas_id,
+            criteria={'contains_text': ''},
+        )
+        changes = [
+            {'operation': 'delete', 'section_id': s['id']}
+            for s in lookup.get('sections', [])
+        ]
+        # Insert fresh content
+        changes.append({
+            'operation': 'insert_at_start',
+            'document_content': {
+                'type': 'markdown',
+                'markdown': _build_canvas_markdown(),
+            },
+        })
+        client.canvases_edit(canvas_id=canvas_id, changes=changes)
+        logger.info(f"Docs Canvas {canvas_id} updated successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Canvas update failed: {e}")
+        return False
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
 
@@ -1323,6 +1420,21 @@ def _handle_message_core(event, say, client):
                     )
             except Exception as e:
                 say(text=f":warning: Planhat-Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
+            return
+
+        # --- Admin-Befehl: #bot-update-docs — Docs Canvas aktualisieren ---
+        if '#bot-update-docs' in text.lower():
+            if user_id not in CS_ADMIN_USER_IDS:
+                say(text=":no_entry: `#bot-update-docs` kann nur vom CS Admin Team genutzt werden.", thread_ts=thread_ts)
+                return
+            if not SLACK_CANVAS_ID:
+                say(text=":warning: `SLACK_CANVAS_ID` ist nicht konfiguriert — Canvas-Update nicht möglich.", thread_ts=thread_ts)
+                return
+            say(text=":pencil: Aktualisiere Canvas...", thread_ts=thread_ts)
+            if _update_docs_canvas(client):
+                say(text=":white_check_mark: Docs Canvas wurde aktualisiert.", thread_ts=thread_ts)
+            else:
+                say(text=":warning: Canvas-Update fehlgeschlagen — bitte Cloud Run Logs prüfen.", thread_ts=thread_ts)
             return
 
         # --- Admin-Befehl: #bot-stop — Thread stummschalten + Ticket löschen ---
