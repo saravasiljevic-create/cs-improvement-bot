@@ -2161,21 +2161,34 @@ def handle_app_mention(event, say, client):
 
     user_name = get_user_name(client, user_id)
 
-    # CS Admin: Chat nutzen
+    # Bot-Mention aus Text entfernen um den Kern zu prüfen
+    import re as _re
+    clean_mention = _re.sub(r'<@[A-Z0-9]+>', '', raw_text).strip()
+
+    _GREETINGS = {'hallo', 'hi', 'hey', 'hello', 'servus', 'moin', 'guten tag',
+                  'guten morgen', 'guten abend', 'was kannst du', 'hilfe', 'help', '?', ''}
+    _is_greeting = clean_mention.lower() in _GREETINGS or len(clean_mention) <= 3
+
+    _HELP_TEXT = (
+        f"Hey <@{user_id}> :wave: Ich bin der *CS Admin Bot*. Hier sind meine Funktionen:\n\n"
+        "*🎫 Feature-Request:* Schreib `#improvement` + Titel und Beschreibung\n"
+        "*📄 Vertragsanpassung:* Anfrage direkt im Channel beschreiben (z.B. 'Bitte für Kunde GmbH Plan upgraden')\n"
+        "*🔍 Chargebee-Fragen:* `@CS Admin Bot Welchen Plan hat Kunde GmbH?`\n"
+        "*❓ Sonstiges:* Das CS Admin Team liest mit."
+    )
+
+    # Greeting oder leere Mention → immer Hilfe-Menü (auch für Admins)
+    if _is_greeting:
+        say(text=_HELP_TEXT, thread_ts=thread_ts)
+        return
+
+    # CS Admin mit echter Frage: Chat nutzen
     if user_id in CS_ADMIN_USER_IDS:
         _handle_chat(raw_text, user_id, user_name, say, thread_ts, is_dm=False)
         return
 
     # Alle anderen: Hilfe-Menü
-    say(
-        text=(
-            f"Hey <@{user_id}> :wave: Ich bin der *CS Admin Bot*. Hier sind meine Funktionen:\n\n"
-            "*🎫 Feature-Request:* `#improvement` + Beschreibung\n"
-            "*📄 Vertragsanpassung:* Anfrage direkt im Channel beschreiben\n"
-            "*❓ Fragen:* Direkt im Channel stellen — das CS Admin Team liest mit."
-        ),
-        thread_ts=thread_ts,
-    )
+    say(text=_HELP_TEXT, thread_ts=thread_ts)
 
 
 
