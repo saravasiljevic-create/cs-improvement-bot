@@ -2227,21 +2227,99 @@ def handle_app_mention(event, say, client):
     import re as _re
     clean_mention = _re.sub(r'<@[A-Z0-9]+>', '', raw_text).strip()
 
-    _GREETINGS = {'hallo', 'hi', 'hey', 'hello', 'servus', 'moin', 'guten tag',
-                  'guten morgen', 'guten abend', 'was kannst du', 'hilfe', 'help', '?', ''}
-    _is_greeting = clean_mention.lower() in _GREETINGS or len(clean_mention) <= 3
+    clean_lower = clean_mention.lower()
 
-    _HELP_TEXT = (
-        f"Hey <@{user_id}> :wave: Ich bin der *CS Admin Bot*. Hier sind meine Funktionen:\n\n"
-        "*🎫 Feature-Request:* Schreib `#improvement` + Titel und Beschreibung\n"
-        "*📄 Vertragsanpassung:* Anfrage direkt im Channel beschreiben (z.B. 'Bitte für Kunde GmbH Plan upgraden')\n"
-        "*🔍 Chargebee-Fragen:* `@CS Admin Bot Welchen Plan hat Kunde GmbH?`\n"
-        "*❓ Sonstiges:* Das CS Admin Team liest mit."
-    )
+    _SIMPLE_GREETINGS = {'hallo', 'hi', 'hey', 'hello', 'servus', 'moin',
+                         'guten tag', 'guten morgen', 'guten abend', '?', ''}
+    _CAPABILITY_KEYWORDS = ('was kannst', 'was kann', 'funktionen', 'befehle',
+                            'features', 'hilfe', 'help', 'wie funktioniert',
+                            'was gibt', 'übersicht', 'commands', 'was machst',
+                            'was bist', 'erkläre dich')
 
-    # Greeting oder leere Mention → immer Hilfe-Menü (auch für Admins)
-    if _is_greeting:
-        say(text=_HELP_TEXT, thread_ts=thread_ts)
+    _is_simple_greeting = clean_lower in _SIMPLE_GREETINGS or len(clean_mention) <= 3
+    _is_capability_question = any(kw in clean_lower for kw in _CAPABILITY_KEYWORDS)
+
+    def _build_help_blocks(full: bool):
+        blocks = [
+            {
+                'type': 'section',
+                'text': {
+                    'type': 'mrkdwn',
+                    'text': f":robot_face: Hey <@{user_id}>! Ich bin der *CS Admin Bot* — hier ist was ich kann:",
+                },
+            },
+            {'type': 'divider'},
+            {
+                'type': 'section',
+                'text': {
+                    'type': 'mrkdwn',
+                    'text': (
+                        '*:ticket: Feature-Requests*\n'
+                        'Schreib `#improvement` + Titel und Beschreibung im Channel.\n'
+                        'Ich suche ähnliche Jira-Tickets und erstelle bei Bedarf automatisch ein neues.\n'
+                        'Andere können dann eine Ticket-Nummer (z.B. `CS-123`) in den Thread schreiben — ich vote automatisch.'
+                    ),
+                },
+            },
+            {
+                'type': 'section',
+                'text': {
+                    'type': 'mrkdwn',
+                    'text': (
+                        '*:page_facing_up: Vertragsanpassungen*\n'
+                        "Beschreib die Änderung direkt im Channel (z.B. _'Bitte für Firma GmbH auf Business 25 Jahresvertrag upgraden'_).\n"
+                        'Ich erkenne das automatisch, schlage die Chargebee-Subscription auf und lege die Ramp direkt an — nach eurer Freigabe.'
+                    ),
+                },
+            },
+        ]
+        if full:
+            blocks += [
+                {
+                    'type': 'section',
+                    'text': {
+                        'type': 'mrkdwn',
+                        'text': (
+                            '*:mag: Chargebee-Fragen* _(CS Admin)_\n'
+                            '`@CS Admin Bot Welchen Plan hat Firma GmbH?`\n'
+                            '`@CS Admin Bot Zeig mir die Subscription von Firma GmbH`'
+                        ),
+                    },
+                },
+                {'type': 'divider'},
+                {
+                    'type': 'section',
+                    'text': {
+                        'type': 'mrkdwn',
+                        'text': (
+                            '*:wrench: Admin-Befehle* _(nur CS Admin Team)_\n'
+                            '`#bot-remove` — Bot-Reaktionen vom Root-Post entfernen\n'
+                            '`#bot-remove CS-123` — Bot-Upvote von Ticket entfernen\n'
+                            '`#bot-remove delete CS-123` — Ticket löschen\n'
+                            '`#bot-stop` — Thread stummschalten + Ticket löschen\n'
+                            '`#vertragsanpassung` — VA-Flow manuell starten (im Thread)'
+                        ),
+                    },
+                },
+            ]
+        return blocks
+
+    # Einfacher Gruß → kurze Begrüßung
+    if _is_simple_greeting:
+        say(
+            blocks=_build_help_blocks(full=False),
+            text=f"Hey {user_name}! Ich bin der CS Admin Bot.",
+            thread_ts=thread_ts,
+        )
+        return
+
+    # Capability-Frage → vollständige Übersicht
+    if _is_capability_question:
+        say(
+            blocks=_build_help_blocks(full=True),
+            text="CS Admin Bot Übersicht",
+            thread_ts=thread_ts,
+        )
         return
 
     # CS Admin mit echter Frage: Chat nutzen
@@ -2249,8 +2327,12 @@ def handle_app_mention(event, say, client):
         _handle_chat(raw_text, user_id, user_name, say, thread_ts, is_dm=False)
         return
 
-    # Alle anderen: Hilfe-Menü
-    say(text=_HELP_TEXT, thread_ts=thread_ts)
+    # Alle anderen ohne erkennbares Keyword: kurze Hilfe
+    say(
+        blocks=_build_help_blocks(full=True),
+        text="CS Admin Bot Übersicht",
+        thread_ts=thread_ts,
+    )
 
 
 
