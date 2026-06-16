@@ -80,6 +80,12 @@ _pending_vertragsanpassung: dict[tuple[str, str], dict] = {}
 # VA-Zusammenfassungen die auf CS Admin Bestätigung warten (für 48h Reminder)
 # (channel, thread_ts) -> {'sent_at': float, 'reminded': bool}
 _va_pending_approval: dict[tuple[str, str], dict] = {}
+
+# Threads where the bot has been silenced via #bot-stop
+_muted_threads: set[tuple[str, str]] = set()
+
+# (channel, thread_ts) -> Jira key of the ticket created for this thread
+_created_tickets: dict[tuple[str, str], str] = {}
 VA_REMINDER_TTL = 48 * 3600  # 48 Stunden
 
 # Warten auf Planhat-Link nach fehlgeschlagener Company-Suche
@@ -407,6 +413,7 @@ def _do_create_ticket(say, client, channel: str, thread_ts: str, ctx: dict):
             images=ctx.get('images', []),
             slack_token=SLACK_BOT_TOKEN,
         )
+        _created_tickets[(channel, thread_ts)] = ticket['key']
         say(
             blocks=format_ticket_created(ticket),
             text=f"Ticket {ticket['key']} erstellt",
@@ -931,6 +938,10 @@ def _handle_message_core(event, say, client):
 
     logger.info(f"Processing: channel={channel}, thread={thread_ts}, user={user_id} ({user_name})")
 
+    # Thread stummgeschaltet via #bot-stop → komplett ignorieren
+    if thread_ts and (channel, thread_ts) in _muted_threads:
+        return
+
     # -----------------------------------------------------------------------
     # THREAD REPLY
     # -----------------------------------------------------------------------
@@ -1312,6 +1323,57 @@ def _handle_message_core(event, say, client):
                     )
             except Exception as e:
                 say(text=f":warning: Planhat-Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
+            return
+
+        # --- Admin-Befehl: #bot-stop — Thread stummschalten + Ticket löschen ---
+        if '#bot-stop' in text.lower():
+            if user_id not in CS_ADMIN_USER_IDS:
+                say(text=":no_entry: `#bot-stop` kann nur vom CS Admin Team genutzt werden.", thread_ts=thread_ts)
+                return
+
+            # Jira-Ticket suchen: 1. in-memory, 2. Thread-Nachrichten scannen
+            jira_key = _created_tickets.get((channel, thread_ts))
+            if not jira_key:
+                try:
+                    replies = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
+                    for msg in replies.get('messages', []):
+                        m = JIRA_KEY_RE.search((msg.get('text') or '').upper())
+                        if m:
+                            jira_key = m.group(1)
+                            break
+                except Exception as e:
+                    logger.warning(f"#bot-stop thread scan failed: {e}")
+
+            deleted_ticket = None
+            if jira_key:
+                try:
+                    result = delete_ticket(jira_key)
+                    deleted_ticket = result.get('summary', jira_key)
+                except Exception as e:
+                    logger.warning(f"#bot-stop: ticket delete {jira_key} failed: {e}")
+
+            # Bot-Reaktionen entfernen
+            for emoji in ('eyes', 'white_check_mark', 'x', VA_DONE_EMOJI):
+                try:
+                    client.reactions_remove(channel=channel, name=emoji, timestamp=thread_ts)
+                except Exception:
+                    pass
+
+            # Alle States für diesen Thread leeren
+            _pending.pop((channel, thread_ts), None)
+            _ticket_data.pop((channel, thread_ts), None)
+            _similar_shown.pop((channel, thread_ts), None)
+            _pending_vertragsanpassung.pop((channel, thread_ts), None)
+            _va_pending_approval.pop((channel, thread_ts), None)
+            _created_tickets.pop((channel, thread_ts), None)
+
+            # Thread stummschalten
+            _muted_threads.add((channel, thread_ts))
+
+            parts = [":mute: Thread stummgeschaltet — der Bot antwortet hier nicht mehr."]
+            if deleted_ticket:
+                parts.append(f":wastebasket: Ticket *{jira_key}* ({deleted_ticket}) gelöscht.")
+            say(text='\n'.join(parts), thread_ts=thread_ts)
             return
 
         # --- Admin-Befehl: #bot-remove [delete] [JIRA-KEY] ---
