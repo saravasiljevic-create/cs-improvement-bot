@@ -1,17 +1,52 @@
 """
 Vertragsanpassungs-Flow: Intent-Erkennung, Parsing, Chargebee-Lookup (read-only),
 und Zusammenfassungs-Builder.
-
-Der Bot schreibt NICHTS in Chargebee — er erstellt nur eine strukturierte Zusammenfassung
-mit Link zur Subscription und kontextuellen Hinweisen basierend auf dem IST-Zustand.
 """
+import ipaddress
 import logging
+import os
 import re
+import socket
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import requests
 
+from config import CS_ADMIN_USER_IDS
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SSRF guard for offer URL fetches
+# ---------------------------------------------------------------------------
+
+# Comma-separated list of allowed hostnames (exact or suffix match).
+# Override via OFFER_ALLOWLIST_HOSTS env var if the offer portal ever moves.
+_OFFER_ALLOWLIST: set[str] = {
+    h.strip().lower()
+    for h in os.environ.get('OFFER_ALLOWLIST_HOSTS', 'xentral.com').split(',')
+    if h.strip()
+}
+
+
+def _validate_offer_url(url: str) -> None:
+    """Raises ValueError if url is not on the offer allow-list or resolves to a private/loopback IP."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ('https', 'http'):
+        raise ValueError(f"Invalid scheme '{parsed.scheme}' — only https/http allowed")
+    host = (parsed.hostname or '').lower()
+    if not host:
+        raise ValueError("No hostname in URL")
+    if not any(host == a or host.endswith('.' + a) for a in _OFFER_ALLOWLIST):
+        raise ValueError(f"Host '{host}' not in offer allow-list {_OFFER_ALLOWLIST}")
+    try:
+        addr_infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise ValueError(f"DNS resolution failed for '{host}': {exc}") from exc
+    for _, _, _, _, sockaddr in addr_infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise ValueError(f"Host '{host}' resolves to non-routable IP {ip}")
 
 # ---------------------------------------------------------------------------
 # Chargebee Plan-ID Lookup
@@ -100,8 +135,8 @@ def resolve_chargebee_plan_id(
 
 
 # CS Admin Slack User IDs für @-Mentions in der Subscription-Warnung
-# Mirjam Köberlein, Linda Litzkow, Sara Vasiljevic
-_CS_ADMIN_IDS = ('U07G83YH6RW', 'U092RN6D339', 'U07TRKK8BH9')
+# Loaded from CS_ADMIN_USER_IDS env var (set in GCP Secret Manager).
+_CS_ADMIN_IDS = CS_ADMIN_USER_IDS
 
 # ---------------------------------------------------------------------------
 # Intent Detection
@@ -455,6 +490,11 @@ def fetch_offer_data(url: str) -> dict:
     - Firmenname (oben auf der Seite)
     - Plan + Zahlweise aus "Produkte & Services" (Format: "Plan | 12-Monatsvertrag [monatliche Zahlung]")
     """
+    try:
+        _validate_offer_url(url)
+    except ValueError as exc:
+        logger.warning(f"fetch_offer_data blocked (SSRF guard): {exc}")
+        return {}
     try:
         resp = requests.get(
             url,

@@ -1948,12 +1948,39 @@ def handle_va_approved(ack, body, say, client):
             )
             _add_reaction(client, channel, thread_ts, 'white_check_mark')
 
-            # Planhat Note erstellen
             customer_name = parsed.get('customer_name', '')
+            old_plan = subscription.get('plan_id', '–') if subscription else '–'
+
+            # Chargebee Customer Note — Attribution: wer hat freigegeben
+            cb_customer_id = subscription.get('customer_id', '') if subscription else ''
+            if cb_customer_id and CHARGEBEE_API_KEY:
+                cb_note = (
+                    f"Ramp freigegeben von {user_name}\n"
+                    f"Plan: {_plan_display(old_plan)} → {_plan_display(new_plan_id)}\n"
+                    f"Effective: {effective_date}\n"
+                    f"Ramp-ID: {ramp_id}\n"
+                    f"Slack: {slack_thread_link}"
+                )
+                try:
+                    requests.post(
+                        f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2/customer_notes",
+                        auth=(CHARGEBEE_API_KEY, ''),
+                        data={
+                            'customer_id': cb_customer_id,
+                            'entity_type': 'subscription',
+                            'entity_id': sub_id,
+                            'note': cb_note,
+                        },
+                        timeout=10,
+                    )
+                    logger.info(f"Chargebee note created for customer {cb_customer_id} by {user_name} (ramp {ramp_id})")
+                except Exception as e:
+                    logger.warning(f"Chargebee customer note failed: {e}")
+
+            # Planhat Note erstellen
             if customer_name and PLANHAT_API_TOKEN:
                 ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(subscription))
                 if ph_company and ph_company.get('id'):
-                    old_plan = subscription.get('plan_id', '–') if subscription else '–'
                     note_text = (
                         f"Vertragsanpassung vorgenommen von {user_name}\n\n"
                         f"Plan: {_plan_display(old_plan)} → {_plan_display(new_plan_id)}\n"
@@ -1974,7 +2001,7 @@ def handle_va_approved(ack, body, say, client):
                             },
                             timeout=10,
                         )
-                        logger.info(f"Planhat note created for {customer_name}")
+                        logger.info(f"Planhat note created for {customer_name} by {user_name}")
                     except Exception as e:
                         logger.warning(f"Planhat note failed: {e}")
         else:
