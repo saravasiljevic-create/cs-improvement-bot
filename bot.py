@@ -51,7 +51,7 @@ _CB_URL_RE = re.compile(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_BOT_VERSION = "v2.5"
+_BOT_VERSION = "v2.6"
 logger.info(f"Bot starting — version {_BOT_VERSION}")
 
 # Custom-Emoji für die VA-Zusammenfassung (Slack-Name ohne Doppelpunkte)
@@ -1916,10 +1916,49 @@ def handle_va_take_over(ack, body, say, client):
     user_name = get_user_name(client, user_id)
     thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
     channel = body.get('channel', {}).get('id', '')
+
+    state = _va_pending_approval.get((channel, thread_ts), {})
+    parsed = state.get('parsed', {})
+    subscription = state.get('subscription', {})
+    customer_name = parsed.get('customer_name', '')
+    old_plan = subscription.get('plan_id', '–') if subscription else '–'
+    new_plan_id = parsed.get('chargebee_plan_id', '–') or '–'
+    effective_date = parsed.get('effective_date', '–')
+    sub_id = subscription.get('subscription_id', '') if subscription else ''
+    slack_thread_link = slack_message_link(channel, thread_ts)
+
     say(
         text=f":csadmin-bot: *{user_name}* übernimmt die Umsetzung — bitte im Thread als ✅ done markieren wenn erledigt.",
         thread_ts=thread_ts,
     )
+
+    if customer_name and PLANHAT_API_TOKEN:
+        ph_company = _planhat_search_company(customer_name, _debit_number_from_subscription(subscription))
+        if ph_company and ph_company.get('id'):
+            cb_sub_link = f"https://{CHARGEBEE_SITE}.chargebee.com/d/subscriptions/{sub_id}" if sub_id else ''
+            note_text = (
+                f"Vertragsanpassung manuell übernommen von {user_name}\n\n"
+                f"Plan: {_plan_display(old_plan)} → {_plan_display(new_plan_id)}\n"
+                f"Effective: {effective_date}\n"
+                + (f"Chargebee: {cb_sub_link}\n" if cb_sub_link else '')
+                + f'Slack-Thread: <a href="{slack_thread_link}">Thread öffnen</a>'
+            )
+            try:
+                requests.post(
+                    'https://api.planhat.com/conversations',
+                    headers={'Authorization': f'Bearer {PLANHAT_API_TOKEN}'},
+                    json={
+                        'subject': 'Vertragsanpassung',
+                        'description': note_text,
+                        'companyId': ph_company['id'],
+                        'type': 'note',
+                    },
+                    timeout=10,
+                )
+                logger.info(f"Planhat note created (manual take-over) for {customer_name} by {user_name}")
+            except Exception as e:
+                logger.warning(f"Planhat note failed (take-over): {e}")
+
     _va_pending_approval.pop((channel, thread_ts), None)
 
 
