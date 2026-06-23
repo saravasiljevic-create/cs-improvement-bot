@@ -7,9 +7,10 @@ import logging
 import os
 import re
 import socket
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
+import html as _html
 import requests
 
 from config import CS_ADMIN_USER_IDS
@@ -253,6 +254,11 @@ _ADDON_ADD_RE = re.compile(
     r'add[\s\-]?ons?\s+(?:hinzufügen?|dazunehmen?|add)[:\s]+([^\n;,]+)',
     re.IGNORECASE,
 )
+_PREPAID_ORDERS_RE = re.compile(
+    r'prepaid\s+(?:auftrag\s*s?\s*)?paket[:\s]+([0-9.,]+(?:\s*(?:k|tsd|tausend))?)'
+    r'(?:\s*\(([^)]+)\))?',
+    re.IGNORECASE,
+)
 _ADDON_REMOVE_RE = re.compile(
     r'add[\s\-]?ons?\s+(?:entfernen?|weg|remove|raus)[:\s]+([^\n;,]+)',
     re.IGNORECASE,
@@ -264,6 +270,7 @@ _TIER_CORRECTIONS = {250: 251, 500: 501, 30: 31, 0: 1}
 
 def parse_vertragsanpassung(text: str) -> dict:
     """Extrahiert strukturierte Felder aus einer Vertragsanpassungs-Anfrage im Freitext."""
+    text = _html.unescape(text)
     result: dict = {}
 
     def _clean_company_name(name: str) -> str:
@@ -417,6 +424,11 @@ def parse_vertragsanpassung(text: str) -> dict:
     m = _ADDON_REMOVE_RE.search(text)
     if m:
         result['addons_remove'] = m.group(1).strip()
+    m = _PREPAID_ORDERS_RE.search(text)
+    if m:
+        amount = m.group(1).strip()
+        freq = m.group(2).strip() if m.group(2) else ''
+        result['prepaid_orders'] = f"{amount}{(' / ' + freq) if freq else ''}"
 
     if re.search(r'\bdiscount\b|\brabatt\b|\bnachlass\b|\bgutschrift\b', text, re.IGNORECASE):
         result['has_discount'] = True
@@ -639,7 +651,12 @@ def fetch_offer_data(url: str) -> dict:
 def _ts_to_date(ts: int | None) -> str:
     if not ts:
         return ''
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%d.%m.%Y')
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo('Europe/Berlin')
+    except ImportError:
+        tz = timezone(timedelta(hours=2))
+    return datetime.fromtimestamp(ts, tz=tz).strftime('%d.%m.%Y')
 
 
 def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> list:
@@ -1253,6 +1270,8 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
         elif date_val == 'ASAP':
             date_val = 'Ab sofort / ASAP'
         soll_lines.append(f"• Vertragsbeginn: {date_val}")
+    if parsed.get('prepaid_orders'):
+        soll_lines.append(f"• Prepaid Auftrag Paket: *{parsed['prepaid_orders']}* _(Chargebee Add-On manuell prüfen)_")
     if parsed.get('addons_add'):
         soll_lines.append(f"• Add-Ons *hinzufügen:* {parsed['addons_add']}")
     if parsed.get('addons_remove'):

@@ -51,7 +51,7 @@ _CB_URL_RE = re.compile(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_BOT_VERSION = "v2.6"
+_BOT_VERSION = "v2.7"
 logger.info(f"Bot starting — version {_BOT_VERSION}")
 
 # Custom-Emoji für die VA-Zusammenfassung (Slack-Name ohne Doppelpunkte)
