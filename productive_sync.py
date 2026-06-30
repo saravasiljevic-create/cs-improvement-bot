@@ -1,8 +1,10 @@
 """
 Productive → Planhat daily sync.
 
-Fetches tracked hours and budget utilization per company from Productive
-and upserts them as metrics in Planhat.
+Fetches tracked hours (CSM/SC split) and budget utilization per company from Productive
+and upserts them as custom fields in Planhat.
+
+Data chain: time_entry → service → deal → company → Planhat ID
 
 Triggered via POST /productive-sync (called by Google Cloud Scheduler).
 """
@@ -25,6 +27,8 @@ PLANHAT_BASE_URL = 'https://api.planhat.com'
 CSM_TEAM_NAMES = {'CSM T1', 'CSM T2', 'CSM T3', 'CSM T4'}
 SC_TEAM_NAMES = {'Solution Consulting'}
 
+PRODUCTIVE_PLANHAT_ID_FIELD = '122091'  # Custom field "Planhat ID" in Productive
+
 
 def _productive_headers() -> dict:
     return {
@@ -39,7 +43,6 @@ def _planhat_headers() -> dict:
 
 
 def _fetch_all_pages(url: str, params: dict) -> list:
-    """Fetches all pages from a Productive API endpoint."""
     results = []
     page = 1
     while True:
@@ -47,24 +50,21 @@ def _fetch_all_pages(url: str, params: dict) -> list:
             url,
             headers=_productive_headers(),
             params={**params, 'page[number]': page, 'page[size]': 200},
-            timeout=30,
+            timeout=60,
         )
         resp.raise_for_status()
-        data = resp.json().get('data', [])
+        body = resp.json()
+        data = body.get('data', [])
         results.extend(data)
-        meta = resp.json().get('meta', {})
-        total_pages = meta.get('total_pages', 1)
+        total_pages = (body.get('meta') or {}).get('total_pages', 1)
         if page >= total_pages:
             break
         page += 1
     return results
 
 
-PRODUCTIVE_PLANHAT_ID_FIELD = '122091'  # Custom field "Planhat ID" in Productive
-
-
 def fetch_companies_with_planhat_id() -> dict:
-    """Returns {productive_company_id: planhat_company_id} for all companies that have a Planhat ID set."""
+    """Returns {productive_company_id: planhat_company_id}."""
     companies = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/companies', {})
     mapping = {}
     for c in companies:
@@ -73,25 +73,14 @@ def fetch_companies_with_planhat_id() -> dict:
         planhat_id = custom_fields.get(PRODUCTIVE_PLANHAT_ID_FIELD) or ''
         if planhat_id:
             mapping[c['id']] = str(planhat_id).strip()
-    logger.info(f"Productive: {len(mapping)} companies with Planhat ID found")
+    logger.info(f"Companies with Planhat ID: {len(mapping)}")
     return mapping
-
-
-def fetch_time_entries_for_period(after: str, before: str) -> list:
-    """Fetches all time entries for a given date range (YYYY-MM-DD)."""
-    return _fetch_all_pages(
-        f'{PRODUCTIVE_BASE_URL}/time_entries',
-        {
-            'filter[after]': after,
-            'filter[before]': before,
-        },
-    )
 
 
 def fetch_teams() -> dict:
     """Returns {team_id: team_name}."""
     teams = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/teams', {})
-    return {t['id']: t.get('attributes', {}).get('name', '') for t in teams}
+    return {t['id']: (t.get('attributes') or {}).get('name', '') for t in teams}
 
 
 def fetch_person_team_map(team_id_to_name: dict) -> dict:
@@ -99,9 +88,7 @@ def fetch_person_team_map(team_id_to_name: dict) -> dict:
     people = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/people', {})
     mapping = {}
     for person in people:
-        rels = person.get('relationships') or {}
-        team_data = (rels.get('team') or {}).get('data') or {}
-        team_id = team_data.get('id', '')
+        team_id = (((person.get('relationships') or {}).get('team') or {}).get('data') or {}).get('id', '')
         team_name = team_id_to_name.get(team_id, '')
         if team_name in CSM_TEAM_NAMES:
             mapping[person['id']] = 'csm'
@@ -112,75 +99,116 @@ def fetch_person_team_map(team_id_to_name: dict) -> dict:
     return mapping
 
 
-def fetch_deals() -> list:
-    """Fetches all deals (projects) including budget fields."""
-    return _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/deals', {})
+def fetch_service_to_deal_map() -> dict:
+    """Returns {service_id: deal_id} by fetching all services."""
+    services = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/services', {})
+    mapping = {}
+    for s in services:
+        deal_id = (((s.get('relationships') or {}).get('deal') or {}).get('data') or {}).get('id', '')
+        if deal_id:
+            mapping[s['id']] = deal_id
+    logger.info(f"Services mapped to deals: {len(mapping)}")
+    return mapping
 
 
-def aggregate_hours_by_company(time_entries: list, person_team_map: dict) -> dict:
-    """Returns {productive_company_id: {'csm': hours, 'sc': hours}}."""
-    totals = {}
-    for entry in time_entries:
-        attrs = entry.get('attributes') or {}
-        rels = entry.get('relationships') or {}
-        company_id = ((rels.get('company') or {}).get('data') or {}).get('id', '')
-        person_id = ((rels.get('person') or {}).get('data') or {}).get('id', '')
-        if not company_id:
-            continue
-        team_type = person_team_map.get(person_id)
-        if team_type not in ('csm', 'sc'):
-            continue
-        minutes = attrs.get('time', 0) or 0
-        if company_id not in totals:
-            totals[company_id] = {'csm': 0, 'sc': 0}
-        totals[company_id][team_type] += minutes
-    return {
-        cid: {k: round(v / 60, 2) for k, v in hours.items()}
-        for cid, hours in totals.items()
-    }
+def fetch_deal_to_company_map_and_budgets() -> tuple[dict, dict]:
+    """
+    Returns:
+      deal_to_company: {deal_id: company_id}
+      budget_by_company: {company_id: budget_utilization_pct}  (aggregated across all deals)
+    """
+    deals = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/deals', {})
+    deal_to_company = {}
+    company_budgets = {}  # {company_id: [used, total]}
 
-
-def aggregate_budget_utilization_by_company(deals: list) -> dict:
-    """Returns {productive_company_id: budget_utilization_pct}."""
-    company_budget = {}  # {company_id: [budget_used, budget_total]}
     for deal in deals:
         attrs = deal.get('attributes') or {}
         rels = deal.get('relationships') or {}
         company_id = ((rels.get('company') or {}).get('data') or {}).get('id', '')
         if not company_id:
             continue
-        budget_total = attrs.get('budget', 0) or 0
-        budget_used = attrs.get('budget_spent', 0) or 0
-        if budget_total <= 0:
-            continue
-        if company_id not in company_budget:
-            company_budget[company_id] = [0, 0]
-        company_budget[company_id][0] += budget_used
-        company_budget[company_id][1] += budget_total
 
-    result = {}
-    for cid, (used, total) in company_budget.items():
+        deal_to_company[deal['id']] = company_id
+
+        # budget_total and budget_used are in cents (or the API's currency unit)
+        budget_total = attrs.get('budget_total') or 0
+        budget_used = attrs.get('budget_used') or 0
+
+        if budget_total > 0:
+            if company_id not in company_budgets:
+                company_budgets[company_id] = [0, 0]
+            company_budgets[company_id][0] += budget_used
+            company_budgets[company_id][1] += budget_total
+
+    budget_by_company = {}
+    for cid, (used, total) in company_budgets.items():
         if total > 0:
-            result[cid] = round((used / total) * 100, 1)
-    return result
+            budget_by_company[cid] = round((used / total) * 100, 1)
 
+    logger.info(f"Deals mapped to companies: {len(deal_to_company)}, companies with budget: {len(budget_by_company)}")
+    return deal_to_company, budget_by_company
+
+
+def fetch_time_entries_for_period(after: str, before: str) -> list:
+    return _fetch_all_pages(
+        f'{PRODUCTIVE_BASE_URL}/time_entries',
+        {'filter[after]': after, 'filter[before]': before},
+    )
+
+
+def aggregate_hours_by_company(
+    time_entries: list,
+    person_team_map: dict,
+    service_to_deal: dict,
+    deal_to_company: dict,
+) -> dict:
+    """Returns {company_id: {'csm': hours, 'sc': hours}}."""
+    totals = {}
+    skipped = 0
+    for entry in time_entries:
+        attrs = entry.get('attributes') or {}
+        rels = entry.get('relationships') or {}
+
+        person_id = ((rels.get('person') or {}).get('data') or {}).get('id', '')
+        service_id = ((rels.get('service') or {}).get('data') or {}).get('id', '')
+
+        team_type = person_team_map.get(person_id)
+        if team_type not in ('csm', 'sc'):
+            continue
+
+        deal_id = service_to_deal.get(service_id, '')
+        company_id = deal_to_company.get(deal_id, '') if deal_id else ''
+
+        if not company_id:
+            skipped += 1
+            continue
+
+        minutes = attrs.get('time', 0) or 0
+        if company_id not in totals:
+            totals[company_id] = {'csm': 0, 'sc': 0}
+        totals[company_id][team_type] += minutes
+
+    if skipped:
+        logger.info(f"Time entries skipped (no company chain): {skipped}")
+
+    return {
+        cid: {k: round(v / 60, 2) for k, v in hours.items()}
+        for cid, hours in totals.items()
+    }
 
 
 def run_productive_sync() -> dict:
-    """Main sync function. Returns a summary dict."""
     if not PRODUCTIVE_API_TOKEN or not PRODUCTIVE_ORG_ID:
-        logger.error("PRODUCTIVE_API_TOKEN or PRODUCTIVE_ORG_ID not set — skipping sync")
+        logger.error("PRODUCTIVE_API_TOKEN or PRODUCTIVE_ORG_ID not set")
         return {'error': 'missing credentials'}
     if not PLANHAT_API_TOKEN:
-        logger.error("PLANHAT_API_TOKEN not set — skipping sync")
+        logger.error("PLANHAT_API_TOKEN not set")
         return {'error': 'missing planhat token'}
 
     today = date.today()
     yesterday = today - timedelta(days=1)
-    # Sync current month from day 1 to yesterday — gives Planhat fresh running totals daily
     period_start = today.replace(day=1).isoformat()
     period_end = yesterday.isoformat()
-    metric_date = yesterday.isoformat()
 
     logger.info(f"Productive sync: {period_start} → {period_end}")
 
@@ -188,31 +216,42 @@ def run_productive_sync() -> dict:
         company_map = fetch_companies_with_planhat_id()
         team_id_to_name = fetch_teams()
         person_team_map = fetch_person_team_map(team_id_to_name)
+        service_to_deal = fetch_service_to_deal_map()
+        deal_to_company, budget_by_company = fetch_deal_to_company_map_and_budgets()
         time_entries = fetch_time_entries_for_period(period_start, period_end)
-        deals = fetch_deals()
     except Exception as e:
         logger.exception("Productive API fetch failed")
         return {'error': str(e)}
 
-    hours_by_company = aggregate_hours_by_company(time_entries, person_team_map)
-    budget_by_company = aggregate_budget_utilization_by_company(deals)
+    logger.info(f"Time entries fetched: {len(time_entries)}")
+
+    hours_by_company = aggregate_hours_by_company(
+        time_entries, person_team_map, service_to_deal, deal_to_company
+    )
+
+    logger.info(f"Companies with hours: {len(hours_by_company)}, companies with budget: {len(budget_by_company)}")
 
     synced = 0
     errors = 0
+    skipped_no_data = 0
 
     for productive_id, planhat_id in company_map.items():
         hours = hours_by_company.get(productive_id, {})
         budget_pct = budget_by_company.get(productive_id)
 
         updates = {}
-        if hours.get('csm') is not None:
-            updates['Productive: CSM Hours'] = hours['csm']
-        if hours.get('sc') is not None:
-            updates['Productive: SC Hours'] = hours['sc']
+        csm_h = hours.get('csm', 0)
+        sc_h = hours.get('sc', 0)
+
+        # Always write hours if there are any CSM/SC entries for this company
+        if productive_id in hours_by_company:
+            updates['Productive: CSM Hours'] = csm_h
+            updates['Productive: SC Hours'] = sc_h
         if budget_pct is not None:
             updates['Productive: Budget Utilization %'] = budget_pct
 
         if not updates:
+            skipped_no_data += 1
             continue
 
         resp = requests.patch(
@@ -230,7 +269,10 @@ def run_productive_sync() -> dict:
     summary = {
         'period': f"{period_start} → {period_end}",
         'companies_mapped': len(company_map),
+        'companies_with_hours': len(hours_by_company),
+        'companies_with_budget': len(budget_by_company),
         'synced': synced,
+        'skipped_no_data': skipped_no_data,
         'errors': errors,
     }
     logger.info(f"Productive sync done: {summary}")
