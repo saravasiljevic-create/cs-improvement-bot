@@ -105,7 +105,7 @@ def fetch_person_team_map(team_id_to_name: dict) -> dict:
 
 def fetch_service_to_deal_map() -> dict:
     """Returns {service_id: deal_id} by fetching all services."""
-    services = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/services', {})
+    services = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/services', {'include': 'deal'})
     mapping = {}
     for s in services:
         deal_id = (((s.get('relationships') or {}).get('deal') or {}).get('data') or {}).get('id', '')
