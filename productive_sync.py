@@ -60,6 +60,9 @@ def _fetch_all_pages(url: str, params: dict) -> list:
     return results
 
 
+PRODUCTIVE_PLANHAT_ID_FIELD = '122091'  # Custom field "Planhat ID" in Productive
+
+
 def fetch_companies_with_planhat_id() -> dict:
     """Returns {productive_company_id: planhat_company_id} for all companies that have a Planhat ID set."""
     companies = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/companies', {})
@@ -67,7 +70,7 @@ def fetch_companies_with_planhat_id() -> dict:
     for c in companies:
         attrs = c.get('attributes') or {}
         custom_fields = attrs.get('custom_fields') or {}
-        planhat_id = custom_fields.get('planhat_id') or attrs.get('planhat_id') or ''
+        planhat_id = custom_fields.get(PRODUCTIVE_PLANHAT_ID_FIELD) or ''
         if planhat_id:
             mapping[c['id']] = str(planhat_id).strip()
     logger.info(f"Productive: {len(mapping)} companies with Planhat ID found")
