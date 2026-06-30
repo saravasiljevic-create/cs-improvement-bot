@@ -159,7 +159,7 @@ def fetch_deal_to_company_map_and_budgets() -> tuple[dict, dict]:
 def fetch_time_entries_for_period(after: str, before: str) -> list:
     return _fetch_all_pages(
         f'{PRODUCTIVE_BASE_URL}/time_entries',
-        {'filter[after]': after, 'filter[before]': before},
+        {'filter[after]': after, 'filter[before]': before, 'include': 'person,service'},
     )
 
 
