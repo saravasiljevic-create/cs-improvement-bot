@@ -85,17 +85,21 @@ def fetch_teams() -> dict:
 
 def fetch_person_team_map(team_id_to_name: dict) -> dict:
     """Returns {person_id: 'csm' | 'sc' | None}."""
-    people = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/people', {})
+    people = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/people', {'include': 'teams'})
     mapping = {}
     for person in people:
-        team_id = (((person.get('relationships') or {}).get('team') or {}).get('data') or {}).get('id', '')
-        team_name = team_id_to_name.get(team_id, '')
-        if team_name in CSM_TEAM_NAMES:
-            mapping[person['id']] = 'csm'
-        elif team_name in SC_TEAM_NAMES:
-            mapping[person['id']] = 'sc'
-        else:
-            mapping[person['id']] = None
+        # 'teams' is plural and an array — a person can belong to multiple teams
+        teams_data = ((person.get('relationships') or {}).get('teams') or {}).get('data') or []
+        person_type = None
+        for team_ref in teams_data:
+            team_name = team_id_to_name.get(team_ref.get('id', ''), '')
+            if team_name in CSM_TEAM_NAMES:
+                person_type = 'csm'
+                break
+            elif team_name in SC_TEAM_NAMES:
+                person_type = 'sc'
+                break
+        mapping[person['id']] = person_type
     return mapping
 
 
