@@ -2492,6 +2492,18 @@ def health():
     return "OK", 200
 
 
+@flask_app.route("/productive-sync", methods=["POST"])
+def productive_sync_endpoint():
+    from productive_sync import run_productive_sync
+    import json
+    try:
+        summary = run_productive_sync()
+        return json.dumps(summary), 200, {'Content-Type': 'application/json'}
+    except Exception as e:
+        logger.exception("Productive sync failed")
+        return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting CS Improvement Bot on port {port}...")
