@@ -257,7 +257,7 @@ def run_productive_sync() -> dict:
             skipped_no_data += 1
             continue
 
-        resp = requests.patch(
+        resp = requests.put(
             f'{PLANHAT_BASE_URL}/companies/{planhat_id}',
             headers=_planhat_headers(),
             json={'custom': updates},
