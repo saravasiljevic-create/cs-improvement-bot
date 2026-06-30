@@ -116,10 +116,13 @@ def fetch_deal_to_company_map_and_budgets() -> tuple[dict, dict]:
     Returns:
       deal_to_company: {deal_id: company_id}
       budget_by_company: {company_id: budget_utilization_pct}  (aggregated across all deals)
+
+    Budget is time-based: worked_time / budgeted_time * 100.
+    Requires include=company to get company ID from deal relationship.
     """
-    deals = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/deals', {})
+    deals = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/deals', {'include': 'company'})
     deal_to_company = {}
-    company_budgets = {}  # {company_id: [used, total]}
+    company_budgets = {}  # {company_id: [worked_minutes, budgeted_minutes]}
 
     for deal in deals:
         attrs = deal.get('attributes') or {}
@@ -130,20 +133,20 @@ def fetch_deal_to_company_map_and_budgets() -> tuple[dict, dict]:
 
         deal_to_company[deal['id']] = company_id
 
-        # budget_total and budget_used are in cents (or the API's currency unit)
-        budget_total = attrs.get('budget_total') or 0
-        budget_used = attrs.get('budget_used') or 0
+        # Use time-based budget: budgeted_time (planned) vs worked_time (actual), both in minutes
+        budgeted_time = attrs.get('budgeted_time') or 0
+        worked_time = attrs.get('worked_time') or 0
 
-        if budget_total > 0:
+        if budgeted_time > 0:
             if company_id not in company_budgets:
                 company_budgets[company_id] = [0, 0]
-            company_budgets[company_id][0] += budget_used
-            company_budgets[company_id][1] += budget_total
+            company_budgets[company_id][0] += worked_time
+            company_budgets[company_id][1] += budgeted_time
 
     budget_by_company = {}
-    for cid, (used, total) in company_budgets.items():
-        if total > 0:
-            budget_by_company[cid] = round((used / total) * 100, 1)
+    for cid, (worked, budgeted) in company_budgets.items():
+        if budgeted > 0:
+            budget_by_company[cid] = round((worked / budgeted) * 100, 1)
 
     logger.info(f"Deals mapped to companies: {len(deal_to_company)}, companies with budget: {len(budget_by_company)}")
     return deal_to_company, budget_by_company
