@@ -15,8 +15,8 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-PRODUCTIVE_API_TOKEN = os.environ.get('PRODUCTIVE_API_TOKEN', '')
-PRODUCTIVE_ORG_ID = os.environ.get('PRODUCTIVE_ORG_ID', '')
+PRODUCTIVE_API_TOKEN = os.environ.get('PRODUCTIVE_API_TOKEN', '').strip()
+PRODUCTIVE_ORG_ID = os.environ.get('PRODUCTIVE_ORG_ID', '').strip()
 PRODUCTIVE_BASE_URL = 'https://api.productive.io/api/v2'
 
 PLANHAT_API_TOKEN = os.environ.get('PLANHAT_API_KEY', '') or os.environ.get('PLANHAT_API_TOKEN', '')
@@ -28,7 +28,7 @@ SC_TEAM_NAMES = {'Solution Consulting'}
 
 def _productive_headers() -> dict:
     return {
-        'Authorization': f'Bearer {PRODUCTIVE_API_TOKEN}',
+        'X-Auth-Token': PRODUCTIVE_API_TOKEN,
         'X-Organization-Id': PRODUCTIVE_ORG_ID,
         'Content-Type': 'application/vnd.api+json',
     }
