@@ -65,10 +65,11 @@ def fetch_companies_with_planhat_id() -> dict:
     companies = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/companies', {})
     mapping = {}
     for c in companies:
-        attrs = c.get('attributes', {})
-        planhat_id = attrs.get('custom_fields', {}).get('planhat_id') or attrs.get('planhat_id', '')
+        attrs = c.get('attributes') or {}
+        custom_fields = attrs.get('custom_fields') or {}
+        planhat_id = custom_fields.get('planhat_id') or attrs.get('planhat_id') or ''
         if planhat_id:
-            mapping[c['id']] = planhat_id.strip()
+            mapping[c['id']] = str(planhat_id).strip()
     logger.info(f"Productive: {len(mapping)} companies with Planhat ID found")
     return mapping
 
@@ -95,12 +96,9 @@ def fetch_person_team_map(team_id_to_name: dict) -> dict:
     people = _fetch_all_pages(f'{PRODUCTIVE_BASE_URL}/people', {})
     mapping = {}
     for person in people:
-        team_id = (
-            person.get('relationships', {})
-            .get('team', {})
-            .get('data', {})
-            .get('id', '')
-        )
+        rels = person.get('relationships') or {}
+        team_data = (rels.get('team') or {}).get('data') or {}
+        team_id = team_data.get('id', '')
         team_name = team_id_to_name.get(team_id, '')
         if team_name in CSM_TEAM_NAMES:
             mapping[person['id']] = 'csm'
@@ -120,10 +118,10 @@ def aggregate_hours_by_company(time_entries: list, person_team_map: dict) -> dic
     """Returns {productive_company_id: {'csm': hours, 'sc': hours}}."""
     totals = {}
     for entry in time_entries:
-        attrs = entry.get('attributes', {})
-        rels = entry.get('relationships', {})
-        company_id = rels.get('company', {}).get('data', {}).get('id', '')
-        person_id = rels.get('person', {}).get('data', {}).get('id', '')
+        attrs = entry.get('attributes') or {}
+        rels = entry.get('relationships') or {}
+        company_id = ((rels.get('company') or {}).get('data') or {}).get('id', '')
+        person_id = ((rels.get('person') or {}).get('data') or {}).get('id', '')
         if not company_id:
             continue
         team_type = person_team_map.get(person_id)
@@ -143,13 +141,9 @@ def aggregate_budget_utilization_by_company(deals: list) -> dict:
     """Returns {productive_company_id: budget_utilization_pct}."""
     company_budget = {}  # {company_id: [budget_used, budget_total]}
     for deal in deals:
-        attrs = deal.get('attributes', {})
-        company_id = (
-            deal.get('relationships', {})
-            .get('company', {})
-            .get('data', {})
-            .get('id', '')
-        )
+        attrs = deal.get('attributes') or {}
+        rels = deal.get('relationships') or {}
+        company_id = ((rels.get('company') or {}).get('data') or {}).get('id', '')
         if not company_id:
             continue
         budget_total = attrs.get('budget', 0) or 0
