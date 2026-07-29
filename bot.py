@@ -1031,6 +1031,100 @@ def _handle_message_core(event, say, client):
                 )
             return
 
+        # --- Admin-Befehle zuerst prüfen (vor allen State-Checks) ---
+        if '#bot-stop' in text.lower():
+            if user_id not in CS_ADMIN_USER_IDS:
+                say(text=":no_entry: `#bot-stop` kann nur vom CS Admin Team genutzt werden.", thread_ts=thread_ts)
+                return
+
+            jira_key = _created_tickets.get((channel, thread_ts))
+            if not jira_key:
+                try:
+                    replies = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
+                    for msg in replies.get('messages', []):
+                        m = JIRA_KEY_RE.search((msg.get('text') or '').upper())
+                        if m:
+                            jira_key = m.group(1)
+                            break
+                except Exception as e:
+                    logger.warning(f"#bot-stop thread scan failed: {e}")
+
+            deleted_ticket = None
+            if jira_key:
+                try:
+                    result = delete_ticket(jira_key)
+                    deleted_ticket = result.get('summary', jira_key)
+                except Exception as e:
+                    logger.warning(f"#bot-stop: ticket delete {jira_key} failed: {e}")
+
+            for emoji in ('eyes', 'white_check_mark', 'x', VA_DONE_EMOJI):
+                try:
+                    client.reactions_remove(channel=channel, name=emoji, timestamp=thread_ts)
+                except Exception:
+                    pass
+
+            _pending.pop((channel, thread_ts), None)
+            _ticket_data.pop((channel, thread_ts), None)
+            _similar_shown.pop((channel, thread_ts), None)
+            _pending_vertragsanpassung.pop((channel, thread_ts), None)
+            _va_pending_approval.pop((channel, thread_ts), None)
+            _created_tickets.pop((channel, thread_ts), None)
+            _muted_threads.add((channel, thread_ts))
+
+            parts = [":mute: Thread stummgeschaltet — der Bot antwortet hier nicht mehr."]
+            if deleted_ticket:
+                parts.append(f":wastebasket: Ticket *{jira_key}* ({deleted_ticket}) gelöscht.")
+            say(text='\n'.join(parts), thread_ts=thread_ts)
+            return
+
+        if '#bot-remove' in text.lower():
+            if user_id not in CS_ADMIN_USER_IDS:
+                say(text=":no_entry: `#bot-remove` kann nur vom CS Admin Team genutzt werden.", thread_ts=thread_ts)
+                return
+
+            jira_match = JIRA_KEY_RE.search(text.upper())
+            is_delete = bool(re.search(r'\bdelete\b', text, re.IGNORECASE))
+
+            if jira_match:
+                issue_key = jira_match.group(1)
+                if is_delete:
+                    try:
+                        result = delete_ticket(issue_key)
+                        say(
+                            text=f":wastebasket: Ticket *{issue_key}* (__{result.get('summary', '')}__) wurde gelöscht.",
+                            thread_ts=thread_ts,
+                        )
+                    except Exception as e:
+                        say(text=f":x: Ticket `{issue_key}` konnte nicht gelöscht werden: {str(e)}", thread_ts=thread_ts)
+                else:
+                    try:
+                        result = remove_vote(issue_key)
+                        parts = []
+                        if result.get('vote_removed'):
+                            parts.append("Vote entfernt")
+                        if result.get('comment_removed'):
+                            parts.append("Upvote-Kommentar gelöscht")
+                        if parts:
+                            summary = result.get('summary', issue_key)
+                            say(text=f":broom: *{issue_key}* ({summary}): {', '.join(parts)}.", thread_ts=thread_ts)
+                        else:
+                            say(text=f":broom: Kein Bot-Upvote auf `{issue_key}` gefunden.", thread_ts=thread_ts)
+                    except Exception as e:
+                        say(text=f":x: Fehler bei `{issue_key}`: {str(e)}", thread_ts=thread_ts)
+            else:
+                removed = []
+                for emoji in ('eyes', 'white_check_mark', 'x', VA_DONE_EMOJI):
+                    try:
+                        client.reactions_remove(channel=channel, name=emoji, timestamp=thread_ts)
+                        removed.append(f":{emoji}:")
+                    except Exception:
+                        pass
+                if removed:
+                    say(text=f":broom: Reaktionen entfernt: {' '.join(removed)}", thread_ts=thread_ts)
+                else:
+                    say(text=":broom: Keine eigenen Reaktionen auf der Nachricht gefunden.", thread_ts=thread_ts)
+            return
+
         # --- Planhat-Link als Antwort auf _ask_for_planhat_link ---
         # Auch ohne aktiven State reagieren (Bot-Neustart löscht State)
         ph_pending = _pending_planhat_link.get((channel, thread_ts))
@@ -1325,110 +1419,6 @@ def _handle_message_core(event, say, client):
                     )
             except Exception as e:
                 say(text=f":warning: Planhat-Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
-            return
-
-        # --- Admin-Befehl: #bot-stop — Thread stummschalten + Ticket löschen ---
-        if '#bot-stop' in text.lower():
-            if user_id not in CS_ADMIN_USER_IDS:
-                say(text=":no_entry: `#bot-stop` kann nur vom CS Admin Team genutzt werden.", thread_ts=thread_ts)
-                return
-
-            # Jira-Ticket suchen: 1. in-memory, 2. Thread-Nachrichten scannen
-            jira_key = _created_tickets.get((channel, thread_ts))
-            if not jira_key:
-                try:
-                    replies = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
-                    for msg in replies.get('messages', []):
-                        m = JIRA_KEY_RE.search((msg.get('text') or '').upper())
-                        if m:
-                            jira_key = m.group(1)
-                            break
-                except Exception as e:
-                    logger.warning(f"#bot-stop thread scan failed: {e}")
-
-            deleted_ticket = None
-            if jira_key:
-                try:
-                    result = delete_ticket(jira_key)
-                    deleted_ticket = result.get('summary', jira_key)
-                except Exception as e:
-                    logger.warning(f"#bot-stop: ticket delete {jira_key} failed: {e}")
-
-            # Bot-Reaktionen entfernen
-            for emoji in ('eyes', 'white_check_mark', 'x', VA_DONE_EMOJI):
-                try:
-                    client.reactions_remove(channel=channel, name=emoji, timestamp=thread_ts)
-                except Exception:
-                    pass
-
-            # Alle States für diesen Thread leeren
-            _pending.pop((channel, thread_ts), None)
-            _ticket_data.pop((channel, thread_ts), None)
-            _similar_shown.pop((channel, thread_ts), None)
-            _pending_vertragsanpassung.pop((channel, thread_ts), None)
-            _va_pending_approval.pop((channel, thread_ts), None)
-            _created_tickets.pop((channel, thread_ts), None)
-
-            # Thread stummschalten
-            _muted_threads.add((channel, thread_ts))
-
-            parts = [":mute: Thread stummgeschaltet — der Bot antwortet hier nicht mehr."]
-            if deleted_ticket:
-                parts.append(f":wastebasket: Ticket *{jira_key}* ({deleted_ticket}) gelöscht.")
-            say(text='\n'.join(parts), thread_ts=thread_ts)
-            return
-
-        # --- Admin-Befehl: #bot-remove [delete] [JIRA-KEY] ---
-        if '#bot-remove' in text.lower():
-            if user_id not in CS_ADMIN_USER_IDS:
-                say(text=":no_entry: `#bot-remove` kann nur vom CS Admin Team genutzt werden.", thread_ts=thread_ts)
-                return
-
-            # Jira-Key im Text suchen (z.B. CS-123)
-            jira_match = JIRA_KEY_RE.search(text.upper())
-            is_delete = bool(re.search(r'\bdelete\b', text, re.IGNORECASE))
-
-            if jira_match:
-                issue_key = jira_match.group(1)
-                if is_delete:
-                    # Ticket löschen
-                    try:
-                        result = delete_ticket(issue_key)
-                        say(
-                            text=f":wastebasket: Ticket *{issue_key}* (__{result.get('summary', '')}__) wurde gelöscht.",
-                            thread_ts=thread_ts,
-                        )
-                    except Exception as e:
-                        say(text=f":x: Ticket `{issue_key}` konnte nicht gelöscht werden: {str(e)}", thread_ts=thread_ts)
-                else:
-                    # Upvote (Vote + Kommentar) entfernen
-                    try:
-                        result = remove_vote(issue_key)
-                        parts = []
-                        if result.get('vote_removed'):
-                            parts.append("Vote entfernt")
-                        if result.get('comment_removed'):
-                            parts.append("Upvote-Kommentar gelöscht")
-                        if parts:
-                            summary = result.get('summary', issue_key)
-                            say(text=f":broom: *{issue_key}* ({summary}): {', '.join(parts)}.", thread_ts=thread_ts)
-                        else:
-                            say(text=f":broom: Kein Bot-Upvote auf `{issue_key}` gefunden.", thread_ts=thread_ts)
-                    except Exception as e:
-                        say(text=f":x: Fehler bei `{issue_key}`: {str(e)}", thread_ts=thread_ts)
-            else:
-                # Kein Jira-Key → Bot-Reaktionen von Root-Nachricht entfernen
-                removed = []
-                for emoji in ('eyes', 'white_check_mark', 'x', VA_DONE_EMOJI):
-                    try:
-                        client.reactions_remove(channel=channel, name=emoji, timestamp=thread_ts)
-                        removed.append(f":{emoji}:")
-                    except Exception:
-                        pass
-                if removed:
-                    say(text=f":broom: Reaktionen entfernt: {' '.join(removed)}", thread_ts=thread_ts)
-                else:
-                    say(text=":broom: Keine eigenen Reaktionen auf der Nachricht gefunden.", thread_ts=thread_ts)
             return
 
         # --- Vertragsanpassung: manual thread trigger (CS Admin only) ---
