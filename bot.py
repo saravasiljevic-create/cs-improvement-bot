@@ -1250,14 +1250,22 @@ def _handle_message_core(event, say, client):
 
         # --- Vertragsanpassung: follow-up to pending state ---
         if va_state and (va_state.get('user_id') == user_id or user_id in CS_ADMIN_USER_IDS):
-            new_parsed = _enrich_from_offer(parse_vertragsanpassung(text))
+            # Only parse text — no URL fetch here (avoids duplicate error messages from thread replies)
+            new_parsed = parse_vertragsanpassung(text)
             # Merge: only fill empty fields from the follow-up reply
+            changed = False
             for k, v in new_parsed.items():
                 if v and not va_state['parsed'].get(k):
                     va_state['parsed'][k] = v
+                    changed = True
             # Try Chargebee lookup now if customer_name just became available
             if not va_state.get('subscription') and va_state['parsed'].get('customer_name'):
                 va_state['subscription'] = _cb_lookup(va_state['parsed']['customer_name'])
+                if va_state['subscription']:
+                    changed = True
+            if not changed:
+                # Nothing new found — stay silent, don't repeat the dropdown
+                return
             missing = missing_va_fields(va_state['parsed'])
             if missing:
                 say(
