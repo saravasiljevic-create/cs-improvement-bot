@@ -2149,7 +2149,8 @@ def handle_va_select_service_package(ack, body, say, client):
     ack()
     user_id = body.get('user', {}).get('id', '')
     selected = body.get('actions', [{}])[0].get('selected_option', {}).get('value', '')
-    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    msg_ts = body.get('message', {}).get('ts', '')
+    thread_ts = body.get('message', {}).get('thread_ts') or msg_ts
     channel = body.get('channel', {}).get('id', '')
     if not selected or not thread_ts:
         return
@@ -2169,11 +2170,11 @@ def handle_va_select_service_package(ack, body, say, client):
             state['parsed']['chargebee_plan_id'] = pid
     missing = missing_va_fields(state['parsed'])
     if missing:
-        say(
-            blocks=ask_for_va_info_blocks(user_id, missing, state['parsed'], state.get('subscription')),
-            text="Weitere Infos benötigt",
-            thread_ts=thread_ts,
-        )
+        new_blocks = ask_for_va_info_blocks(user_id, missing, state['parsed'], state.get('subscription'))
+        try:
+            client.chat_update(channel=channel, ts=msg_ts, blocks=new_blocks, text="Weitere Infos benötigt")
+        except Exception:
+            say(blocks=new_blocks, text="Weitere Infos benötigt", thread_ts=thread_ts)
     else:
         _process_vertragsanpassung(say, client, channel, thread_ts,
                                     state['user_name'], state['parsed'], state.get('subscription'))
@@ -2185,7 +2186,8 @@ def handle_va_select_plan(ack, body, say, client):
     ack()
     user_id = body.get('user', {}).get('id', '')
     selected = body.get('actions', [{}])[0].get('selected_option', {}).get('value', '')
-    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    msg_ts = body.get('message', {}).get('ts', '')
+    thread_ts = body.get('message', {}).get('thread_ts') or msg_ts
     channel = body.get('channel', {}).get('id', '')
     if not selected or not thread_ts:
         return
@@ -2202,11 +2204,11 @@ def handle_va_select_plan(ack, body, say, client):
         state['parsed']['payment_type'] = payment.strip()
     missing = missing_va_fields(state['parsed'])
     if missing:
-        say(
-            blocks=ask_for_va_info_blocks(user_id, missing, state['parsed'], state.get('subscription')),
-            text="Weitere Infos benötigt",
-            thread_ts=thread_ts,
-        )
+        new_blocks = ask_for_va_info_blocks(user_id, missing, state['parsed'], state.get('subscription'))
+        try:
+            client.chat_update(channel=channel, ts=msg_ts, blocks=new_blocks, text="Weitere Infos benötigt")
+        except Exception:
+            say(blocks=new_blocks, text="Weitere Infos benötigt", thread_ts=thread_ts)
     else:
         _process_vertragsanpassung(say, client, channel, thread_ts,
                                     state['user_name'], state['parsed'], state.get('subscription'))
