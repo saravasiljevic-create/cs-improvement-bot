@@ -2469,9 +2469,9 @@ def handle_reaction_added(event, say, client):
 
     logger.info(f"Reaction {reaction!r} by {user_name} ({user_id}) on {channel}/{ts}")
 
-    # 👀 auf die Nachricht setzen damit CS Admin es direkt sieht
+    # 🚨 auf die Nachricht setzen damit CS Admin es direkt sieht
     try:
-        client.reactions_add(channel=channel, name='eyes', timestamp=ts)
+        client.reactions_add(channel=channel, name='rotating_light', timestamp=ts)
     except Exception:
         pass  # Bereits gesetzt oder kein Zugriff — kein Problem
 
