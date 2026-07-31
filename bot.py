@@ -2469,13 +2469,24 @@ def handle_reaction_added(event, say, client):
 
     logger.info(f"Reaction {reaction!r} by {user_name} ({user_id}) on {channel}/{ts}")
 
-    say(
-        text=(
-            f"{admin_mentions} — <@{user_id}> hat mit {emoji} auf diese Nachricht reagiert.\n"
-            "Bitte prüfen und ggf. übernehmen."
-        ),
-        thread_ts=ts,
-    )
+    # 👀 auf die Nachricht setzen damit CS Admin es direkt sieht
+    try:
+        client.reactions_add(channel=channel, name='eyes', timestamp=ts)
+    except Exception:
+        pass  # Bereits gesetzt oder kein Zugriff — kein Problem
+
+    # Explizit mit channel= posten (say() kennt den Channel in reaction_added nicht immer)
+    try:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=ts,
+            text=(
+                f"{admin_mentions} — <@{user_id}> hat mit {emoji} auf diese Nachricht reagiert.\n"
+                "Bitte prüfen und ggf. übernehmen."
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"reaction_added notify failed: {e}")
 
 
 # ---------------------------------------------------------------------------
