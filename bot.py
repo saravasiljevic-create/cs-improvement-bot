@@ -2515,6 +2515,18 @@ def productive_sync_endpoint():
         return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
 
 
+@flask_app.route("/opos-sperrpruefung", methods=["POST"])
+def opos_sperrpruefung_endpoint():
+    from opos_handler import run_opos_check
+    import json
+    try:
+        summary = run_opos_check()
+        return json.dumps(summary), 200, {'Content-Type': 'application/json'}
+    except Exception as e:
+        logger.exception("OPOS-Sperrprüfung failed")
+        return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting CS Improvement Bot on port {port}...")

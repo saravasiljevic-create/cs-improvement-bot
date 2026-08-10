@@ -30,6 +30,13 @@ CS_ADMIN_USER_IDS: set[str] = set(
     os.environ.get('CS_ADMIN_USER_IDS', _DEFAULT_ADMIN_IDS).split(',')
 )
 
+# OPOS-Sperrprüfung-Flow (Freitag-Job, ausgelöst via Cloud Scheduler → /opos-sperrpruefung)
+ZENDESK_API_TOKEN = os.environ.get('ZENDESK_API_TOKEN', '')
+ZENDESK_SUBDOMAIN = os.environ.get('ZENDESK_SUBDOMAIN', 'xentral')
+ZENDESK_EMAIL = os.environ.get('ZENDESK_EMAIL', 'sara.vasiljevic@xentral.com')
+OPOS_CHANNEL_ID = os.environ.get('OPOS_CHANNEL_ID', 'C0BN9JM83ED')  # #opos-instance-blocking
+OPOS_STATE_BUCKET = os.environ.get('OPOS_STATE_BUCKET', 'cs-admin-bot-opos-state')
+
 required_credentials = {
     'SLACK_BOT_TOKEN': SLACK_BOT_TOKEN,
     'SLACK_SIGNING_SECRET': SLACK_SIGNING_SECRET,
