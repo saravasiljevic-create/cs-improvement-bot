@@ -1723,6 +1723,16 @@ def _handle_message_core(event, say, client):
     # --- Vertragsanpassung: auto-detection (only in VA channel) ---
     if _in_va and detect_vertragsanpassung(text):
         _set_eyes(client, channel, ts)
+        # CS Admin Team direkt taggen damit keine Anfrage untergeht
+        _admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
+        try:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=ts,
+                text=f":bell: {_admin_mentions} — neue Vertragsanpassungs-Anfrage erkannt, bitte prüfen.",
+            )
+        except Exception:
+            pass
         parsed = _enrich_from_offer(parse_vertragsanpassung(text))
         if parsed.get('offer_fetch_failed'):
             say(
