@@ -1723,16 +1723,6 @@ def _handle_message_core(event, say, client):
     # --- Vertragsanpassung: auto-detection (only in VA channel) ---
     if _in_va and detect_vertragsanpassung(text):
         _set_eyes(client, channel, ts)
-        # CS Admin Team direkt taggen damit keine Anfrage untergeht
-        _admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
-        try:
-            client.chat_postMessage(
-                channel=channel,
-                thread_ts=ts,
-                text=f":bell: {_admin_mentions} — neue Vertragsanpassungs-Anfrage erkannt, bitte prüfen.",
-            )
-        except Exception:
-            pass
         parsed = _enrich_from_offer(parse_vertragsanpassung(text))
         if parsed.get('offer_fetch_failed'):
             say(
@@ -2479,11 +2469,28 @@ def handle_reaction_added(event, say, client):
 
     logger.info(f"Reaction {reaction!r} by {user_name} ({user_id}) on {channel}/{ts}")
 
+    # Prüfen ob bereits ein CS Admin mit 👀 reagiert hat
+    admin_already_watching = False
+    try:
+        rx = client.reactions_get(channel=channel, timestamp=ts, full=True)
+        msg_reactions = rx.get('message', {}).get('reactions', [])
+        for r in msg_reactions:
+            if r.get('name') == 'eyes':
+                if any(u in CS_ADMIN_USER_IDS for u in r.get('users', [])):
+                    admin_already_watching = True
+                    break
+    except Exception:
+        pass
+
+    if admin_already_watching:
+        # CS Admin hat bereits 👀 gesetzt — kein Alert nötig
+        return
+
     # 🚨 auf die Nachricht setzen damit CS Admin es direkt sieht
     try:
         client.reactions_add(channel=channel, name='rotating_light', timestamp=ts)
     except Exception:
-        pass  # Bereits gesetzt oder kein Zugriff — kein Problem
+        pass
 
     # Explizit mit channel= posten (say() kennt den Channel in reaction_added nicht immer)
     try:
@@ -2491,7 +2498,8 @@ def handle_reaction_added(event, say, client):
             channel=channel,
             thread_ts=ts,
             text=(
-                f"{admin_mentions} — <@{user_id}> hat mit {emoji} auf diese Nachricht reagiert.\n"
+                f":rotating_light: {admin_mentions} — <@{user_id}> hat mit {emoji} reagiert, "
+                f"aber noch niemand aus dem CS Admin Team hat mit 👀 bestätigt.\n"
                 "Bitte prüfen und ggf. übernehmen."
             ),
         )
