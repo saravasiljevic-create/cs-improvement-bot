@@ -892,6 +892,16 @@ def _handle_message_core(event, say, client):
     if event.get('bot_id'):
         return
 
+    # --- OPOS-Sperrprüfung: Einspruchs-Begründung im Thread einer Fall-Nachricht ---
+    # Muss VOR dem Channel-Filter unten laufen, da #opos-instance-blocking nicht in
+    # SLACK_CHANNEL_IDS/VERTRAGSANPASSUNG_CHANNEL_ID enthalten ist.
+    try:
+        from opos_handler import handle_opos_thread_reply
+        if handle_opos_thread_reply(event, client):
+            return
+    except Exception as e:
+        logger.warning(f"opos thread-reply handling failed: {e}")
+
     # --- DMs direkt an den Bot → Chat ---
     if event.get('channel_type') == 'im':
         user_id = event.get('user', '')
@@ -2391,6 +2401,14 @@ def handle_reaction_added(event, say, client):
     user_id = event.get('user', '')
     if not user_id:
         return
+
+    # --- OPOS-Sperrprüfung: ❌ auf eine Fall-Nachricht → Begründung anfordern ---
+    try:
+        from opos_handler import handle_opos_reaction
+        if handle_opos_reaction(event, client):
+            return
+    except Exception as e:
+        logger.warning(f"opos reaction handling failed: {e}")
 
     # Bot-eigene Reaktionen ignorieren
     try:

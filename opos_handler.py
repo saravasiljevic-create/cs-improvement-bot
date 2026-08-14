@@ -58,6 +58,14 @@ OBJECTION_EMOJI_NAMES = {'x', 'negative_squared_cross_mark'}
 STATE_OBJECT_NAME = 'opos_sperrpruefung_state.json'
 TEST_MODE = True  # Solange True: Abschluss-Bericht geht nur in den Channel, nicht separat ans Accounting.
 
+# Ein ❌ allein zählt nicht als gültiger Einspruch — es muss eine geschriebene
+# Begründung im Thread folgen, die mindestens diese Schwellen erreicht.
+# Reine Heuristik (Wort-/Zeichenzahl), keine inhaltliche Prüfung — bewusst
+# einfach gehalten, da kein LLM-Zugriff im Bot verfügbar ist (ANTHROPIC_API_KEY
+# wurde aus dem Deployment entfernt, siehe cloudbuild.yaml).
+MIN_JUSTIFICATION_WORDS = 8
+MIN_JUSTIFICATION_CHARS = 40
+
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
 
@@ -248,19 +256,6 @@ def _slack_user_id_for_email(email: str) -> str | None:
     return None
 
 
-def _has_objection_reaction(channel: str, message_ts: str) -> tuple[bool, list[str]]:
-    try:
-        resp = slack_client.reactions_get(channel=channel, timestamp=message_ts)
-    except SlackApiError as e:
-        logger.warning(f"reactions_get failed for {message_ts}: {e}")
-        return False, []
-    reactions = (resp.get('message') or {}).get('reactions', [])
-    for r in reactions:
-        if r.get('name') in OBJECTION_EMOJI_NAMES:
-            return True, r.get('users', [])
-    return False, []
-
-
 def _format_case_message(case: dict) -> str:
     lines = [f"*{case['customer_name']}*"]
     tier = case.get('tier')
@@ -296,12 +291,122 @@ def _format_case_message(case: dict) -> str:
         lines.append("*Zusammenfassung:* Kunde nicht in Planhat gefunden — bitte manuell prüfen.")
 
     lines.append("")
-    lines.append("❌ auf diese Nachricht = Einspruch gegen die Sperre.")
+    lines.append("❌ auf diese Nachricht = Einspruch gegen die Sperre — der Bot fragt dich danach "
+                 "im Thread nach einer kurzen Begründung.")
     return "\n".join(lines)
 
 
 def _week_key(d: datetime) -> str:
     return d.strftime('%Y-%m-%d')
+
+
+def _find_case_by_message(state: dict, channel: str, message_ts: str):
+    """Sucht den OPOS-Fall (über alle Wochen) zu einer Slack-Nachricht."""
+    for week_key, week in state.get('weeks', {}).items():
+        if week.get('slack_channel_id') != channel:
+            continue
+        for case in week.get('cases', []):
+            if case.get('slack_message_ts') == message_ts:
+                return week_key, case
+    return None, None
+
+
+def _is_sufficient_justification(text: str) -> bool:
+    text = (text or '').strip()
+    return len(text.split()) >= MIN_JUSTIFICATION_WORDS and len(text) >= MIN_JUSTIFICATION_CHARS
+
+
+# ---------------------------------------------------------------------------
+# Echtzeit-Handler: ❌-Reaktion → Begründung anfordern → Begründung validieren
+# (aufgerufen aus bot.py's reaction_added / message Event-Handlern)
+# ---------------------------------------------------------------------------
+
+def handle_opos_reaction(event: dict, client) -> bool:
+    """❌ auf eine OPOS-Fall-Nachricht → fordert eine schriftliche Begründung
+    im Thread an. Gibt True zurück, wenn das Event eine OPOS-Nachricht betraf
+    (damit bot.py's eigene reaction_added-Logik nicht zusätzlich greift)."""
+    if event.get('reaction') not in OBJECTION_EMOJI_NAMES:
+        return False
+    item = event.get('item', {})
+    if item.get('type') != 'message':
+        return False
+    channel = item.get('channel', '')
+    ts = item.get('ts', '')
+    user_id = event.get('user', '')
+    if not (channel and ts and user_id):
+        return False
+
+    state = _load_state()
+    _, case = _find_case_by_message(state, channel, ts)
+    if not case:
+        return False  # keine OPOS-Fall-Nachricht — anderer Handler ist zuständig
+
+    case.setdefault('objection_reasons', {})
+    case.setdefault('pending_justification_users', [])
+
+    if user_id in case['objection_reasons']:
+        return True  # hat schon eine akzeptierte Begründung geliefert
+
+    if user_id not in case['pending_justification_users']:
+        case['pending_justification_users'].append(user_id)
+        try:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=ts,
+                text=(
+                    f"<@{user_id}> Danke für deinen Einspruch (❌) gegen die Sperre von "
+                    f"*{case['customer_name']}*. Bitte antworte in diesem Thread mit einer "
+                    f"kurzen Begründung, warum diese Instanz NICHT gesperrt werden soll — "
+                    f"ein, zwei Sätze reichen, nur ein paar Stichworte leider nicht."
+                ),
+            )
+        except SlackApiError as e:
+            logger.warning(f"justification prompt failed: {e}")
+
+    _save_state(state)
+    return True
+
+
+def handle_opos_thread_reply(event: dict, client) -> bool:
+    """Prüft, ob eine Thread-Antwort eine angeforderte Einspruchs-Begründung
+    ist, und validiert deren Länge/Substanz. Gibt True zurück, wenn behandelt."""
+    thread_ts = event.get('thread_ts')
+    channel = event.get('channel', '')
+    user_id = event.get('user', '')
+    text = event.get('text', '')
+    if not (thread_ts and channel and user_id) or event.get('bot_id'):
+        return False
+
+    state = _load_state()
+    _, case = _find_case_by_message(state, channel, thread_ts)
+    if not case:
+        return False
+
+    pending = case.get('pending_justification_users', [])
+    if user_id not in pending:
+        return False  # dieser User wurde nicht zu einer Begründung aufgefordert
+
+    if _is_sufficient_justification(text):
+        case.setdefault('objection_reasons', {})[user_id] = text.strip()
+        pending.remove(user_id)
+        try:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                                     text=f"✅ Danke <@{user_id}>, Begründung übernommen.")
+        except SlackApiError as e:
+            logger.warning(f"justification confirm failed: {e}")
+    else:
+        try:
+            client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=(f"<@{user_id}> Das ist noch etwas knapp — magst du kurz ausführen, "
+                      f"warum dieser Fall nicht gesperrt werden soll? "
+                      f"(mind. {MIN_JUSTIFICATION_WORDS} Wörter)"),
+            )
+        except SlackApiError as e:
+            logger.warning(f"justification nudge failed: {e}")
+
+    _save_state(state)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -317,29 +422,50 @@ def run_opos_check() -> dict:
     previous_week_key = _week_key(now - timedelta(days=7))
     prev = state['weeks'].get(previous_week_key)
     if prev and not prev.get('closeout_delivered_at') and prev.get('cases'):
-        gesperrt, einspruch = [], []
+        gesperrt, einspruch, unklar = [], [], []
         for case in prev['cases']:
-            objected, objected_by = _has_objection_reaction(prev['slack_channel_id'], case['slack_message_ts'])
-            case['objected'] = objected
-            case['objected_by'] = objected_by
+            # Ein ❌ allein reicht nicht — nur ein akzeptiertes objection_reasons-Eintrag
+            # (siehe handle_opos_reaction/handle_opos_thread_reply) zählt als Einspruch.
+            reasons = case.get('objection_reasons', {}) or {}
+            pending = case.get('pending_justification_users', []) or []
+            case['objected'] = bool(reasons)
+            case['objected_by'] = list(reasons.keys())
             case['delivered_to_accounting'] = True
-            (einspruch if objected else gesperrt).append(case)
+            if reasons:
+                einspruch.append(case)
+            elif pending:
+                # Hat reagiert, aber nie eine ausreichende Begründung nachgeliefert.
+                unklar.append(case)
+            else:
+                gesperrt.append(case)
 
         prefix = "🧪 *TEST — noch nicht live für Accounting*\n" if TEST_MODE else ""
-        report = (
-            f"{prefix}📋 *OPOS-Sperrprüfung Abschluss — Woche {previous_week_key}*\n\n"
+        lines = [
+            f"{prefix}📋 *OPOS-Sperrprüfung Abschluss — Woche {previous_week_key}*",
+            "",
             f"{len(prev['cases'])} Fälle insgesamt · *{len(gesperrt)} werden gesperrt* · "
-            f"*{len(einspruch)} Einspruch* (nicht sperren)\n\n"
-            + "\n".join(f"❌ {c['customer_name']} — Einspruch von {', '.join(f'<@{u}>' for u in c['objected_by'])}"
-                        for c in einspruch)
-        )
+            f"*{len(einspruch)} Einspruch* (nicht sperren)"
+            + (f" · *{len(unklar)} unklar* (❌ ohne Begründung)" if unklar else ""),
+            "",
+        ]
+        lines += [
+            f"❌ {c['customer_name']} — Begründung von "
+            + ", ".join(f"<@{u}>: „{r[:120]}“" for u, r in c.get('objection_reasons', {}).items())
+            for c in einspruch
+        ]
+        lines += [
+            f"⚠️ {c['customer_name']} — {', '.join(f'<@{u}>' for u in c.get('pending_justification_users', []))} "
+            f"hat reagiert, aber keine ausreichende Begründung geliefert — bitte manuell prüfen."
+            for c in unklar
+        ]
         try:
-            slack_client.chat_postMessage(channel=prev['slack_channel_id'], text=report)
+            slack_client.chat_postMessage(channel=prev['slack_channel_id'], text="\n".join(lines))
         except SlackApiError as e:
             logger.warning(f"closeout report post failed: {e}")
 
         prev['closeout_delivered_at'] = now.isoformat()
-        result['closeout'] = {'week': previous_week_key, 'gesperrt': len(gesperrt), 'einspruch': len(einspruch)}
+        result['closeout'] = {'week': previous_week_key, 'gesperrt': len(gesperrt),
+                               'einspruch': len(einspruch), 'unklar': len(unklar)}
 
     # --- SCHRITT B: neue Woche eröffnen -------------------------------------
     this_week_key = _week_key(now)
