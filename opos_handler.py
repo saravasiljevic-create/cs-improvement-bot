@@ -143,7 +143,7 @@ def _planhat_headers() -> dict:
 def _planhat_fetch_page(params: dict) -> list:
     try:
         resp = requests.get(f'{PLANHAT_BASE_URL}/companies', headers=_planhat_headers(),
-                             params=params, timeout=10)
+                             params=params, timeout=20)
         if resp.ok and isinstance(resp.json(), list):
             return resp.json()
     except Exception as e:
@@ -151,30 +151,43 @@ def _planhat_fetch_page(params: dict) -> list:
     return []
 
 
+def _planhat_find_by_external_id(debit_number: str) -> dict | None:
+    """Direkter Lookup über Planhats extid-Shortcut — ein einzelner Call statt
+    seitenweisem Scannen (siehe https://www.planhat.com/developers/api/company:
+    GET /companies/extid-{externalId})."""
+    try:
+        resp = requests.get(f'{PLANHAT_BASE_URL}/companies/extid-{debit_number}',
+                             headers=_planhat_headers(), timeout=15)
+        if resp.ok and isinstance(resp.json(), dict) and resp.json().get('_id'):
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"Planhat extid lookup failed for {debit_number}: {e}")
+    return None
+
+
 def _planhat_find_company(customer_name: str, debit_number: str = '') -> dict | None:
+    """Sucht Planhat-Company: zuerst per direktem externalId-Lookup (schnell,
+    exakt), erst als Fallback per Namens-Scan (Planhats /companies-Listenendpoint
+    unterstützt keine Namensfilterung serverseitig — siehe Doku-Recherche vom
+    2026-08-14 — daher client-seitiger Abgleich, aber mit limit=5000/Seite statt
+    100, um auch bei tausenden Firmen realistisch etwas zu finden)."""
     if not PLANHAT_API_TOKEN:
         return None
 
     if debit_number:
-        for offset in range(0, 1000, 100):
-            page = _planhat_fetch_page({'limit': 100, 'offset': offset})
-            if not page:
-                break
-            match = next((c for c in page if str(c.get('externalId', '')) == str(debit_number)), None)
-            if match:
-                return match
-            if len(page) < 100:
-                break
+        match = _planhat_find_by_external_id(debit_number)
+        if match:
+            return match
 
     if customer_name:
-        for offset in range(0, 1000, 100):
-            page = _planhat_fetch_page({'limit': 100, 'offset': offset})
+        for offset in range(0, 20000, 5000):
+            page = _planhat_fetch_page({'limit': 5000, 'offset': offset})
             if not page:
                 break
             match = next((c for c in page if c.get('name', '').lower() == customer_name.lower()), None)
             if match:
                 return match
-            if len(page) < 100:
+            if len(page) < 5000:
                 break
 
     return None
