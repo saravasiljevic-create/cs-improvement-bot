@@ -300,6 +300,17 @@ def _week_key(d: datetime) -> str:
     return d.strftime('%Y-%m-%d')
 
 
+def _ensure_bot_in_channel(channel: str) -> None:
+    """Bot tritt dem Channel bei, falls er noch nicht Mitglied ist (self-join
+    funktioniert nur bei öffentlichen Channels — bei privaten Channels bleibt
+    ein manuelles /invite nötig, siehe Warnung im Log)."""
+    try:
+        slack_client.conversations_join(channel=channel)
+    except SlackApiError as e:
+        logger.warning(f"could not auto-join channel {channel} — "
+                       f"falls privat, bitte Bot manuell per /invite hinzufügen: {e}")
+
+
 def _find_case_by_message(state: dict, channel: str, message_ts: str):
     """Sucht den OPOS-Fall (über alle Wochen) zu einer Slack-Nachricht."""
     for week_key, week in state.get('weeks', {}).items():
@@ -417,6 +428,7 @@ def run_opos_check() -> dict:
     now = datetime.now(timezone.utc)
     result = {'closeout': None, 'new_week': None}
     state = _load_state()
+    _ensure_bot_in_channel(OPOS_CHANNEL_ID)
 
     # --- SCHRITT A: Vorwoche abschließen -----------------------------------
     previous_week_key = _week_key(now - timedelta(days=7))
@@ -471,7 +483,10 @@ def run_opos_check() -> dict:
     this_week_key = _week_key(now)
     week_end = now + timedelta(days=6)
 
-    if state['weeks'].get(this_week_key, {}).get('cases'):
+    already_posted = any(
+        c.get('slack_message_ts') for c in state['weeks'].get(this_week_key, {}).get('cases', [])
+    )
+    if already_posted:
         result['new_week'] = {'skipped': True, 'reason': 'already posted this week'}
     else:
         invoices = _fetch_open_invoices()
