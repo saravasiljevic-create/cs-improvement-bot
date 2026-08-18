@@ -30,12 +30,12 @@ CS_ADMIN_USER_IDS: set[str] = set(
     os.environ.get('CS_ADMIN_USER_IDS', _DEFAULT_ADMIN_IDS).split(',')
 )
 
-# OPOS-Sperrprüfung-Flow (Freitag-Job, ausgelöst via Cloud Scheduler → /opos-sperrpruefung)
-ZENDESK_API_TOKEN = os.environ.get('ZENDESK_API_TOKEN', '')
-ZENDESK_SUBDOMAIN = os.environ.get('ZENDESK_SUBDOMAIN', 'xentral')
-ZENDESK_EMAIL = os.environ.get('ZENDESK_EMAIL', 'sara.vasiljevic@xentral.com')
+# OPOS-Sperrprüfung: die eigentliche Logik läuft seit 2026-08-18 im ausgelagerten
+# Service/Repo opos-sperrpruefung-bot (eigenes Team-Mitglied kann das dort pflegen,
+# ohne Zugriff auf dieses Repo zu brauchen). Dieser Bot leitet nur noch
+# reaction_added/message-Events aus dem OPOS-Channel dorthin weiter.
 OPOS_CHANNEL_ID = os.environ.get('OPOS_CHANNEL_ID', 'C0BN9JM83ED')  # #opos-instance-blocking
-OPOS_STATE_BUCKET = os.environ.get('OPOS_STATE_BUCKET', 'cs-admin-bot-opos-state')
+OPOS_SERVICE_URL = os.environ.get('OPOS_SERVICE_URL', '')
 
 required_credentials = {
     'SLACK_BOT_TOKEN': SLACK_BOT_TOKEN,

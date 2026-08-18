@@ -14,6 +14,8 @@ from config import (
     CHARGEBEE_API_KEY,
     CHARGEBEE_SITE,
     CS_ADMIN_USER_IDS,
+    OPOS_CHANNEL_ID,
+    OPOS_SERVICE_URL,
     PLANHAT_API_TOKEN,
     PLANHAT_WORKSPACE_URL,
     SLACK_BOT_TOKEN,
@@ -22,6 +24,21 @@ from config import (
     SLACK_SIGNING_SECRET,
     VERTRAGSANPASSUNG_CHANNEL_ID,
 )
+def _forward_to_opos_service(event_type: str, event: dict) -> None:
+    """Leitet ein Slack-Event aus dem OPOS-Channel an den ausgelagerten
+    opos-sperrpruefung-bot Service weiter (siehe dessen README.md). Dieser
+    Bot bleibt der einzige Slack-Events-Empfänger (eine Slack-App kann nur
+    eine Events-URL haben) und verarbeitet den Inhalt selbst nicht mehr."""
+    if not OPOS_SERVICE_URL:
+        logging.getLogger(__name__).warning("OPOS_SERVICE_URL nicht gesetzt — Event nicht weitergeleitet")
+        return
+    try:
+        requests.post(f'{OPOS_SERVICE_URL.rstrip("/")}/slack-event',
+                      json={'type': event_type, 'event': event}, timeout=10)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"opos forward failed: {e}")
+
+
 from jira_handler import add_vote, create_ticket, delete_ticket, remove_vote, search_similar_tickets, search_customer_contract_tickets
 from optimizer import optimize_ticket
 from slack_utils import format_error, format_ticket_created
@@ -892,15 +909,14 @@ def _handle_message_core(event, say, client):
     if event.get('bot_id'):
         return
 
-    # --- OPOS-Sperrprüfung: Einspruchs-Begründung im Thread einer Fall-Nachricht ---
+    # --- OPOS-Sperrprüfung: an ausgelagerten Service weiterleiten ---
     # Muss VOR dem Channel-Filter unten laufen, da #opos-instance-blocking nicht in
-    # SLACK_CHANNEL_IDS/VERTRAGSANPASSUNG_CHANNEL_ID enthalten ist.
-    try:
-        from opos_handler import handle_opos_thread_reply
-        if handle_opos_thread_reply(event, client):
-            return
-    except Exception as e:
-        logger.warning(f"opos thread-reply handling failed: {e}")
+    # SLACK_CHANNEL_IDS/VERTRAGSANPASSUNG_CHANNEL_ID enthalten ist. Die eigentliche
+    # OPOS-Logik lebt seit 2026-08-18 im separaten Repo/Service opos-sperrpruefung-bot
+    # (siehe dessen README.md) — hier wird nur weitergeleitet, nicht verarbeitet.
+    if event.get('channel') == OPOS_CHANNEL_ID:
+        _forward_to_opos_service('message', event)
+        return
 
     # --- DMs direkt an den Bot → Chat ---
     if event.get('channel_type') == 'im':
@@ -2402,13 +2418,12 @@ def handle_reaction_added(event, say, client):
     if not user_id:
         return
 
-    # --- OPOS-Sperrprüfung: ❌ auf eine Fall-Nachricht → Begründung anfordern ---
-    try:
-        from opos_handler import handle_opos_reaction
-        if handle_opos_reaction(event, client):
-            return
-    except Exception as e:
-        logger.warning(f"opos reaction handling failed: {e}")
+    # --- OPOS-Sperrprüfung: an ausgelagerten Service weiterleiten (siehe Kommentar
+    # bei _handle_message_core) ---
+    item = event.get('item', {})
+    if item.get('type') == 'message' and item.get('channel') == OPOS_CHANNEL_ID:
+        _forward_to_opos_service('reaction_added', event)
+        return
 
     # Bot-eigene Reaktionen ignorieren
     try:
@@ -2551,16 +2566,9 @@ def productive_sync_endpoint():
         return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
 
 
-@flask_app.route("/opos-sperrpruefung", methods=["POST"])
-def opos_sperrpruefung_endpoint():
-    from opos_handler import run_opos_check
-    import json
-    try:
-        summary = run_opos_check()
-        return json.dumps(summary), 200, {'Content-Type': 'application/json'}
-    except Exception as e:
-        logger.exception("OPOS-Sperrprüfung failed")
-        return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
+# OPOS-Sperrprüfung läuft seit 2026-08-18 als eigener Service/Repo
+# (opos-sperrpruefung-bot) — dieser Bot leitet nur noch die relevanten
+# Slack-Events dorthin weiter, siehe _forward_to_opos_service oben.
 
 
 if __name__ == "__main__":
