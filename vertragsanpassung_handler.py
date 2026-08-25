@@ -272,6 +272,9 @@ def parse_vertragsanpassung(text: str) -> dict:
     """Extrahiert strukturierte Felder aus einer Vertragsanpassungs-Anfrage im Freitext."""
     text = _html.unescape(text)
     result: dict = {}
+    # URLs vor allen Regex-Suchen entfernen, damit URL-Bestandteile (z.B. "0-3" aus
+    # HubSpot-Pfaden) nicht als Datum oder Plan-Namen erkannt werden.
+    text_no_urls = _URL_RE.sub(' ', text)
 
     def _clean_company_name(name: str) -> str:
         """Extrahiert nur den eigentlichen Firmennamen (kürzt vorne und hinten)."""
@@ -326,13 +329,14 @@ def parse_vertragsanpassung(text: str) -> dict:
     if urls:
         result['offer_link'] = urls[0]
 
-    m = _DATE_RE.search(text)
+    # Datum aus URL-bereinigtem Text suchen (verhindert False Positives wie "0-3" aus HubSpot-URLs)
+    m = _DATE_RE.search(text_no_urls)
     if m:
         result['effective_date'] = (m.group(1) or m.group(2) or m.group(3) or '').strip()
-    elif _ASAP_RE.search(text):
+    elif _ASAP_RE.search(text_no_urls):
         result['effective_date'] = 'ASAP'  # wird durch next_billing_at aus Chargebee ersetzt
 
-    m = _PAYMENT_RE.search(text)
+    m = _PAYMENT_RE.search(text_no_urls)
     if m:
         raw = m.group(1).lower()
         if any(x in raw for x in ('jähr', 'annual', 'yearly')):
@@ -341,6 +345,12 @@ def parse_vertragsanpassung(text: str) -> dict:
             result['payment_type'] = 'monatlich'
         else:
             result['payment_type'] = 'quartalsweise'
+    # Fallback: "Monatsvertrag" → monatlich, "Jahresvertrag" → jährlich
+    if not result.get('payment_type'):
+        if re.search(r'\bmonatsvertrag\b', text_no_urls, re.IGNORECASE):
+            result['payment_type'] = 'monatlich'
+        elif re.search(r'\bjahresvertrag\b', text_no_urls, re.IGNORECASE):
+            result['payment_type'] = 'jährlich'
 
     # Plan: erst "Plan | N-Monatsvertrag [Zahlung] inkl. X"-Format (wie im Angebot)
     _inline_plan = re.compile(
@@ -351,7 +361,7 @@ def parse_vertragsanpassung(text: str) -> dict:
         r'([^\n]*)',                               # inkl. X (optional)
         re.IGNORECASE,
     )
-    inline = _inline_plan.search(text)
+    inline = _inline_plan.search(text_no_urls)
     if inline:
         plan_base = inline.group(1).strip()
         contract_raw = inline.group(2).strip()
@@ -383,9 +393,18 @@ def parse_vertragsanpassung(text: str) -> dict:
             if pid:
                 result['chargebee_plan_id'] = pid
     else:
-        m = _PLAN_RE.search(text)
+        m = _PLAN_RE.search(text_no_urls)
         if m:
             result['new_plan'] = m.group(0).strip()
+
+    # Fallback Service-Paket: "inkl. Standard S" / "inkl. Growth M" im Freitext
+    if not result.get('service_package'):
+        _inkl = re.search(
+            r'\binkl\.?\s+((?:standard|growth|premium|launch|scale|connect)\s*[smlx]?)',
+            text_no_urls, re.IGNORECASE,
+        )
+        if _inkl:
+            result['service_package'] = _inkl.group(1).strip()
 
     # Fallback: Laufzeit aus "N Monate" / "N Jahre" / "N-Jahres-..." extrahieren
     if not result.get('contract_months'):
