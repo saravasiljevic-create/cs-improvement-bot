@@ -984,7 +984,9 @@ def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
         )
         return
 
-    planhat_result = get_planhat_sandbox_fields(customer_name, PLANHAT_API_TOKEN)
+    planhat_result = get_planhat_sandbox_fields(
+        customer_name, PLANHAT_API_TOKEN, debit_number=chargebee_result.get('debit_number')
+    )
     if planhat_result is None:
         say(
             blocks=build_sandbox_clarification_blocks(

@@ -14,6 +14,8 @@ from vertragsanpassung_handler import _chargebee_customer_search, detect_vertrag
 
 logger = logging.getLogger(__name__)
 
+PLANHAT_BASE_URL = 'https://api.planhat.com'
+
 # ---------------------------------------------------------------------------
 # Intent Detection
 # ---------------------------------------------------------------------------
@@ -120,6 +122,7 @@ def get_chargebee_contact_email(customer_name: str, api_key: str, site: str) -> 
         'first_name': billing_address.get('first_name'),
         'company': customer.get('company'),
         'customer_id': customer.get('id'),
+        'debit_number': customer.get('cf_debit_number'),
     }
 
 
@@ -127,40 +130,85 @@ def get_chargebee_contact_email(customer_name: str, api_key: str, site: str) -> 
 # Planhat-Lookup (read-only)
 # ---------------------------------------------------------------------------
 
-def get_planhat_sandbox_fields(customer_name: str, api_token: str) -> dict | None:
+def _planhat_find_by_external_id(debit_number, api_token: str) -> dict | None:
+    """Direkter Lookup über Planhats extid-Shortcut (GET /companies/extid-{externalId}) —
+    ein einzelner, exakter Call statt seitenweisem Scannen. Siehe git-Historie
+    (Commit 10d2921 'Fix Planhat lookup: use extid- direct endpoint instead of
+    full scan', ursprünglich in opos_handler.py, jetzt im ausgelagerten
+    opos-sperrpruefung-bot-Repo) — dieselbe Erkenntnis gilt hier 1:1."""
+    headers = {'Authorization': f'Bearer {api_token}'}
+    try:
+        resp = requests.get(
+            f'{PLANHAT_BASE_URL}/companies/extid-{debit_number}',
+            headers=headers, timeout=15,
+        )
+        if resp.ok and isinstance(resp.json(), dict) and resp.json().get('_id'):
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"Planhat extid lookup failed for {debit_number}: {e}")
+    return None
+
+
+def _planhat_find_by_name_scan(customer_name: str, api_token: str) -> list:
+    """Fallback nur wenn keine Debitorennummer vorliegt: Planhats /companies-
+    Listenendpoint unterstützt KEINEN serverseitigen Namensfilter (Doku-Recherche
+    2026-08-14, siehe Commit 10d2921) — 'companyName'-Query-Parameter wird
+    schlicht ignoriert und liefert immer dieselbe Default-Seite zurück. Deshalb
+    hier client-seitiger Abgleich über die komplette Liste (limit=5000/Seite,
+    Planhats Maximum) statt eines (nicht-funktionierenden) Serverfilters."""
+    headers = {'Authorization': f'Bearer {api_token}'}
+    matches = []
+    for offset in range(0, 20000, 5000):
+        try:
+            resp = requests.get(
+                f'{PLANHAT_BASE_URL}/companies',
+                params={'limit': 5000, 'offset': offset},
+                headers=headers, timeout=20,
+            )
+            if not resp.ok:
+                break
+            page = resp.json()
+        except Exception as e:
+            logger.warning(f"Planhat name-scan page (offset={offset}) failed: {e}")
+            break
+        if not page:
+            break
+        matches.extend(c for c in page if c.get('name', '').lower() == customer_name.lower())
+        if len(page) < 5000:
+            break
+    return matches
+
+
+def get_planhat_sandbox_fields(customer_name: str, api_token: str, debit_number=None) -> dict | None:
     """Sucht den Planhat-Kunden und liefert die Sandbox-Preis-Custom-Fields.
+
+    Bevorzugt den exakten extid-Lookup über die Chargebee-Debitorennummer
+    (`debit_number` == Planhat `externalId`) — zuverlässig und schnell.
+    Nur wenn keine Debitorennummer vorliegt, wird auf einen vollständigen
+    Namens-Scan zurückgegriffen (siehe `_planhat_find_by_name_scan`).
 
     Gibt None zurück wenn kein Treffer gefunden wurde, oder
     {'ambiguous': True, 'candidates': [...]} bei mehreren Treffern — niemals raten.
     """
-    headers = {'Authorization': f'Bearer {api_token}'}
-    try:
-        resp = requests.get(
-            'https://api.planhat.com/companies',
-            params={'companyName': customer_name, 'limit': 5},
-            headers=headers,
-            timeout=10,
-        )
-        logger.info(
-            f"Planhat sandbox-fields search [companyName={customer_name!r}]: "
-            f"status={resp.status_code}, results={len(resp.json()) if resp.ok else 'error'}"
-        )
-        if not resp.ok:
+    company = None
+    if debit_number:
+        company = _planhat_find_by_external_id(debit_number, api_token)
+
+    if not company:
+        try:
+            companies = _planhat_find_by_name_scan(customer_name, api_token)
+        except Exception as e:
+            logger.warning(f"get_planhat_sandbox_fields({customer_name!r}) failed: {e}")
             return None
-        companies = resp.json()
-    except Exception as e:
-        logger.warning(f"get_planhat_sandbox_fields({customer_name!r}) failed: {e}")
-        return None
+        if not companies:
+            return None
+        if len(companies) > 1:
+            return {
+                'ambiguous': True,
+                'candidates': [c.get('name') for c in companies],
+            }
+        company = companies[0]
 
-    if not companies:
-        return None
-    if len(companies) > 1:
-        return {
-            'ambiguous': True,
-            'candidates': [c.get('name') for c in companies],
-        }
-
-    company = companies[0]
     custom = company.get('custom') or {}
     sandbox_raw = custom.get('Sandbox')
     spiegelung_raw = custom.get('Sandbox Spiegelung')
