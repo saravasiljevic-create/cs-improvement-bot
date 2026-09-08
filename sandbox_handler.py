@@ -69,6 +69,31 @@ _CUSTOM_CODE_POSITIVE_RE = re.compile(
 )
 
 
+# Fallback wenn extract_company_name() nichts findet (kein Label wie "Kunde: X", kein
+# Rechtsform-Suffix wie GmbH/AG/...) — live bestätigt: reale Chargebee-Firmennamen wie
+# "Wellnest" tragen oft gar keine Rechtsform. Nutzt die typische Formulierung dieses
+# Flows ("sandbox für X" / "spiegelung für X"), NICHT in text_utils.py ergänzt, um die
+# produktiv genutzte Vertragsanpassungs-Namenserkennung nicht zu beeinflussen.
+_SANDBOX_NAME_FALLBACK_RE = re.compile(
+    r'\b(?:sandbox|spiegelung)\b\s+(?:für|fuer)\s+(.+)', re.IGNORECASE,
+)
+_TRAILING_ACTION_RE = re.compile(
+    r'\s+(?:anlegen|einrichten|erstellen|einzurichten|anzulegen|bitte|please|'
+    r'haben|möchte|wollen|will)\b.*$',
+    re.IGNORECASE,
+)
+
+
+def _extract_company_name_sandbox_fallback(text: str) -> str | None:
+    m = _SANDBOX_NAME_FALLBACK_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    raw = _TRAILING_ACTION_RE.sub('', raw).strip()
+    raw = raw.strip('.,!? ').strip()
+    return raw or None
+
+
 def parse_sandbox_request(text: str) -> dict:
     """Extrahiert strukturierte Felder aus einer Sandbox-Anfrage im Freitext."""
     wants_spiegelung = bool(_SPIEGELUNG_MENTION_RE.search(text))
@@ -82,8 +107,10 @@ def parse_sandbox_request(text: str) -> dict:
         else:
             custom_code = None
 
+    customer_name = extract_company_name(text) or _extract_company_name_sandbox_fallback(text)
+
     return {
-        'customer_name': extract_company_name(text),
+        'customer_name': customer_name,
         'wants_spiegelung': wants_spiegelung,
         'custom_code': custom_code,
     }
