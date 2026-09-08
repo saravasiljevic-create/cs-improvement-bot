@@ -531,12 +531,33 @@ def build_sandbox_clarification_blocks(reason: str) -> list[dict]:
 
 
 def build_sandbox_come_back_later_blocks() -> list[dict]:
-    """Bestätigt den Entwurf und bittet den CSM, nach Kundenantwort in den Thread zurückzukommen."""
+    """Bestätigt den Entwurf und bittet den CSM, nach Kundenantwort in den Thread zurückzukommen.
+
+    Bietet zusätzlich zur Text-Antwort einen Button ('Kunde hat sich zurückgemeldet'),
+    der direkt zur Scope-Frage springt — bequemer als selbst etwas tippen zu müssen.
+    Beide Wege funktionieren nebeneinander (siehe _advance_sandbox_thread für den
+    Text-Weg, sandbox_customer_replied-Action-Handler für den Button-Weg).
+    """
     text = (
         "Perfekt! Schick die E-Mail an den Kunden. Sobald du eine Antwort hast, "
-        "schreib einfach hier im Thread weiter — ich frage dich dann nach den nächsten Schritten."
+        "schreib einfach hier im Thread weiter oder klick unten — "
+        "ich frage dich dann nach den nächsten Schritten."
     )
-    return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
+    return [
+        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}},
+        {
+            'type': 'actions',
+            'elements': [
+                {
+                    'type': 'button',
+                    'text': {'type': 'plain_text', 'text': 'Kunde hat sich zurückgemeldet'},
+                    'action_id': 'sandbox_customer_replied',
+                    'value': 'customer_replied',
+                    'style': 'primary',
+                },
+            ],
+        },
+    ]
 
 
 def build_sandbox_scope_question_blocks() -> list[dict]:

@@ -2608,6 +2608,31 @@ def _handle_sandbox_scope_choice(ack, body, say, client, scope: str):
         state['step'] = 'done'
 
 
+@app.action("sandbox_customer_replied")
+def handle_sandbox_customer_replied(ack, body, say, client):
+    """Button: 'Kunde hat sich zurückgemeldet' — Alternative zur Text-Antwort im
+    Thread, springt direkt zur Scope-Frage (siehe auch der 'awaiting_customer_reply'-
+    Zweig in _advance_sandbox_thread, den dieser Button-Pfad dupliziert)."""
+    ack()
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    if not thread_ts:
+        return
+    state = _pending_sandbox.get((channel, thread_ts))
+    if not state or state.get('step') != 'awaiting_customer_reply':
+        say(
+            text=":wave: Kein aktiver Sandbox-Flow in diesem Thread mehr — bitte die Anfrage neu stellen.",
+            thread_ts=thread_ts,
+        )
+        return
+    say(
+        blocks=build_sandbox_scope_question_blocks(),
+        text="Was soll final umgesetzt werden?",
+        thread_ts=thread_ts,
+    )
+    state['step'] = 'awaiting_scope_choice'
+
+
 @app.action("sandbox_scope_new_only")
 def handle_sandbox_scope_new_only(ack, body, say, client):
     """Button: Schritt 2 — nur neue Sandbox anlegen (keine Spiegelung)."""
