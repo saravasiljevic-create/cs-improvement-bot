@@ -2,6 +2,7 @@
 Gemeinsame Freitext-Utilities für mehrere Handler (Vertragsanpassung,
 Sandbox-Anfrage, ...).
 """
+import html as _html
 import re
 
 # Erkennt explizit gelabelte Kundennennungen ("Kunde: X", "Firma X").
@@ -74,7 +75,14 @@ def extract_company_name(text: str) -> str | None:
     Versucht zuerst ein explizit gelabeltes Muster ('Kunde: X', 'Firma X'), danach
     eine direkte Suche nach einem Rechtsform-Suffix (GmbH, AG, ...) im Text.
     Gibt None zurück, wenn kein Firmenname erkannt werden konnte.
+
+    Slack liefert Nachrichtentext HTML-entity-escaped (z.B. '&' als '&amp;') —
+    ohne Unescape würde "GmbH & Co. KG" an "&amp;" zerbrechen und die
+    Rechtsform-Endung (KG) verlorengehen. `html.unescape` ist idempotent,
+    daher unschädlich falls der Aufrufer (z.B. parse_vertragsanpassung) schon
+    unescaped hat.
     """
+    text = _html.unescape(text)
     m = _CUSTOMER_LABELED_RE.search(text)
     if m:
         raw = _STRIP_COMPANY_PREFIX_RE.sub('', m.group(1)).strip()
