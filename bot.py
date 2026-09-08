@@ -1,8 +1,9 @@
 import logging
 import os
 import re
+import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -57,6 +58,22 @@ from vertragsanpassung_handler import (
     parse_vertragsanpassung,
     _fetch_subscription_by_id,
 )
+from sandbox_handler import (
+    build_customer_email,
+    build_sandbox_clarification_blocks,
+    build_sandbox_come_back_later_blocks,
+    build_sandbox_instance_info_request_blocks,
+    build_sandbox_lookup_result_blocks,
+    build_sandbox_scope_question_blocks,
+    build_sandbox_step2_stub_blocks,
+    create_sandbox_mirroring_ticket,
+    detect_sandbox_request,
+    get_chargebee_contact_email,
+    get_planhat_sandbox_fields,
+    parse_instance_info,
+    parse_sandbox_request,
+    resolve_paragraph_variants,
+)
 
 # Erkennt Chargebee-Links (Subscription ODER Customer) und Standard-IDs
 _CB_URL_RE = re.compile(
@@ -68,7 +85,7 @@ _CB_URL_RE = re.compile(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_BOT_VERSION = "v2.7"
+_BOT_VERSION = "v2.8"
 logger.info(f"Bot starting — version {_BOT_VERSION}")
 
 # Custom-Emoji für die VA-Zusammenfassung (Slack-Name ohne Doppelpunkte)
@@ -95,6 +112,11 @@ _similar_shown: dict[tuple[str, str], dict] = {}
 # Vertragsanpassungs-Flow state
 # (channel, thread_ts) -> {'parsed': dict, 'user_id', 'user_name', 'created_at'}
 _pending_vertragsanpassung: dict[tuple[str, str], dict] = {}
+
+# Sandbox-Anfrage-Flow state
+# (channel, thread_ts) -> {'step', 'user_id', 'user_name', 'customer_name', 'chargebee_result',
+#                           'planhat_result', 'variant', 'email_text', 'correction_text', 'created_at'}
+_pending_sandbox: dict[tuple[str, str], dict] = {}
 
 # VA-Zusammenfassungen die auf CS Admin Bestätigung warten (für 48h Reminder)
 # (channel, thread_ts) -> {'sent_at': float, 'reminded': bool}
@@ -393,6 +415,16 @@ def _cleanup_expired_pending(client):
         channel, thread_ts = key
         logger.info(f"Pending state expired for {channel}/{thread_ts} — marking done")
         _set_done(client, channel, thread_ts)
+
+    # Sandbox-Anfrage-Flow: gleiche 72h TTL wie der Improvement-Flow
+    expired_sandbox = [
+        key for key, state in list(_pending_sandbox.items())
+        if now - state.get('created_at', now) > PENDING_TTL
+    ]
+    for key in expired_sandbox:
+        _pending_sandbox.pop(key, None)
+        channel, thread_ts = key
+        logger.info(f"Sandbox pending state expired for {channel}/{thread_ts}")
 
     # VA-Zusammenfassung: 48h Reminder wenn noch keine Bestätigung
     admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
@@ -895,6 +927,208 @@ def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
 
 
 # ---------------------------------------------------------------------------
+# Sandbox-Anfrage-Flow
+# ---------------------------------------------------------------------------
+
+_SANDBOX_AFFIRMATIVE_RE = re.compile(r'\bja\b', re.IGNORECASE)
+
+# Labels für die Rückfrage bei unvollständiger Instanz-Info-Antwort
+_INSTANCE_INFO_LABELS = {
+    'prod_url': 'Prod URL',
+    'prod_serial': 'Prod Serial',
+    'sandbox_url': 'Sandbox URL',
+    'sandbox_serial': 'Sandbox Serial',
+}
+
+
+def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
+    """Orchestriert den Sandbox-Anfrage-Flow: Parsing -> Chargebee/Planhat-Lookup ->
+    Preis-Mapping -> E-Mail-Entwurf -> Slack-Antwort -> _pending_sandbox-Eintrag.
+
+    Bricht bei fehlendem/mehrdeutigem Match oder unauflösbarem Feldwert mit einer
+    Rückfrage ab — rät niemals.
+    """
+    parsed = parse_sandbox_request(text)
+    customer_name = parsed.get('customer_name')
+    if not customer_name:
+        say(
+            blocks=build_sandbox_clarification_blocks(
+                "Ich konnte keinen Kundennamen aus deiner Nachricht erkennen — "
+                "für welchen Kunden soll die Sandbox eingerichtet werden?"
+            ),
+            text="Kundenname unklar",
+            thread_ts=ts,
+        )
+        return
+
+    chargebee_result = get_chargebee_contact_email(customer_name, CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+    if chargebee_result is None:
+        say(
+            blocks=build_sandbox_clarification_blocks(
+                f"Ich konnte '{customer_name}' nicht in Chargebee finden — "
+                "ist der Firmenname korrekt geschrieben?"
+            ),
+            text="Kein Chargebee-Treffer",
+            thread_ts=ts,
+        )
+        return
+    if chargebee_result.get('ambiguous'):
+        candidates = ', '.join(chargebee_result.get('candidates', []))
+        say(
+            blocks=build_sandbox_clarification_blocks(
+                f"Ich konnte '{customer_name}' nicht eindeutig in Chargebee finden — "
+                f"meintest du: {candidates}?"
+            ),
+            text="Mehrdeutiger Chargebee-Treffer",
+            thread_ts=ts,
+        )
+        return
+
+    planhat_result = get_planhat_sandbox_fields(customer_name, PLANHAT_API_TOKEN)
+    if planhat_result is None:
+        say(
+            blocks=build_sandbox_clarification_blocks(
+                f"Ich konnte '{customer_name}' nicht in Planhat finden — "
+                "ist der Firmenname korrekt geschrieben?"
+            ),
+            text="Kein Planhat-Treffer",
+            thread_ts=ts,
+        )
+        return
+    if planhat_result.get('ambiguous'):
+        candidates = ', '.join(planhat_result.get('candidates', []))
+        say(
+            blocks=build_sandbox_clarification_blocks(
+                f"Ich konnte '{customer_name}' nicht eindeutig in Planhat finden — "
+                f"meintest du: {candidates}?"
+            ),
+            text="Mehrdeutiger Planhat-Treffer",
+            thread_ts=ts,
+        )
+        return
+
+    variant = resolve_paragraph_variants(
+        planhat_result.get('sandbox_raw'),
+        planhat_result.get('spiegelung_raw'),
+        planhat_result.get('cs_package'),
+    )
+    if variant.get('mode') == 'unresolved':
+        field = variant.get('unresolved_field')
+        raw_value = variant.get('raw_value')
+        say(
+            blocks=build_sandbox_clarification_blocks(
+                f"Ich habe im Planhat-Feld `{field}` einen mir unbekannten Wert "
+                f"'{raw_value}' gefunden — welcher Preis-Absatz passt hier?"
+            ),
+            text="Unbekannter Preiswert",
+            thread_ts=ts,
+        )
+        return
+
+    email_text = build_customer_email(
+        chargebee_result.get('first_name'), chargebee_result.get('email'), variant
+    )
+    say(
+        blocks=build_sandbox_lookup_result_blocks(
+            customer_name, chargebee_result, planhat_result, variant, email_text
+        ),
+        text="Sandbox-Anfrage — E-Mail-Entwurf",
+        thread_ts=ts,
+    )
+    _pending_sandbox[(channel, ts)] = {
+        'step': 'awaiting_fit_confirmation',
+        'user_id': user_id,
+        'user_name': user_name,
+        'customer_name': customer_name,
+        'wants_custom_code': parsed.get('custom_code'),
+        'chargebee_result': chargebee_result,
+        'planhat_result': planhat_result,
+        'variant': variant,
+        'email_text': email_text,
+        'created_at': time.time(),
+    }
+
+
+def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name, text) -> bool:
+    """Treibt den Sandbox-Flow im Thread einen Schritt weiter, falls einer aktiv ist.
+
+    Gibt True zurück wenn eine Nachricht behandelt wurde (Aufrufer soll dann returnen),
+    sonst False (kein aktiver Sandbox-Flow in diesem Thread).
+    """
+    state = _pending_sandbox.get((channel, thread_ts))
+    if not state:
+        return False
+
+    step = state.get('step')
+    if step == 'awaiting_fit_confirmation':
+        if _SANDBOX_AFFIRMATIVE_RE.search(text or ''):
+            say(
+                blocks=build_sandbox_come_back_later_blocks(),
+                text="Alles klar — bis zur Kundenantwort!",
+                thread_ts=thread_ts,
+            )
+            state['step'] = 'awaiting_customer_reply'
+        else:
+            logger.info(f"Sandbox-Korrektur in {channel}/{thread_ts}: {text!r}")
+            state['correction_text'] = text
+            say(
+                text="Danke für den Hinweis — was genau sollte ich anders formulieren?",
+                thread_ts=thread_ts,
+            )
+        return True
+
+    if step == 'awaiting_customer_reply':
+        say(
+            blocks=build_sandbox_scope_question_blocks(),
+            text="Was soll final umgesetzt werden?",
+            thread_ts=thread_ts,
+        )
+        state['step'] = 'awaiting_scope_choice'
+        return True
+
+    if step == 'awaiting_scope_choice':
+        say(text="Bitte nutze einen der Buttons oben 👆", thread_ts=thread_ts)
+        return True
+
+    if step == 'awaiting_instance_info':
+        info = parse_instance_info(text or '')
+        required = ('prod_url', 'prod_serial', 'sandbox_url', 'sandbox_serial')
+        missing = [k for k in required if k not in info]
+        if missing:
+            missing_labels = ', '.join(_INSTANCE_INFO_LABELS[k] for k in missing)
+            say(
+                text=f"Mir fehlen noch: {missing_labels} — bitte ergänzen.",
+                thread_ts=thread_ts,
+            )
+            return True
+
+        ticket = create_sandbox_mirroring_ticket(
+            state.get('customer_name', ''),
+            info['prod_url'],
+            info['prod_serial'],
+            info['sandbox_url'],
+            info['sandbox_serial'],
+        )
+        if ticket:
+            say(
+                text=f":white_check_mark: Jira-Ticket erstellt: <{ticket['url']}|{ticket['key']}>",
+                thread_ts=thread_ts,
+            )
+        else:
+            say(
+                text=(
+                    ":warning: Das Jira-Ticket konnte nicht angelegt werden — bitte manuell "
+                    "im CCS-Projekt in Jira anlegen oder nochmal hier antworten, um es erneut zu versuchen."
+                ),
+                thread_ts=thread_ts,
+            )
+        state['step'] = 'done'
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Event handlers
 # ---------------------------------------------------------------------------
 
@@ -923,12 +1157,24 @@ def _handle_message_core(event, say, client):
         user_id = event.get('user', '')
         if not user_id:
             return
+        text = event.get('text', '') or ''
+        channel = event.get('channel', '')
+        dm_ts = event.get('ts')
+        dm_thread_ts = event.get('thread_ts')
+        user_name = get_user_name(client, user_id)
+
+        # --- Sandbox-Anfrage-Flow: für ALLE CSMs, unabhängig von CS_ADMIN_USER_IDS ---
+        # Muss vor dem Admin-only-Gate laufen, damit auch Nicht-Admin-CSMs den Flow per DM
+        # nutzen können. Alle anderen DMs fallen unverändert durch die bestehende Admin-Logik.
+        if dm_thread_ts and _advance_sandbox_thread(say, client, channel, dm_thread_ts, user_id, user_name, text):
+            return
+        if detect_sandbox_request(text):
+            _handle_sandbox_intent(say, client, channel, dm_ts, user_id, user_name, text)
+            return
+
         if user_id not in CS_ADMIN_USER_IDS:
             say(text="Die Chat-Funktion ist aktuell nur für das CS Admin Team verfügbar.")
             return
-        text = event.get('text', '') or ''
-        channel = event.get('channel', '')
-        user_name = get_user_name(client, user_id)
         # In DMs kein thread_ts — direkt in den DM-Channel antworten
         import re as _re
         clean = _re.sub(r'<@[A-Z0-9]+>', '', text).strip()
@@ -974,6 +1220,10 @@ def _handle_message_core(event, say, client):
     # THREAD REPLY
     # -----------------------------------------------------------------------
     if thread_ts:
+        # --- Sandbox-Anfrage: Fortsetzung eines aktiven Flows in diesem Thread ---
+        if _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name, text):
+            return
+
         # --- ? Hilfe-Trigger: ein oder mehrere Fragezeichen → Bot erklärt was zu tun ist ---
         if re.fullmatch(r'\?+', text.strip()):
             va_state_check = _pending_vertragsanpassung.get((channel, thread_ts))
@@ -1746,6 +1996,13 @@ def _handle_message_core(event, say, client):
     # NEW MESSAGE
     # -----------------------------------------------------------------------
 
+    # --- Sandbox-Anfrage: auto-detection (Improvement- oder VA-Channel, z.B. #ask-cs-admin) ---
+    # Vor dem Vertragsanpassungs-Check platziert, damit es nicht von überlappenden Keywords
+    # geschluckt wird — detect_sandbox_request schließt VA-Treffer bereits selbst aus.
+    if (_in_improvement or _in_va) and detect_sandbox_request(text):
+        _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text)
+        return
+
     # --- Vertragsanpassung: auto-detection (only in VA channel) ---
     if _in_va and detect_vertragsanpassung(text):
         _set_eyes(client, channel, ts)
@@ -2238,6 +2495,54 @@ def handle_va_select_plan(ack, body, say, client):
                                     state['user_name'], state['parsed'], state.get('subscription'))
 
 
+def _handle_sandbox_scope_choice(ack, body, say, client, scope: str):
+    """Gemeinsame Logik für die drei Sandbox-Scope-Buttons (Schritt 2)."""
+    ack()
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    if not thread_ts:
+        return
+    state = _pending_sandbox.get((channel, thread_ts))
+    if not state:
+        say(
+            text=":wave: Kein aktiver Sandbox-Flow in diesem Thread mehr — bitte die Anfrage neu stellen.",
+            thread_ts=thread_ts,
+        )
+        return
+
+    say(blocks=build_sandbox_step2_stub_blocks(scope), text="Nächste Schritte", thread_ts=thread_ts)
+
+    if scope in ('new_plus_mirror', 'mirror_existing'):
+        # Ticket wird erst nach Erhalt der 4 Instanz-Werte angelegt (awaiting_instance_info),
+        # nicht mehr hier inline — siehe _advance_sandbox_thread.
+        say(
+            blocks=build_sandbox_instance_info_request_blocks(),
+            text="Instanz-Infos für Jira-Ticket benötigt",
+            thread_ts=thread_ts,
+        )
+        state['step'] = 'awaiting_instance_info'
+    else:
+        state['step'] = 'done'
+
+
+@app.action("sandbox_scope_new_only")
+def handle_sandbox_scope_new_only(ack, body, say, client):
+    """Button: Schritt 2 — nur neue Sandbox anlegen (keine Spiegelung)."""
+    _handle_sandbox_scope_choice(ack, body, say, client, 'new_only')
+
+
+@app.action("sandbox_scope_new_plus_mirror")
+def handle_sandbox_scope_new_plus_mirror(ack, body, say, client):
+    """Button: Schritt 2 — neue Sandbox anlegen + Spiegelung."""
+    _handle_sandbox_scope_choice(ack, body, say, client, 'new_plus_mirror')
+
+
+@app.action("sandbox_scope_mirror_existing")
+def handle_sandbox_scope_mirror_existing(ack, body, say, client):
+    """Button: Schritt 2 — Spiegelung auf bereits bestehender Sandbox."""
+    _handle_sandbox_scope_choice(ack, body, say, client, 'mirror_existing')
+
+
 @app.action("create_ticket_button")
 def handle_create_ticket(ack, body, say):
     ack()
@@ -2541,6 +2846,102 @@ def handle_reaction_added(event, say, client):
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Daily reminder: unanswered questions in #ask-cs-admin
+# ---------------------------------------------------------------------------
+
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _BERLIN_TZ = _ZoneInfo('Europe/Berlin')
+except ImportError:
+    _BERLIN_TZ = timezone(timedelta(hours=2))
+
+_ASK_CS_ADMIN_CHANNEL = 'C06MK1QGMTR'
+_REMINDER_TAG_IDS = {'U07TRKK8BH9', 'U07G83YH6RW'}  # Sara, Mirjam
+_REMINDER_MARKER = 'noch-offen-reminder'
+
+
+def _check_unanswered_questions(slack_client) -> None:
+    now = datetime.now(tz=_BERLIN_TZ)
+    # On Mondays look back 72h to catch Friday messages
+    lookback_hours = 72 if now.weekday() == 0 else 48
+    oldest = (now - timedelta(hours=lookback_hours)).timestamp()
+
+    try:
+        history = slack_client.conversations_history(
+            channel=_ASK_CS_ADMIN_CHANNEL,
+            oldest=str(oldest),
+            limit=50,
+        )
+    except Exception as e:
+        logger.warning(f"ask-cs-admin history fetch failed: {e}")
+        return
+
+    for msg in history.get('messages', []):
+        if msg.get('bot_id') or msg.get('subtype'):
+            continue
+        ts = msg.get('ts', '')
+        if not ts or not msg.get('user'):
+            continue
+
+        # Skip if already marked done via ✅ reaction
+        reactions = {r.get('name') for r in msg.get('reactions', [])}
+        if reactions & {'white_check_mark', 'heavy_check_mark'}:
+            continue
+
+        # Check thread for CS admin reply or existing reminder from this bot
+        already_reminded = False
+        has_admin_reply = False
+        if msg.get('reply_count', 0) > 0:
+            try:
+                replies = slack_client.conversations_replies(
+                    channel=_ASK_CS_ADMIN_CHANNEL, ts=ts, limit=30,
+                )
+                for reply in replies.get('messages', [])[1:]:
+                    if reply.get('user') in CS_ADMIN_USER_IDS:
+                        has_admin_reply = True
+                        break
+                    if _REMINDER_MARKER in (reply.get('text') or ''):
+                        already_reminded = True
+                        break
+            except Exception as e:
+                logger.warning(f"Thread fetch for {ts} failed: {e}")
+                continue
+
+        if has_admin_reply or already_reminded:
+            continue
+
+        mentions = ' '.join(f'<@{uid}>' for uid in sorted(_REMINDER_TAG_IDS))
+        try:
+            slack_client.chat_postMessage(
+                channel=_ASK_CS_ADMIN_CHANNEL,
+                thread_ts=ts,
+                text=(
+                    f":wave: {mentions} — diese Anfrage ist noch offen und wurde bisher nicht beantwortet. "
+                    f"<!-- {_REMINDER_MARKER} -->"
+                ),
+            )
+            logger.info(f"Unanswered reminder posted for {ts}")
+        except Exception as e:
+            logger.warning(f"Reminder post failed for {ts}: {e}")
+
+
+def _daily_reminder_loop() -> None:
+    last_run_date = None
+    while True:
+        try:
+            now = datetime.now(tz=_BERLIN_TZ)
+            is_weekday = now.weekday() < 5
+            is_8am = now.hour == 8 and now.minute < 5
+            today = now.date()
+            if is_weekday and is_8am and last_run_date != today:
+                last_run_date = today
+                _check_unanswered_questions(app.client)
+        except Exception as e:
+            logger.warning(f"Daily reminder loop error: {e}")
+        time.sleep(60)
+
+
 # Flask routes
 # ---------------------------------------------------------------------------
 
@@ -2574,4 +2975,5 @@ def productive_sync_endpoint():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting CS Improvement Bot on port {port}...")
+    threading.Thread(target=_daily_reminder_loop, daemon=True, name="daily-reminder").start()
     flask_app.run(host="0.0.0.0", port=port)
