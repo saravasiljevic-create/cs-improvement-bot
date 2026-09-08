@@ -198,6 +198,35 @@ def delete_ticket(issue_key: str) -> dict:
         raise
 
 
+def create_ccs_mirroring_ticket(summary: str, description: str) -> dict:
+    """Create a Jira Task ticket in the CCS (Customer cloud service) project.
+
+    Used for Sandbox-Spiegelung requests from the Sandbox-Anfrage flow — a separate
+    project from the CS project used by create_ticket() above (verified against the
+    real production ticket CCS-1956). Mirrors create_ticket's minimal issue_dict
+    pattern and error handling (raises on failure; caller is responsible for
+    catching it).
+    """
+    try:
+        issue_dict = {
+            'project': {'key': 'CCS'},
+            'summary': summary,
+            'description': description,
+            'issuetype': {'name': 'Task'},
+        }
+        new_issue = _get_client().create_issue(fields=issue_dict)
+        print(f"Created Jira ticket {new_issue.key}")
+
+        return {
+            'key': new_issue.key,
+            'url': f'{JIRA_SERVER_URL}/browse/{new_issue.key}',
+            'summary': summary,
+        }
+    except Exception as e:
+        print(f"Error creating CCS mirroring ticket: {str(e)}")
+        raise
+
+
 def _attach_images(issue_key: str, images: list, slack_token: str):
     """Download images from Slack and attach them to the Jira issue.
 
