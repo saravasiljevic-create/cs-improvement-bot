@@ -253,7 +253,7 @@ def get_planhat_sandbox_fields(customer_name: str, api_token: str, debit_number=
         'spiegelung_raw': spiegelung_raw,
         'cs_package': cs_package,
         'has_existing_sandbox': has_existing_sandbox,
-        'planhat_url': f"https://app.planhat.com/customer/{company.get('_id')}",
+        'planhat_url': f"https://ws.planhat.com/xentral/home/content-explorer?profile=Company.{company.get('_id')}",
     }
 
 
