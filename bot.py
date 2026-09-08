@@ -944,26 +944,31 @@ _INSTANCE_INFO_LABELS = {
 }
 
 
-def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
-    """Orchestriert den Sandbox-Anfrage-Flow: Parsing -> Chargebee/Planhat-Lookup ->
-    Preis-Mapping -> E-Mail-Entwurf -> Slack-Antwort -> _pending_sandbox-Eintrag.
+def _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code):
+    """Merkt sich im Thread, dass eine Rückfrage offen ist (kein Match/mehrdeutig/
+    unauflösbarer Feldwert/kein Kundenname) — ohne diesen Eintrag würde eine spätere
+    Korrektur-Antwort des CSMs im selben Thread ins Leere laufen (fällt sonst auf
+    unrelated Handling wie die allgemeine Chat-Q&A zurück statt den Flow fortzusetzen)."""
+    _pending_sandbox[(channel, ts)] = {
+        'step': 'awaiting_clarification',
+        'user_id': user_id,
+        'user_name': user_name,
+        'wants_spiegelung': wants_spiegelung,
+        'wants_custom_code': wants_custom_code,
+        'created_at': time.time(),
+    }
 
-    Bricht bei fehlendem/mehrdeutigem Match oder unauflösbarem Feldwert mit einer
-    Rückfrage ab — rät niemals.
+
+def _run_sandbox_lookup(say, client, channel, ts, user_id, user_name, customer_name,
+                         wants_spiegelung, wants_custom_code):
+    """Chargebee/Planhat-Lookup -> Preis-Mapping -> E-Mail-Entwurf -> Slack-Antwort ->
+    _pending_sandbox-Eintrag, für einen bereits bekannten Kundennamen.
+
+    Wird sowohl vom initialen Intent-Handler als auch von der Namens-Korrektur-
+    Rückfrage (Schritt 'awaiting_clarification') mit demselben Kundennamen-Slot
+    aufgerufen. Bricht bei fehlendem/mehrdeutigem Match oder unauflösbarem Feldwert
+    mit einer Rückfrage ab (und merkt sich diese im Thread) — rät niemals.
     """
-    parsed = parse_sandbox_request(text)
-    customer_name = parsed.get('customer_name')
-    if not customer_name:
-        say(
-            blocks=build_sandbox_clarification_blocks(
-                "Ich konnte keinen Kundennamen aus deiner Nachricht erkennen — "
-                "für welchen Kunden soll die Sandbox eingerichtet werden?"
-            ),
-            text="Kundenname unklar",
-            thread_ts=ts,
-        )
-        return
-
     chargebee_result = get_chargebee_contact_email(customer_name, CHARGEBEE_API_KEY, CHARGEBEE_SITE)
     if chargebee_result is None:
         say(
@@ -974,6 +979,7 @@ def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
             text="Kein Chargebee-Treffer",
             thread_ts=ts,
         )
+        _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
         return
     if chargebee_result.get('ambiguous'):
         candidates = ', '.join(chargebee_result.get('candidates', []))
@@ -985,6 +991,7 @@ def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
             text="Mehrdeutiger Chargebee-Treffer",
             thread_ts=ts,
         )
+        _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
         return
 
     planhat_result = get_planhat_sandbox_fields(
@@ -999,6 +1006,7 @@ def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
             text="Kein Planhat-Treffer",
             thread_ts=ts,
         )
+        _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
         return
     if planhat_result.get('ambiguous'):
         candidates = ', '.join(planhat_result.get('candidates', []))
@@ -1010,6 +1018,7 @@ def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
             text="Mehrdeutiger Planhat-Treffer",
             thread_ts=ts,
         )
+        _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
         return
 
     # Hat der Kunde laut Planhat bereits eine Sandbox (aktives 'sandbox-*'-Produkt)?
@@ -1031,6 +1040,7 @@ def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
                 text="Unbekannter Preiswert",
                 thread_ts=ts,
             )
+            _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
             return
 
         email_text = build_existing_sandbox_mirroring_email(
@@ -1060,6 +1070,7 @@ def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
                 text="Unbekannter Preiswert",
                 thread_ts=ts,
             )
+            _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
             return
 
         email_text = build_customer_email(
@@ -1077,13 +1088,37 @@ def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
         'user_id': user_id,
         'user_name': user_name,
         'customer_name': customer_name,
-        'wants_custom_code': parsed.get('custom_code'),
+        'wants_custom_code': wants_custom_code,
         'chargebee_result': chargebee_result,
         'planhat_result': planhat_result,
         'variant': variant,
         'email_text': email_text,
         'created_at': time.time(),
     }
+
+
+def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
+    """Parst die Sandbox-Anfrage und startet den Lookup — siehe _run_sandbox_lookup."""
+    parsed = parse_sandbox_request(text)
+    customer_name = parsed.get('customer_name')
+    if not customer_name:
+        say(
+            blocks=build_sandbox_clarification_blocks(
+                "Ich konnte keinen Kundennamen aus deiner Nachricht erkennen — "
+                "für welchen Kunden soll die Sandbox eingerichtet werden?"
+            ),
+            text="Kundenname unklar",
+            thread_ts=ts,
+        )
+        _await_sandbox_clarification(
+            channel, ts, user_id, user_name, parsed.get('wants_spiegelung'), parsed.get('custom_code')
+        )
+        return
+
+    _run_sandbox_lookup(
+        say, client, channel, ts, user_id, user_name,
+        customer_name, parsed.get('wants_spiegelung'), parsed.get('custom_code'),
+    )
 
 
 def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name, text) -> bool:
@@ -1097,6 +1132,17 @@ def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name,
         return False
 
     step = state.get('step')
+    if step == 'awaiting_clarification':
+        corrected_name = (text or '').strip()
+        if not corrected_name:
+            say(text="Für welchen Kunden soll die Sandbox eingerichtet werden?", thread_ts=thread_ts)
+            return True
+        _run_sandbox_lookup(
+            say, client, channel, thread_ts, state['user_id'], state['user_name'],
+            corrected_name, state.get('wants_spiegelung'), state.get('wants_custom_code'),
+        )
+        return True
+
     if step == 'awaiting_fit_confirmation':
         if _SANDBOX_AFFIRMATIVE_RE.search(text or ''):
             say(
