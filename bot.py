@@ -60,6 +60,8 @@ from vertragsanpassung_handler import (
 )
 from sandbox_handler import (
     build_customer_email,
+    build_existing_sandbox_mirroring_email,
+    build_existing_sandbox_result_blocks,
     build_sandbox_clarification_blocks,
     build_sandbox_come_back_later_blocks,
     build_sandbox_instance_info_request_blocks,
@@ -73,6 +75,7 @@ from sandbox_handler import (
     parse_instance_info,
     parse_sandbox_request,
     resolve_paragraph_variants,
+    resolve_spiegelung_only_variant,
 )
 
 # Erkennt Chargebee-Links (Subscription ODER Customer) und Standard-IDs
@@ -1009,34 +1012,66 @@ def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
         )
         return
 
-    variant = resolve_paragraph_variants(
-        planhat_result.get('sandbox_raw'),
-        planhat_result.get('spiegelung_raw'),
-        planhat_result.get('cs_package'),
-    )
-    if variant.get('mode') == 'unresolved':
-        field = variant.get('unresolved_field')
-        raw_value = variant.get('raw_value')
+    # Hat der Kunde laut Planhat bereits eine Sandbox (aktives 'sandbox-*'-Produkt)?
+    # Dann passt Template 1 (Neu-Sandbox) inhaltlich nicht — stattdessen Template 2
+    # (Spiegelung auf bestehender Sandbox) vorschlagen.
+    if planhat_result.get('has_existing_sandbox'):
+        variant = resolve_spiegelung_only_variant(
+            planhat_result.get('spiegelung_raw'),
+            planhat_result.get('cs_package'),
+        )
+        if variant.get('mode') == 'unresolved':
+            field = variant.get('unresolved_field')
+            raw_value = variant.get('raw_value')
+            say(
+                blocks=build_sandbox_clarification_blocks(
+                    f"Ich habe im Planhat-Feld `{field}` einen mir unbekannten Wert "
+                    f"'{raw_value}' gefunden — welcher Preis-Absatz passt hier?"
+                ),
+                text="Unbekannter Preiswert",
+                thread_ts=ts,
+            )
+            return
+
+        email_text = build_existing_sandbox_mirroring_email(
+            chargebee_result.get('first_name'), chargebee_result.get('email'), variant['spiegelung_key']
+        )
         say(
-            blocks=build_sandbox_clarification_blocks(
-                f"Ich habe im Planhat-Feld `{field}` einen mir unbekannten Wert "
-                f"'{raw_value}' gefunden — welcher Preis-Absatz passt hier?"
+            blocks=build_existing_sandbox_result_blocks(
+                customer_name, chargebee_result, planhat_result, variant, email_text
             ),
-            text="Unbekannter Preiswert",
+            text="Sandbox-Anfrage — E-Mail-Entwurf (bestehende Sandbox)",
             thread_ts=ts,
         )
-        return
+    else:
+        variant = resolve_paragraph_variants(
+            planhat_result.get('sandbox_raw'),
+            planhat_result.get('spiegelung_raw'),
+            planhat_result.get('cs_package'),
+        )
+        if variant.get('mode') == 'unresolved':
+            field = variant.get('unresolved_field')
+            raw_value = variant.get('raw_value')
+            say(
+                blocks=build_sandbox_clarification_blocks(
+                    f"Ich habe im Planhat-Feld `{field}` einen mir unbekannten Wert "
+                    f"'{raw_value}' gefunden — welcher Preis-Absatz passt hier?"
+                ),
+                text="Unbekannter Preiswert",
+                thread_ts=ts,
+            )
+            return
 
-    email_text = build_customer_email(
-        chargebee_result.get('first_name'), chargebee_result.get('email'), variant
-    )
-    say(
-        blocks=build_sandbox_lookup_result_blocks(
-            customer_name, chargebee_result, planhat_result, variant, email_text
-        ),
-        text="Sandbox-Anfrage — E-Mail-Entwurf",
-        thread_ts=ts,
-    )
+        email_text = build_customer_email(
+            chargebee_result.get('first_name'), chargebee_result.get('email'), variant
+        )
+        say(
+            blocks=build_sandbox_lookup_result_blocks(
+                customer_name, chargebee_result, planhat_result, variant, email_text
+            ),
+            text="Sandbox-Anfrage — E-Mail-Entwurf",
+            thread_ts=ts,
+        )
     _pending_sandbox[(channel, ts)] = {
         'step': 'awaiting_fit_confirmation',
         'user_id': user_id,

@@ -213,12 +213,19 @@ def get_planhat_sandbox_fields(customer_name: str, api_token: str, debit_number=
     sandbox_raw = custom.get('Sandbox')
     spiegelung_raw = custom.get('Sandbox Spiegelung')
     cs_package = custom.get('CS Package')
+    # 'products' ist ein Top-Level-Feld (Chargebee-Sync), keine custom-Property —
+    # listet aktive Item-Price-IDs, z.B. "sandbox-monthly-contract-monthly-payment".
+    # Damit erkennen wir zuverlässig, ob der Kunde bereits eine Sandbox hat, ohne
+    # eine zusätzliche Chargebee-Subscription-Abfrage zu brauchen.
+    products = company.get('products') or []
+    has_existing_sandbox = any(str(p).lower().startswith('sandbox') for p in products)
     return {
         'planhat_id': company.get('_id'),
         'name': company.get('name'),
         'sandbox_raw': sandbox_raw,
         'spiegelung_raw': spiegelung_raw,
         'cs_package': cs_package,
+        'has_existing_sandbox': has_existing_sandbox,
         'planhat_url': f"https://app.planhat.com/customer/{company.get('_id')}",
     }
 
@@ -454,6 +461,34 @@ def build_sandbox_lookup_result_blocks(
         spiegelung_key = variant.get('spiegelung_key')
         if sandbox_key in _VARIANT_EXPLANATIONS:
             lines.append(f"*Preis-Variante Sandbox:* {_VARIANT_EXPLANATIONS[sandbox_key]}")
+        if spiegelung_key in _SPIEGELUNG_EXPLANATIONS:
+            lines.append(f"*Preis-Variante Spiegelung:* {_SPIEGELUNG_EXPLANATIONS[spiegelung_key]}")
+
+    text = '\n'.join(lines)
+    text += f"\n\n```\n{email_text}\n```"
+    text += "\n\nPasst das so? Antworte mit *ja* oder beschreibe kurz, was nicht passt."
+    return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
+
+
+def build_existing_sandbox_result_blocks(
+    customer_name: str, chargebee_result: dict, planhat_result: dict, variant: dict, email_text: str
+) -> list[dict]:
+    """Recap + E-Mail-Entwurf für den Fall, dass der Kunde laut Planhat bereits eine
+    Sandbox hat — nutzt Template 2 (Spiegelung auf bestehender Sandbox) statt Template 1."""
+    lines = [f"*Kunde:* {customer_name}"]
+    lines.append(
+        ":bulb: Kunde hat laut Planhat bereits eine Sandbox (aktives Produkt beginnt mit "
+        "`sandbox`) → Spiegelungs-Template statt Neu-Sandbox-Vorlage vorgeschlagen."
+    )
+    if chargebee_result.get('email'):
+        lines.append(f"*Chargebee-Kontakt (Decider):* {chargebee_result['email']}")
+    if planhat_result.get('planhat_url'):
+        lines.append(f"*Planhat:* <{planhat_result['planhat_url']}|{planhat_result.get('name', customer_name)}>")
+
+    if variant.get('override_reason') == 'success_package':
+        lines.append(":warning: Servicepaket enthält 'Success' → Basis-Variante erzwungen (Datenqualitäts-Fix)")
+    else:
+        spiegelung_key = variant.get('spiegelung_key')
         if spiegelung_key in _SPIEGELUNG_EXPLANATIONS:
             lines.append(f"*Preis-Variante Spiegelung:* {_SPIEGELUNG_EXPLANATIONS[spiegelung_key]}")
 
