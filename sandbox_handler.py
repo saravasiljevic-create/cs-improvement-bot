@@ -593,6 +593,66 @@ def build_sandbox_scope_question_blocks() -> list[dict]:
     ]
 
 
+# Loom-Anleitungen zur Sandbox-Erstellung in Chargebee, von Sara bereitgestellt.
+# Welches Video passt, richtet sich nach der bereits in Schritt 1 berechneten
+# Sandbox-Preis-Variante ("kostenlos" deckt sich 1:1 mit dem dort erkannten
+# free/kombinierten-Premium-L-Fall) bzw. — falls nicht kostenlos — danach, ob der
+# Kunde in seiner Antwort einen Monats- oder Jahresvertrag für die Sandbox gewählt
+# hat (das weiß nur der CSM, dafür gibt es die Rückfrage unten).
+LOOM_SANDBOX_FREE_URL = "https://www.loom.com/share/a9d44ca176ce4b11be81c2046e51be40"
+LOOM_SANDBOX_MONTHLY_URL = "https://www.loom.com/share/a7791adbc4704e5cb120a8535b425144"
+LOOM_SANDBOX_ANNUAL_URL = "https://www.loom.com/share/de525d7045844f3f9ef9f575d57655b2"
+
+
+def sandbox_is_free(variant: dict) -> bool:
+    """True für exakt die Fälle, die Schritt 1 schon als kostenfrei erkannt hat
+    (Growth S–Premium M sowie das kombinierte Premium-L-Sondertemplate)."""
+    if variant.get('mode') == 'combined_premium_l':
+        return True
+    if variant.get('mode') == 'standard' and variant.get('sandbox_key') == 'growth_s_premium_m':
+        return True
+    return False
+
+
+def build_sandbox_contract_type_question_blocks() -> list[dict]:
+    """Fragt per Buttons, ob der Kunde einen Monats- oder Jahresvertrag für die
+    Sandbox gewählt hat — bestimmt, welches Loom-Video zur Chargebee-Erstellung passt."""
+    return [
+        {
+            'type': 'section',
+            'text': {
+                'type': 'mrkdwn',
+                'text': 'Hat der Kunde einen Monats- oder Jahresvertrag für die Sandbox gewählt?',
+            },
+        },
+        {
+            'type': 'actions',
+            'elements': [
+                {
+                    'type': 'button',
+                    'text': {'type': 'plain_text', 'text': 'Monatsvertrag'},
+                    'action_id': 'sandbox_contract_monthly',
+                    'value': 'monthly',
+                },
+                {
+                    'type': 'button',
+                    'text': {'type': 'plain_text', 'text': 'Jahresvertrag'},
+                    'action_id': 'sandbox_contract_annual',
+                    'value': 'annual',
+                },
+            ],
+        },
+    ]
+
+
+def build_sandbox_video_blocks(loom_url: str) -> list[dict]:
+    """Verlinkt die passende Loom-Anleitung zur Sandbox-Erstellung in Chargebee."""
+    return [{
+        'type': 'section',
+        'text': {'type': 'mrkdwn', 'text': f"🎥 Anleitung zur Sandbox-Erstellung in Chargebee: {loom_url}"},
+    }]
+
+
 def build_sandbox_step2_stub_blocks(scope: str) -> list[dict]:
     """Platzhalter für Schritt 2 (Chargebee-Umsetzung).
 

@@ -59,15 +59,20 @@ from vertragsanpassung_handler import (
     _fetch_subscription_by_id,
 )
 from sandbox_handler import (
+    LOOM_SANDBOX_ANNUAL_URL,
+    LOOM_SANDBOX_FREE_URL,
+    LOOM_SANDBOX_MONTHLY_URL,
     build_customer_email,
     build_existing_sandbox_mirroring_email,
     build_existing_sandbox_result_blocks,
     build_sandbox_clarification_blocks,
     build_sandbox_come_back_later_blocks,
+    build_sandbox_contract_type_question_blocks,
     build_sandbox_instance_info_request_blocks,
     build_sandbox_lookup_result_blocks,
     build_sandbox_scope_question_blocks,
     build_sandbox_step2_stub_blocks,
+    build_sandbox_video_blocks,
     create_sandbox_mirroring_ticket,
     detect_sandbox_request,
     get_chargebee_contact_email,
@@ -76,6 +81,7 @@ from sandbox_handler import (
     parse_sandbox_request,
     resolve_paragraph_variants,
     resolve_spiegelung_only_variant,
+    sandbox_is_free,
 )
 
 # Erkennt Chargebee-Links (Subscription ODER Customer) und Standard-IDs
@@ -1170,6 +1176,10 @@ def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name,
         return True
 
     if step == 'awaiting_scope_choice':
+        say(text="Bitte nutze einen der Buttons oben 👆", thread_ts=thread_ts)
+        return True
+
+    if step == 'awaiting_contract_type':
         say(text="Bitte nutze einen der Buttons oben 👆", thread_ts=thread_ts)
         return True
 
@@ -2578,6 +2588,21 @@ def handle_va_select_plan(ack, body, say, client):
                                     state['user_name'], state['parsed'], state.get('subscription'))
 
 
+def _continue_sandbox_after_video(say, channel, thread_ts, state, scope: str):
+    """Nach dem Zeigen des passenden Loom-Videos (oder direkt, falls kein Video
+    nötig war) geht es weiter wie bisher: bei new_plus_mirror Instanz-Infos für
+    das Jira-Ticket abfragen, sonst ist der Flow für diesen Scope abgeschlossen."""
+    if scope == 'new_plus_mirror':
+        say(
+            blocks=build_sandbox_instance_info_request_blocks(),
+            text="Instanz-Infos für Jira-Ticket benötigt",
+            thread_ts=thread_ts,
+        )
+        state['step'] = 'awaiting_instance_info'
+    else:
+        state['step'] = 'done'
+
+
 def _handle_sandbox_scope_choice(ack, body, say, client, scope: str):
     """Gemeinsame Logik für die drei Sandbox-Scope-Buttons (Schritt 2)."""
     ack()
@@ -2595,7 +2620,27 @@ def _handle_sandbox_scope_choice(ack, body, say, client, scope: str):
 
     say(blocks=build_sandbox_step2_stub_blocks(scope), text="Nächste Schritte", thread_ts=thread_ts)
 
-    if scope in ('new_plus_mirror', 'mirror_existing'):
+    if scope in ('new_only', 'new_plus_mirror'):
+        # Loom-Anleitung zur Sandbox-Erstellung: kostenlos direkt aus der schon in
+        # Schritt 1 berechneten Preis-Variante ableitbar, sonst muss der CSM sagen,
+        # ob der Kunde Monats- oder Jahresvertrag gewählt hat (weiß nur er/sie).
+        variant = state.get('variant') or {}
+        if sandbox_is_free(variant):
+            say(
+                blocks=build_sandbox_video_blocks(LOOM_SANDBOX_FREE_URL),
+                text="Anleitung: Sandbox erstellen (kostenlos)",
+                thread_ts=thread_ts,
+            )
+            _continue_sandbox_after_video(say, channel, thread_ts, state, scope)
+        else:
+            say(
+                blocks=build_sandbox_contract_type_question_blocks(),
+                text="Monats- oder Jahresvertrag?",
+                thread_ts=thread_ts,
+            )
+            state['pending_video_scope'] = scope
+            state['step'] = 'awaiting_contract_type'
+    elif scope == 'mirror_existing':
         # Ticket wird erst nach Erhalt der 4 Instanz-Werte angelegt (awaiting_instance_info),
         # nicht mehr hier inline — siehe _advance_sandbox_thread.
         say(
@@ -2604,8 +2649,43 @@ def _handle_sandbox_scope_choice(ack, body, say, client, scope: str):
             thread_ts=thread_ts,
         )
         state['step'] = 'awaiting_instance_info'
-    else:
-        state['step'] = 'done'
+
+
+def _handle_sandbox_contract_type(ack, body, say, client, contract_type: str):
+    """Gemeinsame Logik für die Monats-/Jahresvertrag-Buttons (bestimmt das Loom-Video)."""
+    ack()
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    if not thread_ts:
+        return
+    state = _pending_sandbox.get((channel, thread_ts))
+    if not state or state.get('step') != 'awaiting_contract_type':
+        say(
+            text=":wave: Kein aktiver Sandbox-Flow in diesem Thread mehr — bitte die Anfrage neu stellen.",
+            thread_ts=thread_ts,
+        )
+        return
+
+    loom_url = LOOM_SANDBOX_MONTHLY_URL if contract_type == 'monthly' else LOOM_SANDBOX_ANNUAL_URL
+    say(
+        blocks=build_sandbox_video_blocks(loom_url),
+        text=f"Anleitung: Sandbox erstellen ({contract_type})",
+        thread_ts=thread_ts,
+    )
+    scope = state.pop('pending_video_scope', 'new_only')
+    _continue_sandbox_after_video(say, channel, thread_ts, state, scope)
+
+
+@app.action("sandbox_contract_monthly")
+def handle_sandbox_contract_monthly(ack, body, say, client):
+    """Button: Kunde hat Monatsvertrag für die Sandbox gewählt."""
+    _handle_sandbox_contract_type(ack, body, say, client, 'monthly')
+
+
+@app.action("sandbox_contract_annual")
+def handle_sandbox_contract_annual(ack, body, say, client):
+    """Button: Kunde hat Jahresvertrag für die Sandbox gewählt."""
+    _handle_sandbox_contract_type(ack, body, say, client, 'annual')
 
 
 @app.action("sandbox_customer_replied")
