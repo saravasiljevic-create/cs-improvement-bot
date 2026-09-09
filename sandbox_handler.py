@@ -9,8 +9,13 @@ import re
 
 import requests
 
+from config import CS_ADMIN_USER_IDS
 from text_utils import extract_company_name
-from vertragsanpassung_handler import _chargebee_customer_search, detect_vertragsanpassung
+from vertragsanpassung_handler import (
+    _chargebee_customer_search,
+    _names_match,
+    detect_vertragsanpassung,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +134,7 @@ def get_chargebee_contact_email(customer_name: str, api_key: str, site: str) -> 
     base = f"https://{site}.chargebee.com/api/v2"
     auth = (api_key, '')
     try:
-        customers = _chargebee_customer_search(base, auth, customer_name)
+        customers = _chargebee_customer_search(base, auth, customer_name, lenient=True)
     except Exception as e:
         logger.warning(f"get_chargebee_contact_email({customer_name!r}) failed: {e}")
         return None
@@ -200,7 +205,8 @@ def _planhat_find_by_name_scan(customer_name: str, api_token: str) -> list:
             break
         if not page:
             break
-        matches.extend(c for c in page if c.get('name', '').lower() == customer_name.lower())
+        search_lower = customer_name.lower()
+        matches.extend(c for c in page if _names_match(search_lower, c.get('name')))
         if len(page) < 5000:
             break
     return matches
@@ -240,6 +246,9 @@ def get_planhat_sandbox_fields(customer_name: str, api_token: str, debit_number=
     sandbox_raw = custom.get('Sandbox')
     spiegelung_raw = custom.get('Sandbox Spiegelung')
     cs_package = custom.get('CS Package')
+    # HubSpot-Kontakt-Link liegt (live verifiziert) unter custom.Hubspot, nicht
+    # top-level — für den CSM-Hinweis "Chargebee-Kontakt auch in HubSpot prüfen".
+    hubspot_url = custom.get('Hubspot')
     # 'products' ist ein Top-Level-Feld (Chargebee-Sync), keine custom-Property —
     # listet aktive Item-Price-IDs, z.B. "sandbox-monthly-contract-monthly-payment".
     # Damit erkennen wir zuverlässig, ob der Kunde bereits eine Sandbox hat, ohne
@@ -252,6 +261,7 @@ def get_planhat_sandbox_fields(customer_name: str, api_token: str, debit_number=
         'sandbox_raw': sandbox_raw,
         'spiegelung_raw': spiegelung_raw,
         'cs_package': cs_package,
+        'hubspot_url': hubspot_url,
         'has_existing_sandbox': has_existing_sandbox,
         'planhat_url': f"https://ws.planhat.com/xentral/home/content-explorer?profile=Company.{company.get('_id')}",
     }
@@ -383,7 +393,7 @@ danke für deine Nachricht! Gerne richten wir dir eine Sandbox ein. Diese wird s
 
 Bitte beachte, dass der initiale Versand der Sandbox-Zugangsdaten aus technischen Gründen nur an die E-Mail-Adresse des vertraglichen Entscheidungsträgers möglich ist, in eurem Fall also an {DECIDER_EMAIL}. Natürlich könnt ihr nach Erhalt aber beliebige weitere Nutzer hinzufügen.
 
-Bitte bestätige mir kurz, dass du damit einverstanden bist und ob du eine Spiegelung der Daten wünschst. Wenn ihr eine Spiegelung wollt, teile uns bitte auch mit, ob euer Custom Code (falls vorhanden) ebenfalls übertragen werden soll. Sobald wir diese Infos haben, gebe ich die Erstellung der Sandbox umgehend in Auftrag."""
+Bitte bestätige mir kurz, dass du damit einverstanden bist und ob du eine Spiegelung der Daten wünschst. Wenn ihr eine Spiegelung wollt, teile uns bitte auch mit, ob euer Custom Code (falls vorhanden) ebenfalls übertragen werden soll. Falls dir ein bestimmter Zeitpunkt für die Umsetzung lieber ist, lass es uns wissen — andernfalls gebe ich die Erstellung der Sandbox direkt nach deiner Bestätigung in Auftrag."""
 
 _COMBINED_PREMIUM_L_TEMPLATE = """{GREETING}
 
@@ -393,7 +403,7 @@ Im Rahmen eures Premium L-Servicepakets ist sowohl die Bereitstellung der Sandbo
 
 Bitte beachtet, dass der initiale Versand der Sandbox-Zugangsdaten nur an die E-Mail-Adresse des vertraglichen Entscheidungsträgers möglich ist, in eurem Fall also an {DECIDER_EMAIL}. Natürlich könnt ihr nach Erhalt aber beliebige weitere Nutzer hinzufügen.
 
-Bitte bestätige mir kurz, ob du eine Spiegelung der Daten wünschst. Wenn ja, teile mir bitte auch mit, ob euer Custom Code (falls vorhanden) dabei ebenfalls übertragen werden soll. Sobald wir diese Infos haben, gebe ich die Erstellung der Sandbox umgehend in Auftrag.
+Bitte bestätige mir kurz, ob du eine Spiegelung der Daten wünschst. Wenn ja, teile mir bitte auch mit, ob euer Custom Code (falls vorhanden) dabei ebenfalls übertragen werden soll. Falls dir ein bestimmter Zeitpunkt für die Umsetzung lieber ist, lass es uns wissen — andernfalls gebe ich die Erstellung der Sandbox direkt nach deiner Bestätigung in Auftrag.
 
 Gib mir gerne Bescheid, wenn Du weitere Infos brauchst."""
 
@@ -407,7 +417,7 @@ Bitte beachte, dass bei der Spiegelung alle Daten und Einstellungen aus der Haup
 
 Zudem sind nach der Spiegelung alle Prozessstarter in der Sandbox standardmäßig deaktiviert und müssen zum Testen gegebenenfalls wieder aktiviert werden.
 
-Bitte bestätige mir kurz, ob du damit einverstanden bist, bevor ich unsere Entwickler mit der Spiegelung beauftrage. Wenn ihr Custom Code nutzt, teile uns bitte auch mit, ob dieser ebenfalls in die Sandbox übertragen werden soll."""
+Bitte bestätige mir kurz, ob du damit einverstanden bist, bevor ich unsere Entwickler mit der Spiegelung beauftrage. Wenn ihr Custom Code nutzt, teile uns bitte auch mit, ob dieser ebenfalls in die Sandbox übertragen werden soll. Falls dir ein bestimmter Zeitpunkt für die Spiegelung lieber ist, lass es uns wissen — andernfalls beauftragen wir sie direkt nach deiner Bestätigung."""
 
 
 def _greeting(first_name: str | None) -> str:
@@ -469,6 +479,38 @@ _SPIEGELUNG_EXPLANATIONS = {
 }
 
 
+def _fit_confirmation_buttons_block() -> dict:
+    """Buttons als Alternative zum Freitext-Weg ('ja'/Korrekturtext) bei der
+    E-Mail-Entwurfs-Bestätigung — beide Wege funktionieren nebeneinander."""
+    return {
+        'type': 'actions',
+        'elements': [
+            {
+                'type': 'button',
+                'text': {'type': 'plain_text', 'text': '✅ Passt'},
+                'action_id': 'sandbox_fit_confirmed',
+                'value': 'confirmed',
+                'style': 'primary',
+            },
+            {
+                'type': 'button',
+                'text': {'type': 'plain_text', 'text': '✏️ Korrektur nötig'},
+                'action_id': 'sandbox_fit_correction',
+                'value': 'correction',
+            },
+        ],
+    }
+
+
+def _hubspot_reminder_line(planhat_result: dict) -> str:
+    """Hinweis an den CSM, den Chargebee-Kontakt auch in HubSpot zu prüfen —
+    immer als Text, plus Link falls Planhats `custom.Hubspot`-Feld vorhanden ist."""
+    hubspot_url = planhat_result.get('hubspot_url')
+    if hubspot_url:
+        return f"💡 Bitte prüfen, ob der Chargebee-Kontakt auch in <{hubspot_url}|HubSpot> hinterlegt ist."
+    return "💡 Bitte prüfen, ob der Chargebee-Kontakt auch in HubSpot hinterlegt ist."
+
+
 def build_sandbox_lookup_result_blocks(
     customer_name: str, chargebee_result: dict, planhat_result: dict, variant: dict, email_text: str
 ) -> list[dict]:
@@ -478,6 +520,7 @@ def build_sandbox_lookup_result_blocks(
         lines.append(f"*Chargebee-Kontakt (Decider):* {chargebee_result['email']}")
     if planhat_result.get('planhat_url'):
         lines.append(f"*Planhat:* <{planhat_result['planhat_url']}|{planhat_result.get('name', customer_name)}>")
+    lines.append(_hubspot_reminder_line(planhat_result))
 
     if variant.get('override_reason') == 'success_package':
         lines.append(":warning: Servicepaket enthält 'Success' → Basis-Variante erzwungen (Datenqualitäts-Fix)")
@@ -493,8 +536,11 @@ def build_sandbox_lookup_result_blocks(
 
     text = '\n'.join(lines)
     text += f"\n\n```\n{email_text}\n```"
-    text += "\n\nPasst das so? Antworte mit *ja* oder beschreibe kurz, was nicht passt."
-    return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
+    text += "\n\nPasst das so? Antworte mit *ja* oder beschreibe kurz, was nicht passt — oder nutze die Buttons:"
+    return [
+        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}},
+        _fit_confirmation_buttons_block(),
+    ]
 
 
 def build_existing_sandbox_result_blocks(
@@ -511,6 +557,7 @@ def build_existing_sandbox_result_blocks(
         lines.append(f"*Chargebee-Kontakt (Decider):* {chargebee_result['email']}")
     if planhat_result.get('planhat_url'):
         lines.append(f"*Planhat:* <{planhat_result['planhat_url']}|{planhat_result.get('name', customer_name)}>")
+    lines.append(_hubspot_reminder_line(planhat_result))
 
     if variant.get('override_reason') == 'success_package':
         lines.append(":warning: Servicepaket enthält 'Success' → Basis-Variante erzwungen (Datenqualitäts-Fix)")
@@ -521,8 +568,11 @@ def build_existing_sandbox_result_blocks(
 
     text = '\n'.join(lines)
     text += f"\n\n```\n{email_text}\n```"
-    text += "\n\nPasst das so? Antworte mit *ja* oder beschreibe kurz, was nicht passt."
-    return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
+    text += "\n\nPasst das so? Antworte mit *ja* oder beschreibe kurz, was nicht passt — oder nutze die Buttons:"
+    return [
+        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}},
+        _fit_confirmation_buttons_block(),
+    ]
 
 
 def build_sandbox_clarification_blocks(reason: str) -> list[dict]:
@@ -560,33 +610,37 @@ def build_sandbox_come_back_later_blocks() -> list[dict]:
     ]
 
 
-def build_sandbox_scope_question_blocks() -> list[dict]:
-    """Fragt per Buttons, welches der drei Szenarien final umgesetzt werden soll."""
+def build_sandbox_mirroring_question_blocks(has_existing_sandbox: bool) -> list[dict]:
+    """Fragt per Ja/Nein-Buttons, ob der Kunde eine Spiegelung möchte.
+
+    Ersetzt die frühere 3-Wege-Frage (neue Sandbox / +Spiegelung / Spiegelung auf
+    bestehender Sandbox) — ob es um eine neue oder eine bereits bestehende Sandbox
+    geht, ist durch `has_existing_sandbox` (aus Schritt 1, Planhat-Lookup) schon
+    bekannt, das muss der CSM nicht mehr separat auswählen. Der Handler
+    (`_handle_sandbox_mirroring_choice` in bot.py) leitet aus dieser Info +
+    Ja/Nein den finalen Scope ab.
+    """
+    if has_existing_sandbox:
+        prompt = "Möchte der Kunde die Spiegelung auf die bestehende Sandbox durchführen lassen?"
+    else:
+        prompt = "Möchte der Kunde zusätzlich zur neuen Sandbox auch eine Spiegelung?"
     return [
-        {
-            'type': 'section',
-            'text': {'type': 'mrkdwn', 'text': 'Was soll final umgesetzt werden?'},
-        },
+        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': prompt}},
         {
             'type': 'actions',
             'elements': [
                 {
                     'type': 'button',
-                    'text': {'type': 'plain_text', 'text': 'Nur neue Sandbox anlegen'},
-                    'action_id': 'sandbox_scope_new_only',
-                    'value': 'new_only',
+                    'text': {'type': 'plain_text', 'text': 'Ja'},
+                    'action_id': 'sandbox_wants_mirroring_yes',
+                    'value': 'yes',
+                    'style': 'primary',
                 },
                 {
                     'type': 'button',
-                    'text': {'type': 'plain_text', 'text': 'Neue Sandbox + Spiegelung'},
-                    'action_id': 'sandbox_scope_new_plus_mirror',
-                    'value': 'new_plus_mirror',
-                },
-                {
-                    'type': 'button',
-                    'text': {'type': 'plain_text', 'text': 'Spiegelung auf bestehender Sandbox'},
-                    'action_id': 'sandbox_scope_mirror_existing',
-                    'value': 'mirror_existing',
+                    'text': {'type': 'plain_text', 'text': 'Nein'},
+                    'action_id': 'sandbox_wants_mirroring_no',
+                    'value': 'no',
                 },
             ],
         },
@@ -612,6 +666,60 @@ def sandbox_is_free(variant: dict) -> bool:
     if variant.get('mode') == 'standard' and variant.get('sandbox_key') == 'growth_s_premium_m':
         return True
     return False
+
+
+def sandbox_scope_needs_billing(scope: str, variant: dict) -> bool:
+    """True wenn im aufgelösten Szenario tatsächlich etwas zu berechnen ist —
+    steuert, ob CS Admin überhaupt benachrichtigt wird (kostenfreie Fälle brauchen
+    keine Rechnung, also auch keine Benachrichtigung)."""
+    if scope == 'mirror_existing':
+        return variant.get('spiegelung_key') != 'premium_l'
+    if variant.get('mode') == 'combined_premium_l':
+        return False
+    if scope == 'new_only':
+        return variant.get('sandbox_key') != 'growth_s_premium_m'
+    # new_plus_mirror: combined_premium_l (beides kostenfrei) bereits oben ausgeschlossen —
+    # jede andere Kombination hat mindestens beim Sandbox- oder Spiegelung-Anteil Kosten.
+    return True
+
+
+_SCOPE_LABELS = {
+    'new_only': 'Nur neue Sandbox anlegen',
+    'new_plus_mirror': 'Neue Sandbox anlegen + Spiegelung',
+    'mirror_existing': 'Spiegelung auf bestehender Sandbox',
+}
+
+
+def build_sandbox_admin_billing_blocks(
+    customer_name: str, scope: str, requester_name: str, origin_permalink: str | None = None
+) -> list[dict]:
+    """CS-Admin-Benachrichtigung: eine (neue oder gespiegelte) Sandbox wird
+    umgesetzt und muss berechnet werden. `origin_permalink` wird nur beim
+    Cross-Posting aus einem anderen Channel/DM mitgegeben, damit CS Admin den
+    vollen Kontext im Ursprungs-Thread findet."""
+    admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
+    lines = [
+        f"💰 {admin_mentions} *Sandbox-Rechnungsstellung nötig* — {customer_name}",
+        f"*Szenario:* {_SCOPE_LABELS.get(scope, scope)}",
+        f"*Angefragt von:* {requester_name}",
+    ]
+    if origin_permalink:
+        lines.append(f"*Ursprungs-Thread:* {origin_permalink}")
+    text = '\n'.join(lines)
+    return [
+        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}},
+        {
+            'type': 'actions',
+            'elements': [
+                {
+                    'type': 'button',
+                    'text': {'type': 'plain_text', 'text': 'Für Rechnungsstellung übernehmen'},
+                    'action_id': 'sandbox_admin_take_billing',
+                    'value': customer_name,
+                },
+            ],
+        },
+    ]
 
 
 def build_sandbox_contract_type_question_blocks() -> list[dict]:
@@ -658,11 +766,18 @@ def build_sandbox_step2_stub_blocks(scope: str) -> list[dict]:
 
     TODO: replace with real, detailed guidance (+ screenshots) once Sara provides the content.
     """
+    # Neue Zugangsdaten werden nur verschickt, wenn tatsächlich eine neue Sandbox
+    # entsteht — bei mirror_existing sendet Template 2 laut Text explizit keine
+    # neuen Zugangsdaten, daher der Login-Mail-Hinweis nur für diese beiden Fälle.
+    _login_mail_hint = (
+        "\n\n📬 Behalte außerdem den Channel #hs-loginmail-notification im Auge, "
+        "um sicherzugehen, dass der Kunde seine Login-Daten erhalten hat."
+    )
     if scope == 'new_only':
         text = (
             "Als nächstes: Sandbox-Item in Chargebee hinzufügen (Namenskonvention `sandbox-*`, "
             "z.B. `sandbox-monthly-contract-monthly-payment`). Eine ausführliche Anleitung mit "
-            "Screenshots folgt hier bald."
+            "Screenshots folgt hier bald." + _login_mail_hint
         )
     elif scope == 'new_plus_mirror':
         text = (
@@ -670,7 +785,7 @@ def build_sandbox_step2_stub_blocks(scope: str) -> list[dict]:
             "z.B. `sandbox-monthly-contract-monthly-payment`). Eine ausführliche Anleitung mit "
             "Screenshots folgt hier bald.\n\n"
             "Zusätzlich wird für die Spiegelung ein Jira-Ticket angelegt, sobald die Instanz-Infos "
-            "vorliegen (siehe nächste Nachricht)."
+            "vorliegen (siehe nächste Nachricht)." + _login_mail_hint
         )
     elif scope == 'mirror_existing':
         text = (

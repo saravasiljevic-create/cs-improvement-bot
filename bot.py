@@ -65,12 +65,13 @@ from sandbox_handler import (
     build_customer_email,
     build_existing_sandbox_mirroring_email,
     build_existing_sandbox_result_blocks,
+    build_sandbox_admin_billing_blocks,
     build_sandbox_clarification_blocks,
     build_sandbox_come_back_later_blocks,
     build_sandbox_contract_type_question_blocks,
     build_sandbox_instance_info_request_blocks,
     build_sandbox_lookup_result_blocks,
-    build_sandbox_scope_question_blocks,
+    build_sandbox_mirroring_question_blocks,
     build_sandbox_step2_stub_blocks,
     build_sandbox_video_blocks,
     create_sandbox_mirroring_ticket,
@@ -82,6 +83,7 @@ from sandbox_handler import (
     resolve_paragraph_variants,
     resolve_spiegelung_only_variant,
     sandbox_is_free,
+    sandbox_scope_needs_billing,
 )
 
 # Erkennt Chargebee-Links (Subscription ODER Customer) und Standard-IDs
@@ -1097,6 +1099,7 @@ def _run_sandbox_lookup(say, client, channel, ts, user_id, user_name, customer_n
         'wants_custom_code': wants_custom_code,
         'chargebee_result': chargebee_result,
         'planhat_result': planhat_result,
+        'has_existing_sandbox': bool(planhat_result.get('has_existing_sandbox')),
         'variant': variant,
         'email_text': email_text,
         'created_at': time.time(),
@@ -1127,6 +1130,29 @@ def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
     )
 
 
+def _confirm_sandbox_fit(say, thread_ts, state):
+    """E-Mail-Entwurf wurde bestätigt (Text 'ja' oder Button) — bittet den CSM,
+    nach Kundenantwort zurückzukommen."""
+    say(
+        blocks=build_sandbox_come_back_later_blocks(),
+        text="Alles klar — bis zur Kundenantwort!",
+        thread_ts=thread_ts,
+    )
+    state['step'] = 'awaiting_customer_reply'
+
+
+def _request_sandbox_correction(say, thread_ts, state, correction_text=None):
+    """E-Mail-Entwurf passt nicht (Korrektur-Text oder Button) — fragt nach, was
+    zu ändern ist. Bleibt in awaiting_fit_confirmation, ein Button allein kann
+    die eigentliche Korrektur nicht abbilden, die muss weiterhin als Text folgen."""
+    if correction_text is not None:
+        state['correction_text'] = correction_text
+    say(
+        text="Danke für den Hinweis — was genau sollte ich anders formulieren?",
+        thread_ts=thread_ts,
+    )
+
+
 def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name, text) -> bool:
     """Treibt den Sandbox-Flow im Thread einen Schritt weiter, falls einer aktiv ist.
 
@@ -1151,25 +1177,16 @@ def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name,
 
     if step == 'awaiting_fit_confirmation':
         if _SANDBOX_AFFIRMATIVE_RE.search(text or ''):
-            say(
-                blocks=build_sandbox_come_back_later_blocks(),
-                text="Alles klar — bis zur Kundenantwort!",
-                thread_ts=thread_ts,
-            )
-            state['step'] = 'awaiting_customer_reply'
+            _confirm_sandbox_fit(say, thread_ts, state)
         else:
             logger.info(f"Sandbox-Korrektur in {channel}/{thread_ts}: {text!r}")
-            state['correction_text'] = text
-            say(
-                text="Danke für den Hinweis — was genau sollte ich anders formulieren?",
-                thread_ts=thread_ts,
-            )
+            _request_sandbox_correction(say, thread_ts, state, correction_text=text)
         return True
 
     if step == 'awaiting_customer_reply':
         say(
-            blocks=build_sandbox_scope_question_blocks(),
-            text="Was soll final umgesetzt werden?",
+            blocks=build_sandbox_mirroring_question_blocks(state.get('has_existing_sandbox', False)),
+            text="Möchte der Kunde eine Spiegelung?",
             thread_ts=thread_ts,
         )
         state['step'] = 'awaiting_scope_choice'
@@ -2603,22 +2620,53 @@ def _continue_sandbox_after_video(say, channel, thread_ts, state, scope: str):
         state['step'] = 'done'
 
 
-def _handle_sandbox_scope_choice(ack, body, say, client, scope: str):
-    """Gemeinsame Logik für die drei Sandbox-Scope-Buttons (Schritt 2)."""
-    ack()
-    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
-    channel = body.get('channel', {}).get('id', '')
-    if not thread_ts:
-        return
-    state = _pending_sandbox.get((channel, thread_ts))
-    if not state:
+def _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope: str):
+    """Benachrichtigt #ask-cs-admin, dass für diese Sandbox/Spiegelung eine Rechnung
+    nötig ist — als Thread-Antwort wenn der Flow ohnehin schon dort läuft, sonst als
+    neue Cross-Post-Nachricht mit Permalink zurück zum Ursprungs-Thread (DM oder
+    anderer Channel), damit CS Admin den vollen Kontext hat."""
+    customer_name = state.get('customer_name', '')
+    requester_name = state.get('user_name', '')
+
+    if channel == _ASK_CS_ADMIN_CHANNEL:
         say(
-            text=":wave: Kein aktiver Sandbox-Flow in diesem Thread mehr — bitte die Anfrage neu stellen.",
+            blocks=build_sandbox_admin_billing_blocks(customer_name, scope, requester_name),
+            text="Sandbox-Rechnungsstellung nötig",
             thread_ts=thread_ts,
         )
         return
 
+    origin_permalink = None
+    try:
+        resp = client.chat_getPermalink(channel=channel, message_ts=thread_ts)
+        if resp.get('ok'):
+            origin_permalink = resp.get('permalink')
+    except Exception as e:
+        logger.warning(f"chat_getPermalink failed for {channel}/{thread_ts}: {e}")
+
+    try:
+        client.chat_postMessage(
+            channel=_ASK_CS_ADMIN_CHANNEL,
+            blocks=build_sandbox_admin_billing_blocks(customer_name, scope, requester_name, origin_permalink),
+            text="Sandbox-Rechnungsstellung nötig",
+        )
+    except Exception as e:
+        logger.warning(f"Cross-post to #ask-cs-admin failed: {e}")
+
+
+def _apply_sandbox_scope(say, client, channel, thread_ts, state, scope: str):
+    """Postet die Schritt-2-Anleitung für den aufgelösten Scope und leitet je nach
+    Fall zum Video/zur Vertragsart-Frage oder direkt zur Instanz-Info-Abfrage weiter.
+
+    `scope` ist bereits aufgelöst (siehe `_handle_sandbox_mirroring_choice`) —
+    diese Funktion selbst trifft keine Ja/Nein-Entscheidung mehr, sie war früher
+    der Körper der 3-Wege-Scope-Buttons, ist jetzt aber die gemeinsame Anwendungs-
+    logik für alle Wege dorthin.
+    """
     say(blocks=build_sandbox_step2_stub_blocks(scope), text="Nächste Schritte", thread_ts=thread_ts)
+
+    if sandbox_scope_needs_billing(scope, state.get('variant') or {}):
+        _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope)
 
     if scope in ('new_only', 'new_plus_mirror'):
         # Loom-Anleitung zur Sandbox-Erstellung: kostenlos direkt aus der schon in
@@ -2688,11 +2736,58 @@ def handle_sandbox_contract_annual(ack, body, say, client):
     _handle_sandbox_contract_type(ack, body, say, client, 'annual')
 
 
+def _handle_sandbox_fit_button(ack, body, say, client, fits: bool):
+    """Gemeinsame Logik für die '✅ Passt'/'✏️ Korrektur nötig'-Buttons — Alternative
+    zum Freitext-Weg ('ja'/Korrekturtext), beide funktionieren nebeneinander."""
+    ack()
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    if not thread_ts:
+        return
+    state = _pending_sandbox.get((channel, thread_ts))
+    if not state or state.get('step') != 'awaiting_fit_confirmation':
+        say(
+            text=":wave: Kein aktiver Sandbox-Flow in diesem Thread mehr — bitte die Anfrage neu stellen.",
+            thread_ts=thread_ts,
+        )
+        return
+    if fits:
+        _confirm_sandbox_fit(say, thread_ts, state)
+    else:
+        _request_sandbox_correction(say, thread_ts, state)
+
+
+@app.action("sandbox_fit_confirmed")
+def handle_sandbox_fit_confirmed(ack, body, say, client):
+    """Button: '✅ Passt' — E-Mail-Entwurf ist in Ordnung."""
+    _handle_sandbox_fit_button(ack, body, say, client, True)
+
+
+@app.action("sandbox_fit_correction")
+def handle_sandbox_fit_correction(ack, body, say, client):
+    """Button: '✏️ Korrektur nötig' — CSM muss die Korrektur danach als Text schicken."""
+    _handle_sandbox_fit_button(ack, body, say, client, False)
+
+
+@app.action("sandbox_admin_take_billing")
+def handle_sandbox_admin_take_billing(ack, body, say, client):
+    """Button: CS Admin übernimmt die Rechnungsstellung für eine Sandbox/Spiegelung.
+    Rein informativ (wie va_take_over) — keine automatische Chargebee-Aktion."""
+    ack()
+    user_id = body.get('user', {}).get('id', '')
+    if user_id not in CS_ADMIN_USER_IDS:
+        return
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    user_name = get_user_name(client, user_id)
+    say(text=f":white_check_mark: Rechnungsstellung von {user_name} übernommen.", thread_ts=thread_ts)
+
+
 @app.action("sandbox_customer_replied")
 def handle_sandbox_customer_replied(ack, body, say, client):
     """Button: 'Kunde hat sich zurückgemeldet' — Alternative zur Text-Antwort im
-    Thread, springt direkt zur Scope-Frage (siehe auch der 'awaiting_customer_reply'-
-    Zweig in _advance_sandbox_thread, den dieser Button-Pfad dupliziert)."""
+    Thread, springt direkt zur Spiegelungs-Frage (siehe auch der
+    'awaiting_customer_reply'-Zweig in _advance_sandbox_thread, den dieser
+    Button-Pfad dupliziert)."""
     ack()
     thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
     channel = body.get('channel', {}).get('id', '')
@@ -2706,29 +2801,66 @@ def handle_sandbox_customer_replied(ack, body, say, client):
         )
         return
     say(
-        blocks=build_sandbox_scope_question_blocks(),
-        text="Was soll final umgesetzt werden?",
+        blocks=build_sandbox_mirroring_question_blocks(state.get('has_existing_sandbox', False)),
+        text="Möchte der Kunde eine Spiegelung?",
         thread_ts=thread_ts,
     )
     state['step'] = 'awaiting_scope_choice'
 
 
-@app.action("sandbox_scope_new_only")
-def handle_sandbox_scope_new_only(ack, body, say, client):
-    """Button: Schritt 2 — nur neue Sandbox anlegen (keine Spiegelung)."""
-    _handle_sandbox_scope_choice(ack, body, say, client, 'new_only')
+def _handle_sandbox_mirroring_choice(ack, body, say, client, wants_mirroring: bool):
+    """Gemeinsame Logik für die Ja/Nein-Spiegelungs-Buttons (Schritt 2).
+
+    Leitet aus dem bereits in Schritt 1 bekannten `has_existing_sandbox` + der
+    Ja/Nein-Antwort den finalen Scope ab, statt ihn (wie früher) über 3 separate
+    Buttons direkt abzufragen — der CSM muss nicht mehr angeben, ob es um eine
+    neue oder bestehende Sandbox geht, das weiß der Bot schon.
+    """
+    ack()
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    if not thread_ts:
+        return
+    state = _pending_sandbox.get((channel, thread_ts))
+    if not state or state.get('step') != 'awaiting_scope_choice':
+        say(
+            text=":wave: Kein aktiver Sandbox-Flow in diesem Thread mehr — bitte die Anfrage neu stellen.",
+            thread_ts=thread_ts,
+        )
+        return
+
+    has_existing = state.get('has_existing_sandbox', False)
+    if has_existing and wants_mirroring:
+        scope = 'mirror_existing'
+    elif not has_existing and wants_mirroring:
+        scope = 'new_plus_mirror'
+    elif not has_existing and not wants_mirroring:
+        scope = 'new_only'
+    else:
+        # has_existing und keine Spiegelung gewünscht -> nichts umzusetzen, nichts zu berechnen.
+        say(
+            text=(
+                ":white_check_mark: Alles klar — der Kunde hat bereits eine Sandbox und möchte "
+                "keine Spiegelung. Keine weitere Aktion nötig."
+            ),
+            thread_ts=thread_ts,
+        )
+        state['step'] = 'done'
+        return
+
+    _apply_sandbox_scope(say, client, channel, thread_ts, state, scope)
 
 
-@app.action("sandbox_scope_new_plus_mirror")
-def handle_sandbox_scope_new_plus_mirror(ack, body, say, client):
-    """Button: Schritt 2 — neue Sandbox anlegen + Spiegelung."""
-    _handle_sandbox_scope_choice(ack, body, say, client, 'new_plus_mirror')
+@app.action("sandbox_wants_mirroring_yes")
+def handle_sandbox_wants_mirroring_yes(ack, body, say, client):
+    """Button: Kunde möchte eine Spiegelung (neu oder auf bestehender Sandbox)."""
+    _handle_sandbox_mirroring_choice(ack, body, say, client, True)
 
 
-@app.action("sandbox_scope_mirror_existing")
-def handle_sandbox_scope_mirror_existing(ack, body, say, client):
-    """Button: Schritt 2 — Spiegelung auf bereits bestehender Sandbox."""
-    _handle_sandbox_scope_choice(ack, body, say, client, 'mirror_existing')
+@app.action("sandbox_wants_mirroring_no")
+def handle_sandbox_wants_mirroring_no(ack, body, say, client):
+    """Button: Kunde möchte keine Spiegelung."""
+    _handle_sandbox_mirroring_choice(ack, body, say, client, False)
 
 
 @app.action("create_ticket_button")

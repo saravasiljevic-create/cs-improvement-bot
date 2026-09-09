@@ -616,16 +616,43 @@ def _ts_to_date(ts: int | None) -> str:
     return datetime.fromtimestamp(ts, tz=tz).strftime('%d.%m.%Y')
 
 
-def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> list:
+_LEGAL_SUFFIX_RE = re.compile(
+    r'\s*(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _strip_legal_suffix(name: str) -> str:
+    return _LEGAL_SUFFIX_RE.sub('', name).strip()
+
+
+def _names_match(search_lower: str, candidate: str) -> bool:
+    """Exakter Vergleich, plus (nur wenn die Suche selbst KEINE Rechtsform trägt)
+    zusätzlich gegen den Kandidaten OHNE Rechtsform. Strikte Erweiterung, kein
+    Ersatz: trägt die Suche bereits eine Rechtsform (z.B. "Muster GmbH"), bleibt
+    der Vergleich exakt wie zuvor — verhindert, dass "Muster GmbH" plötzlich auch
+    "Muster AG" träfe. Nur ohne Rechtsform in der Suche (z.B. "well b4" für
+    "Well B4 GmbH") wird zusätzlich tolerant verglichen."""
+    candidate_lower = (candidate or '').strip().lower()
+    if search_lower == candidate_lower:
+        return True
+    if not _LEGAL_SUFFIX_RE.search(search_lower):
+        return search_lower == _strip_legal_suffix(candidate_lower).lower()
+    return False
+
+
+def _chargebee_customer_search(base: str, auth: tuple, customer_name: str, lenient: bool = False) -> list:
     """Versucht mehrere Suchstrategien um einen Chargebee-Kunden zu finden.
 
     Chargebee v2 unterstützt nur 'company[is]' und 'company[starts_with]' —
     KEIN 'company[contains]'. Deshalb nutzen wir starts_with als Hauptstrategie.
+
+    `lenient=True` (nur vom Sandbox-Flow gesetzt, VA-Aufrufstelle lässt es auf
+    False) erlaubt zusätzlich den rechtsform-toleranten Vergleich aus
+    `_names_match` — Default bleibt exakt wie bisher, keine Verhaltensänderung
+    für bestehende Aufrufer.
     """
-    name_no_suffix = re.sub(
-        r'\s*(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?\s*$',
-        '', customer_name, flags=re.IGNORECASE,
-    ).strip()
+    name_no_suffix = _strip_legal_suffix(customer_name)
 
     first_word = customer_name.split()[0] if customer_name else ''
     strategies = [
@@ -657,10 +684,13 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str) -> li
                 # ("" in "any string" == True in Python → explizit prüfen)
                 # Exakter Company-Name-Vergleich (case-insensitive)
                 # Verhindert falsche Treffer wenn Chargebee den Filter ignoriert
-                exact = [
-                    c for c in candidates
-                    if (c['customer'].get('company') or '').strip().lower() == search_lower
-                ]
+                if lenient:
+                    exact = [c for c in candidates if _names_match(search_lower, c['customer'].get('company'))]
+                else:
+                    exact = [
+                        c for c in candidates
+                        if (c['customer'].get('company') or '').strip().lower() == search_lower
+                    ]
                 if exact:
                     logger.info(f"Chargebee exakter Treffer: {exact[0]['customer']['id']} ({exact[0]['customer'].get('company')})")
                     return exact
