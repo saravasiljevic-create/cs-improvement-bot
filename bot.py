@@ -2772,13 +2772,19 @@ def handle_sandbox_fit_correction(ack, body, say, client):
 @app.action("sandbox_admin_take_billing")
 def handle_sandbox_admin_take_billing(ack, body, say, client):
     """Button: CS Admin übernimmt die Rechnungsstellung für eine Sandbox/Spiegelung.
-    Rein informativ (wie va_take_over) — keine automatische Chargebee-Aktion."""
+    Rein informativ (wie va_take_over) — keine automatische Chargebee-Aktion.
+    Markiert die Benachrichtigung selbst zusätzlich mit ✅, damit im Channel auch
+    ohne Thread zu öffnen sichtbar ist, dass sie schon übernommen wurde."""
     ack()
     user_id = body.get('user', {}).get('id', '')
     if user_id not in CS_ADMIN_USER_IDS:
         return
-    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    own_ts = body.get('message', {}).get('ts')
+    thread_ts = body.get('message', {}).get('thread_ts') or own_ts
     user_name = get_user_name(client, user_id)
+    if own_ts:
+        _add_reaction(client, channel, own_ts, 'white_check_mark')
     say(text=f":white_check_mark: Rechnungsstellung von {user_name} übernommen.", thread_ts=thread_ts)
 
 

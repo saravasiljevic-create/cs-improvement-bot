@@ -24,8 +24,8 @@ PLANHAT_WORKSPACE_URL = 'https://ws.planhat.com/xentral/home/69941855813dcb5e78d
 VERTRAGSANPASSUNG_CHANNEL_ID = os.environ.get('VERTRAGSANPASSUNG_CHANNEL_ID') or SLACK_CHANNEL_ID
 
 # CS Admin User IDs (dürfen #vertragsanpassung im Thread triggern)
-# Mirjam Köberlein, Linda Litzkow, Sara Vasiljevic
-_DEFAULT_ADMIN_IDS = 'U07G83YH6RW,U092RN6D339,U07TRKK8BH9'
+# Mirjam Köberlein, Sara Vasiljevic
+_DEFAULT_ADMIN_IDS = 'U07G83YH6RW,U07TRKK8BH9'
 CS_ADMIN_USER_IDS: set[str] = set(
     os.environ.get('CS_ADMIN_USER_IDS', _DEFAULT_ADMIN_IDS).split(',')
 )
