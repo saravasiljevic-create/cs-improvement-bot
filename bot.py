@@ -76,8 +76,11 @@ from sandbox_handler import (
     build_sandbox_video_blocks,
     create_sandbox_mirroring_ticket,
     detect_sandbox_request,
+    extract_direct_references,
     get_chargebee_contact_email,
+    get_chargebee_contact_email_by_id,
     get_planhat_sandbox_fields,
+    get_planhat_sandbox_fields_by_id,
     parse_instance_info,
     parse_sandbox_request,
     resolve_paragraph_variants,
@@ -90,6 +93,14 @@ from sandbox_handler import (
 _CB_URL_RE = re.compile(
     r'https?://[^\s]*chargebee\.com/d/(?P<type>subscriptions|customers)/(?P<id>[^\s/\|><]+)'
     r'|\b(?P<std_id>\d{4}-\d{4}-\d{4}-\d{4})\b',
+    re.IGNORECASE,
+)
+
+# Bekannte #bot-Befehle, die in JEDEM Thread Vorrang vor einem laufenden Flow-
+# State (Sandbox, VA, ...) haben müssen — insbesondere #bot-stop/#bot-remove,
+# damit ein Mute-Befehl nicht von einer aktiven Flow-Rückfrage verschluckt wird.
+_BOT_COMMAND_RE = re.compile(
+    r'#bot-stop|#bot-remove|#vertragsanpassung|#improvement|#planhat-log|#planhat-upload',
     re.IGNORECASE,
 )
 
@@ -969,13 +980,12 @@ def _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelu
 
 def _run_sandbox_lookup(say, client, channel, ts, user_id, user_name, customer_name,
                          wants_spiegelung, wants_custom_code):
-    """Chargebee/Planhat-Lookup -> Preis-Mapping -> E-Mail-Entwurf -> Slack-Antwort ->
-    _pending_sandbox-Eintrag, für einen bereits bekannten Kundennamen.
+    """Chargebee/Planhat-Lookup per Namenssuche -> _finish_sandbox_lookup.
 
     Wird sowohl vom initialen Intent-Handler als auch von der Namens-Korrektur-
     Rückfrage (Schritt 'awaiting_clarification') mit demselben Kundennamen-Slot
-    aufgerufen. Bricht bei fehlendem/mehrdeutigem Match oder unauflösbarem Feldwert
-    mit einer Rückfrage ab (und merkt sich diese im Thread) — rät niemals.
+    aufgerufen. Bricht bei fehlendem/mehrdeutigem Match mit einer Rückfrage ab
+    (und merkt sich diese im Thread) — rät niemals.
     """
     chargebee_result = get_chargebee_contact_email(customer_name, CHARGEBEE_API_KEY, CHARGEBEE_SITE)
     if chargebee_result is None:
@@ -990,11 +1000,16 @@ def _run_sandbox_lookup(say, client, channel, ts, user_id, user_name, customer_n
         _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
         return
     if chargebee_result.get('ambiguous'):
-        candidates = ', '.join(chargebee_result.get('candidates', []))
+        candidates = chargebee_result.get('candidates', [])
+        candidate_lines = '\n'.join(
+            f"• {c.get('company')} — Chargebee-ID `{c.get('customer_id')}`"
+            + (f", {c['email']}" if c.get('email') else '')
+            for c in candidates
+        )
         say(
             blocks=build_sandbox_clarification_blocks(
-                f"Ich konnte '{customer_name}' nicht eindeutig in Chargebee finden — "
-                f"meintest du: {candidates}?"
+                f"Ich konnte '{customer_name}' nicht eindeutig in Chargebee finden:\n{candidate_lines}\n\n"
+                "Schick mir den Chargebee-Kunden-Link zum richtigen Datensatz, dann übernehme ich den direkt."
             ),
             text="Mehrdeutiger Chargebee-Treffer",
             thread_ts=ts,
@@ -1021,7 +1036,7 @@ def _run_sandbox_lookup(say, client, channel, ts, user_id, user_name, customer_n
         say(
             blocks=build_sandbox_clarification_blocks(
                 f"Ich konnte '{customer_name}' nicht eindeutig in Planhat finden — "
-                f"meintest du: {candidates}?"
+                f"meintest du: {candidates}? Schick mir gerne auch den Planhat-Link zum richtigen Datensatz."
             ),
             text="Mehrdeutiger Planhat-Treffer",
             thread_ts=ts,
@@ -1029,6 +1044,83 @@ def _run_sandbox_lookup(say, client, channel, ts, user_id, user_name, customer_n
         _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
         return
 
+    _finish_sandbox_lookup(say, channel, ts, user_id, user_name, customer_name, wants_spiegelung,
+                            wants_custom_code, chargebee_result, planhat_result)
+
+
+def _run_sandbox_lookup_by_reference(say, client, channel, ts, user_id, user_name, refs,
+                                      wants_spiegelung, wants_custom_code):
+    """Wie _run_sandbox_lookup, aber ausgehend von einem direkt gepasteten Chargebee-
+    Kunden- und/oder Planhat-Firmen-Link (siehe extract_direct_references) statt
+    einem Namen — keine Mehrdeutigkeit möglich, da über IDs statt Namen aufgelöst wird.
+    Planhats custom-Feld 'CB Customer ID' überbrückt den Fall, dass nur der
+    Planhat-Link gepastet wurde (kein separater Chargebee-Link nötig)."""
+    chargebee_result = None
+    planhat_result = None
+
+    if refs.get('chargebee_customer_id'):
+        chargebee_result = get_chargebee_contact_email_by_id(
+            refs['chargebee_customer_id'], CHARGEBEE_API_KEY, CHARGEBEE_SITE
+        )
+
+    if refs.get('planhat_id'):
+        planhat_result = get_planhat_sandbox_fields_by_id(refs['planhat_id'], PLANHAT_API_TOKEN)
+        if chargebee_result is None and planhat_result and planhat_result.get('cb_customer_id'):
+            chargebee_result = get_chargebee_contact_email_by_id(
+                planhat_result['cb_customer_id'], CHARGEBEE_API_KEY, CHARGEBEE_SITE
+            )
+
+    if chargebee_result is None:
+        say(
+            blocks=build_sandbox_clarification_blocks(
+                "Über den Link konnte ich keinen Chargebee-Kontakt finden — bitte den "
+                "Chargebee-Kunden-Link schicken oder den Firmennamen erneut nennen."
+            ),
+            text="Link nicht auflösbar",
+            thread_ts=ts,
+        )
+        _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
+        return
+
+    customer_name = chargebee_result.get('company') or 'Kunde'
+
+    if planhat_result is None:
+        planhat_result = get_planhat_sandbox_fields(
+            customer_name, PLANHAT_API_TOKEN, debit_number=chargebee_result.get('debit_number')
+        )
+    if planhat_result is None:
+        say(
+            blocks=build_sandbox_clarification_blocks(
+                f"Ich konnte '{customer_name}' nicht in Planhat finden — ist der Firmenname korrekt geschrieben?"
+            ),
+            text="Kein Planhat-Treffer",
+            thread_ts=ts,
+        )
+        _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
+        return
+    if planhat_result.get('ambiguous'):
+        candidates = ', '.join(planhat_result.get('candidates', []))
+        say(
+            blocks=build_sandbox_clarification_blocks(
+                f"Ich konnte '{customer_name}' nicht eindeutig in Planhat finden — "
+                f"meintest du: {candidates}? Schick mir gerne auch den Planhat-Link zum richtigen Datensatz."
+            ),
+            text="Mehrdeutiger Planhat-Treffer",
+            thread_ts=ts,
+        )
+        _await_sandbox_clarification(channel, ts, user_id, user_name, wants_spiegelung, wants_custom_code)
+        return
+
+    _finish_sandbox_lookup(say, channel, ts, user_id, user_name, customer_name, wants_spiegelung,
+                            wants_custom_code, chargebee_result, planhat_result)
+
+
+def _finish_sandbox_lookup(say, channel, ts, user_id, user_name, customer_name, wants_spiegelung,
+                            wants_custom_code, chargebee_result, planhat_result):
+    """Preis-Mapping -> E-Mail-Entwurf -> Slack-Antwort -> _pending_sandbox-Eintrag,
+    sobald chargebee_result/planhat_result eindeutig aufgelöst sind — egal ob über
+    Namenssuche (_run_sandbox_lookup) oder einen direkt gepasteten Link
+    (_run_sandbox_lookup_by_reference)."""
     # Hat der Kunde laut Planhat bereits eine Sandbox (aktives 'sandbox-*'-Produkt)?
     # Dann passt Template 1 (Neu-Sandbox) inhaltlich nicht — stattdessen Template 2
     # (Spiegelung auf bestehender Sandbox) vorschlagen.
@@ -1163,15 +1255,33 @@ def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name,
     if not state:
         return False
 
+    # Bot-Befehle (#bot-stop, #bot-remove, ...) müssen IMMER Vorrang haben, auch
+    # wenn hier ein Sandbox-Flow aktiv ist — sonst verschluckt z.B.
+    # awaiting_clarification den Mute-Befehl als (erfolglosen) Korrekturversuch
+    # und der Thread lässt sich nie stummschalten (live beobachteter Bug: #bot-stop
+    # wurde als Firmenname interpretiert, der Thread blieb aktiv).
+    if _BOT_COMMAND_RE.search(text or ''):
+        return False
+
     step = state.get('step')
     if step == 'awaiting_clarification':
-        corrected_name = (text or '').strip()
-        if not corrected_name:
+        corrected_text = (text or '').strip()
+        if not corrected_text:
             say(text="Für welchen Kunden soll die Sandbox eingerichtet werden?", thread_ts=thread_ts)
+            return True
+        # Direkt gepasteter Chargebee-/Planhat-Link? Dann per ID statt per Namen
+        # auflösen — sonst würde der Link selbst als (garantiert erfolgloser)
+        # Namens-Suchbegriff behandelt.
+        refs = extract_direct_references(corrected_text)
+        if refs:
+            _run_sandbox_lookup_by_reference(
+                say, client, channel, thread_ts, state['user_id'], state['user_name'],
+                refs, state.get('wants_spiegelung'), state.get('wants_custom_code'),
+            )
             return True
         _run_sandbox_lookup(
             say, client, channel, thread_ts, state['user_id'], state['user_name'],
-            corrected_name, state.get('wants_spiegelung'), state.get('wants_custom_code'),
+            corrected_text, state.get('wants_spiegelung'), state.get('wants_custom_code'),
         )
         return True
 

@@ -142,12 +142,28 @@ def get_chargebee_contact_email(customer_name: str, api_key: str, site: str) -> 
     if not customers:
         return None
     if len(customers) > 1:
+        # Company-Name allein reicht zur Unterscheidung oft nicht (z.B. zwei
+        # Kunden-Datensätze mit identischem Anzeigenamen) — Kunden-ID + E-Mail
+        # mitgeben, damit der CSM per Link/ID eindeutig disambiguieren kann.
         return {
             'ambiguous': True,
-            'candidates': [c['customer'].get('company') for c in customers],
+            'candidates': [
+                {
+                    'company': c['customer'].get('company'),
+                    'customer_id': c['customer'].get('id'),
+                    'email': c['customer'].get('email'),
+                }
+                for c in customers
+            ],
         }
 
     customer = customers[0]['customer']
+    return _chargebee_customer_to_result(customer)
+
+
+def _chargebee_customer_to_result(customer: dict) -> dict:
+    """Baut das einheitliche Rückgabe-Dict aus einem rohen Chargebee-Customer-Objekt —
+    gemeinsam genutzt vom namensbasierten und vom ID-basierten Lookup."""
     billing_address = customer.get('billing_address') or {}
     return {
         'email': customer.get('email'),
@@ -156,6 +172,44 @@ def get_chargebee_contact_email(customer_name: str, api_key: str, site: str) -> 
         'customer_id': customer.get('id'),
         'debit_number': customer.get('cf_debit_number'),
     }
+
+
+def get_chargebee_contact_email_by_id(customer_id: str, api_key: str, site: str) -> dict | None:
+    """Direkter Lookup per Chargebee-Kunden-ID (z.B. aus einem gepasteten
+    .../d/customers/{id}-Link) — GET /customers/{id}, keine Mehrdeutigkeit möglich."""
+    base = f"https://{site}.chargebee.com/api/v2"
+    auth = (api_key, '')
+    try:
+        resp = requests.get(f"{base}/customers/{customer_id}", auth=auth, timeout=10)
+        if not resp.ok:
+            return None
+        customer = resp.json().get('customer') or {}
+    except Exception as e:
+        logger.warning(f"get_chargebee_contact_email_by_id({customer_id!r}) failed: {e}")
+        return None
+    if not customer:
+        return None
+    return _chargebee_customer_to_result(customer)
+
+
+# Erkennt einen direkt gepasteten Chargebee-Kunden- oder Planhat-Firmen-Link im
+# Text — damit der CSM bei Mehrdeutigkeit/keinem Treffer einfach den Link zum
+# richtigen Datensatz schicken kann, statt (erfolglos) nochmal den Namen zu tippen.
+_CB_CUSTOMER_URL_RE = re.compile(r'chargebee\.com/d/customers/(?P<id>[^\s/\|><?]+)', re.IGNORECASE)
+_PLANHAT_PROFILE_URL_RE = re.compile(r'planhat\.com/\S*[?&]profile=Company\.(?P<id>[a-zA-Z0-9]+)', re.IGNORECASE)
+
+
+def extract_direct_references(text: str) -> dict:
+    """Extrahiert eine Chargebee-Kunden-ID und/oder Planhat-Firmen-ID aus gepasteten
+    Links im Text. Leeres Dict wenn keiner der beiden Link-Typen gefunden wurde."""
+    result = {}
+    m = _CB_CUSTOMER_URL_RE.search(text)
+    if m:
+        result['chargebee_customer_id'] = m.group('id')
+    m = _PLANHAT_PROFILE_URL_RE.search(text)
+    if m:
+        result['planhat_id'] = m.group('id')
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +266,39 @@ def _planhat_find_by_name_scan(customer_name: str, api_token: str) -> list:
     return matches
 
 
+def _planhat_company_to_result(company: dict) -> dict:
+    """Baut das einheitliche Rückgabe-Dict aus einem rohen Planhat-Company-Objekt —
+    gemeinsam genutzt von allen drei Lookup-Wegen (extid, Namens-Scan, direkte ID)."""
+    custom = company.get('custom') or {}
+    sandbox_raw = custom.get('Sandbox')
+    spiegelung_raw = custom.get('Sandbox Spiegelung')
+    cs_package = custom.get('CS Package')
+    # HubSpot-Kontakt-Link liegt (live verifiziert) unter custom.Hubspot, nicht
+    # top-level — für den CSM-Hinweis "Chargebee-Kontakt auch in HubSpot prüfen".
+    hubspot_url = custom.get('Hubspot')
+    # Planhat pflegt die Chargebee-Kunden-ID als eigenes custom-Feld — nützlich um
+    # bei einem direkt gepasteten Planhat-Link auch ohne Namenssuche den passenden
+    # Chargebee-Kontakt zu finden (siehe get_planhat_sandbox_fields_by_id).
+    cb_customer_id = custom.get('CB Customer ID')
+    # 'products' ist ein Top-Level-Feld (Chargebee-Sync), keine custom-Property —
+    # listet aktive Item-Price-IDs, z.B. "sandbox-monthly-contract-monthly-payment".
+    # Damit erkennen wir zuverlässig, ob der Kunde bereits eine Sandbox hat, ohne
+    # eine zusätzliche Chargebee-Subscription-Abfrage zu brauchen.
+    products = company.get('products') or []
+    has_existing_sandbox = any(str(p).lower().startswith('sandbox') for p in products)
+    return {
+        'planhat_id': company.get('_id'),
+        'name': company.get('name'),
+        'sandbox_raw': sandbox_raw,
+        'spiegelung_raw': spiegelung_raw,
+        'cs_package': cs_package,
+        'hubspot_url': hubspot_url,
+        'cb_customer_id': cb_customer_id,
+        'has_existing_sandbox': has_existing_sandbox,
+        'planhat_url': f"https://ws.planhat.com/xentral/home/content-explorer?profile=Company.{company.get('_id')}",
+    }
+
+
 def get_planhat_sandbox_fields(customer_name: str, api_token: str, debit_number=None) -> dict | None:
     """Sucht den Planhat-Kunden und liefert die Sandbox-Preis-Custom-Fields.
 
@@ -242,29 +329,25 @@ def get_planhat_sandbox_fields(customer_name: str, api_token: str, debit_number=
             }
         company = companies[0]
 
-    custom = company.get('custom') or {}
-    sandbox_raw = custom.get('Sandbox')
-    spiegelung_raw = custom.get('Sandbox Spiegelung')
-    cs_package = custom.get('CS Package')
-    # HubSpot-Kontakt-Link liegt (live verifiziert) unter custom.Hubspot, nicht
-    # top-level — für den CSM-Hinweis "Chargebee-Kontakt auch in HubSpot prüfen".
-    hubspot_url = custom.get('Hubspot')
-    # 'products' ist ein Top-Level-Feld (Chargebee-Sync), keine custom-Property —
-    # listet aktive Item-Price-IDs, z.B. "sandbox-monthly-contract-monthly-payment".
-    # Damit erkennen wir zuverlässig, ob der Kunde bereits eine Sandbox hat, ohne
-    # eine zusätzliche Chargebee-Subscription-Abfrage zu brauchen.
-    products = company.get('products') or []
-    has_existing_sandbox = any(str(p).lower().startswith('sandbox') for p in products)
-    return {
-        'planhat_id': company.get('_id'),
-        'name': company.get('name'),
-        'sandbox_raw': sandbox_raw,
-        'spiegelung_raw': spiegelung_raw,
-        'cs_package': cs_package,
-        'hubspot_url': hubspot_url,
-        'has_existing_sandbox': has_existing_sandbox,
-        'planhat_url': f"https://ws.planhat.com/xentral/home/content-explorer?profile=Company.{company.get('_id')}",
-    }
+    return _planhat_company_to_result(company)
+
+
+def get_planhat_sandbox_fields_by_id(planhat_id: str, api_token: str) -> dict | None:
+    """Direkter Lookup per Planhat-Firmen-ID (z.B. aus einem gepasteten
+    ws.planhat.com/...?profile=Company.{id}-Link) — GET /companies/{id}, keine
+    Mehrdeutigkeit möglich."""
+    headers = {'Authorization': f'Bearer {api_token}'}
+    try:
+        resp = requests.get(f'{PLANHAT_BASE_URL}/companies/{planhat_id}', headers=headers, timeout=15)
+        if not resp.ok:
+            return None
+        company = resp.json()
+    except Exception as e:
+        logger.warning(f"get_planhat_sandbox_fields_by_id({planhat_id!r}) failed: {e}")
+        return None
+    if not company or not company.get('_id'):
+        return None
+    return _planhat_company_to_result(company)
 
 
 # ---------------------------------------------------------------------------
