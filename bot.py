@@ -75,6 +75,7 @@ from sandbox_handler import (
     build_sandbox_step2_stub_blocks,
     build_sandbox_video_blocks,
     create_sandbox_mirroring_ticket,
+    fetch_instance_info_from_csm,
     detect_sandbox_request,
     extract_direct_references,
     get_chargebee_contact_email,
@@ -1311,7 +1312,9 @@ def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name,
         return True
 
     if step == 'awaiting_instance_info':
-        info = parse_instance_info(text or '')
+        # Werte aus dem Instance Manager (falls vorhanden) + was der CSM ergänzt; Eingaben
+        # des CSM überschreiben die vorbefüllten Werte.
+        info = {**(state.get('instance_info_prefill') or {}), **parse_instance_info(text or '')}
         required = ('prod_url', 'prod_serial', 'sandbox_url', 'sandbox_serial')
         missing = [k for k in required if k not in info]
         if missing:
@@ -1322,27 +1325,7 @@ def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name,
             )
             return True
 
-        ticket = create_sandbox_mirroring_ticket(
-            state.get('customer_name', ''),
-            info['prod_url'],
-            info['prod_serial'],
-            info['sandbox_url'],
-            info['sandbox_serial'],
-        )
-        if ticket:
-            say(
-                text=f":white_check_mark: Jira-Ticket erstellt: <{ticket['url']}|{ticket['key']}>",
-                thread_ts=thread_ts,
-            )
-        else:
-            say(
-                text=(
-                    ":warning: Das Jira-Ticket konnte nicht angelegt werden — bitte manuell "
-                    "im CCS-Projekt in Jira anlegen oder nochmal hier antworten, um es erneut zu versuchen."
-                ),
-                thread_ts=thread_ts,
-            )
-        state['step'] = 'done'
+        _create_mirroring_ticket_and_report(say, thread_ts, state, info)
         return True
 
     return False
@@ -2715,17 +2698,64 @@ def handle_va_select_plan(ack, body, say, client):
                                     state['user_name'], state['parsed'], state.get('subscription'))
 
 
+def _create_mirroring_ticket_and_report(say, thread_ts, state, info: dict, from_instance_manager: bool = False):
+    """Legt das CCS-Spiegelungs-Ticket an und meldet das Ergebnis im Thread."""
+    ticket = create_sandbox_mirroring_ticket(
+        state.get('customer_name', ''),
+        info['prod_url'],
+        info['prod_serial'],
+        info['sandbox_url'],
+        info['sandbox_serial'],
+    )
+    if ticket:
+        source = ""
+        if from_instance_manager:
+            source = (
+                "\n_Instanz-Infos automatisch aus dem Instance Manager:_\n"
+                f"Prod: {info['prod_url']} · {info['prod_serial']}\n"
+                f"Sandbox: {info['sandbox_url']} · {info['sandbox_serial']}"
+            )
+        say(
+            text=f":white_check_mark: Jira-Ticket erstellt: <{ticket['url']}|{ticket['key']}>{source}",
+            thread_ts=thread_ts,
+        )
+    else:
+        say(
+            text=(
+                ":warning: Das Jira-Ticket konnte nicht angelegt werden — bitte manuell "
+                "im CCS-Projekt in Jira anlegen oder nochmal hier antworten, um es erneut zu versuchen."
+            ),
+            thread_ts=thread_ts,
+        )
+    state['step'] = 'done'
+
+
+def _request_instance_info_or_create_ticket(say, thread_ts, state):
+    """Versucht zuerst, alle vier Instanz-Werte aus dem Instance Manager zu holen (CSM-MCP).
+    Sind alle vier eindeutig da, wird das CCS-Ticket direkt angelegt. Sonst werden die
+    bekannten Werte angezeigt und nur die fehlenden beim CSM erfragt."""
+    chargebee_result = state.get('chargebee_result') or {}
+    query = chargebee_result.get('debit_number') or state.get('customer_name', '')
+    info = fetch_instance_info_from_csm(query)
+    required = ('prod_url', 'prod_serial', 'sandbox_url', 'sandbox_serial')
+    if all(info.get(k) for k in required):
+        _create_mirroring_ticket_and_report(say, thread_ts, state, info, from_instance_manager=True)
+        return
+    state['instance_info_prefill'] = info
+    say(
+        blocks=build_sandbox_instance_info_request_blocks(info),
+        text="Instanz-Infos für Jira-Ticket benötigt",
+        thread_ts=thread_ts,
+    )
+    state['step'] = 'awaiting_instance_info'
+
+
 def _continue_sandbox_after_video(say, channel, thread_ts, state, scope: str):
     """Nach dem Zeigen des passenden Loom-Videos (oder direkt, falls kein Video
     nötig war) geht es weiter wie bisher: bei new_plus_mirror Instanz-Infos für
     das Jira-Ticket abfragen, sonst ist der Flow für diesen Scope abgeschlossen."""
     if scope == 'new_plus_mirror':
-        say(
-            blocks=build_sandbox_instance_info_request_blocks(),
-            text="Instanz-Infos für Jira-Ticket benötigt",
-            thread_ts=thread_ts,
-        )
-        state['step'] = 'awaiting_instance_info'
+        _request_instance_info_or_create_ticket(say, thread_ts, state)
     else:
         state['step'] = 'done'
 
@@ -2799,14 +2829,9 @@ def _apply_sandbox_scope(say, client, channel, thread_ts, state, scope: str):
             state['pending_video_scope'] = scope
             state['step'] = 'awaiting_contract_type'
     elif scope == 'mirror_existing':
-        # Ticket wird erst nach Erhalt der 4 Instanz-Werte angelegt (awaiting_instance_info),
-        # nicht mehr hier inline — siehe _advance_sandbox_thread.
-        say(
-            blocks=build_sandbox_instance_info_request_blocks(),
-            text="Instanz-Infos für Jira-Ticket benötigt",
-            thread_ts=thread_ts,
-        )
-        state['step'] = 'awaiting_instance_info'
+        # Instanz-Werte zuerst aus dem Instance Manager (CSM-MCP); nur was dort fehlt,
+        # wird beim CSM erfragt (awaiting_instance_info, siehe _advance_sandbox_thread).
+        _request_instance_info_or_create_ticket(say, thread_ts, state)
 
 
 def _handle_sandbox_contract_type(ack, body, say, client, contract_type: str):
