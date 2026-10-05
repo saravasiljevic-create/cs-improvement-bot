@@ -4,7 +4,9 @@ Preis-/Text-Mapping und E-Mail-/Slack-Block-Builder.
 
 Spiegelt bewusst die Struktur und Konventionen von vertragsanpassung_handler.py.
 """
+import json
 import logging
+import os
 import re
 
 import requests
@@ -911,17 +913,110 @@ def parse_instance_info(text: str) -> dict:
     return result
 
 
-def build_sandbox_instance_info_request_blocks() -> list[dict]:
-    """Fragt den CSM nach den 4 Instanz-Werten, bevor das Jira-Ticket angelegt wird."""
-    text = (
-        "Bevor ich das Jira-Ticket für die Spiegelung anlege, brauche ich noch die "
-        "Instanz-Infos. Bitte antworte mit allen vier Zeilen (Format beibehalten):\n\n"
-        "Prod URL: ...\n"
-        "Prod Serial: ...\n"
-        "Sandbox URL: ...\n"
-        "Sandbox Serial: ..."
-    )
+def build_sandbox_instance_info_request_blocks(prefill: dict | None = None) -> list[dict]:
+    """Fragt den CSM nach den Instanz-Werten, bevor das Jira-Ticket angelegt wird.
+
+    Mit `prefill` (Werte aus dem Instance Manager, siehe fetch_instance_info_from_csm)
+    werden die bereits bekannten Werte angezeigt und nur die fehlenden abgefragt.
+    """
+    prefill = prefill or {}
+    labels = {
+        'prod_url': 'Prod URL', 'prod_serial': 'Prod Serial',
+        'sandbox_url': 'Sandbox URL', 'sandbox_serial': 'Sandbox Serial',
+    }
+    known = [f"{labels[k]}: {prefill[k]}" for k in labels if prefill.get(k)]
+    missing = [f"{labels[k]}: ..." for k in labels if not prefill.get(k)]
+    if known:
+        text = (
+            "Bevor ich das Jira-Ticket für die Spiegelung anlege, fehlen mir noch Instanz-Infos.\n\n"
+            "*Aus dem Instance Manager:*\n" + "\n".join(known) + "\n\n"
+            "*Bitte ergänzen* (Format beibehalten):\n" + "\n".join(missing)
+        )
+    else:
+        text = (
+            "Bevor ich das Jira-Ticket für die Spiegelung anlege, brauche ich noch die "
+            "Instanz-Infos. Bitte antworte mit allen vier Zeilen (Format beibehalten):\n\n"
+            + "\n".join(missing)
+        )
     return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}]
+
+
+# ---------------------------------------------------------------------------
+# Instanz-Infos aus dem Instance Manager (über den CSM-MCP-Server, read-only)
+# ---------------------------------------------------------------------------
+
+CSM_MCP_URL = os.environ.get('CSM_MCP_URL', 'https://csm-mcp.xentral.com/mcp')
+CSM_MCP_TOKEN = os.environ.get('CSM_MCP_TOKEN', '')
+
+
+def _mcp_parse(resp) -> dict | None:
+    """Antwort des Streamable-HTTP-MCP lesen: JSON oder Server-Sent-Events (`data: {...}`)."""
+    if 'event-stream' in resp.headers.get('content-type', ''):
+        for line in resp.text.splitlines():
+            if line.startswith('data:'):
+                return json.loads(line[5:])
+        return None
+    return resp.json() if resp.text else None
+
+
+def fetch_instance_info_from_csm(query: str) -> dict:
+    """Holt Prod-/Sandbox-URL und -Serial über das Tool `customer_lookup` des CSM-MCP-Servers.
+
+    `query` ist am besten die Kundennummer (Chargebee cf_debit_number), sonst der Firmenname.
+    Liefert nur Werte, die eindeutig sind: Prod aus genau einem Treffer, Sandbox nur, wenn es
+    genau eine aktive Sandbox im Instance Manager gibt. Ohne CSM_MCP_TOKEN, bei Fehlern oder
+    Mehrdeutigkeit kommt ein leeres bzw. unvollständiges Dict zurück, dann fragt der Bot wie
+    bisher beim CSM nach. Niemals raten.
+    """
+    if not (CSM_MCP_TOKEN and query):
+        return {}
+    headers = {
+        'Authorization': f'Bearer {CSM_MCP_TOKEN}',
+        'Accept': 'application/json, text/event-stream',
+        'Content-Type': 'application/json',
+    }
+    try:
+        with requests.Session() as session:
+            init = session.post(CSM_MCP_URL, headers=headers, timeout=30, json={
+                'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                'params': {'protocolVersion': '2025-03-26', 'capabilities': {},
+                           'clientInfo': {'name': 'cs-admin-bot', 'version': '1.0'}},
+            })
+            init.raise_for_status()
+            if init.headers.get('mcp-session-id'):
+                headers['Mcp-Session-Id'] = init.headers['mcp-session-id']
+            session.post(CSM_MCP_URL, headers=headers, timeout=30,
+                         json={'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+            resp = session.post(CSM_MCP_URL, headers=headers, timeout=60, json={
+                'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+                'params': {'name': 'customer_lookup', 'arguments': {'query': str(query), 'limit': 2}},
+            })
+            resp.raise_for_status()
+            payload = _mcp_parse(resp) or {}
+        content = (payload.get('result') or {}).get('content') or []
+        data = json.loads(content[0]['text']) if content else {}
+    except Exception as e:
+        logger.warning(f"fetch_instance_info_from_csm({query!r}) failed: {e}")
+        return {}
+
+    matches = data.get('matches') or []
+    if len(matches) != 1:
+        return {}
+    match = matches[0]
+    info = {}
+    if match.get('instance_url') and match.get('serial'):
+        info['prod_url'] = match['instance_url']
+        info['prod_serial'] = match['serial']
+    sandboxes = [
+        sb for sb in (match.get('sandbox_instances') or [])
+        if sb.get('subscription_status') == 'active' and sb.get('in_instance_manager')
+    ]
+    if (len(sandboxes) == 1 and not match.get('sandbox_note')
+            and not match.get('instance_url_is_sandbox_warning')):
+        if sandboxes[0].get('instance_url') and sandboxes[0].get('serial'):
+            info['sandbox_url'] = sandboxes[0]['instance_url']
+            info['sandbox_serial'] = sandboxes[0]['serial']
+    return info
 
 
 # ---------------------------------------------------------------------------
