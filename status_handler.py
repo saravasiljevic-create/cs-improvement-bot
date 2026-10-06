@@ -122,7 +122,7 @@ _TXN_STATUS_DE = {
 }
 
 
-def invoice_status_lines(invoice_id: str) -> list[str]:
+def invoice_status_lines(invoice_id: str, customers: list | None = None) -> list[str]:
     data = _cb(f"invoices/{invoice_id}")
     if not data or 'invoice' not in data:
         return [f"*Rechnung {invoice_id}:* in Chargebee nicht gefunden."]
@@ -156,13 +156,15 @@ def invoice_status_lines(invoice_id: str) -> list[str]:
             + (f" · nächste Rate {_eur(nxt.get('amount'))} am {_d(nxt.get('date'))}" if nxt else '')
         )
     if inv.get('customer_id'):
+        if customers is not None:
+            customers.append(inv['customer_id'])
         cust = (_cb(f"customers/{inv['customer_id']}") or {}).get('customer', {})
         if cust.get('company'):
             lines.append(f"• Kunde: {cust['company']} (Deb.-Nr. {cust.get('cf_debit_number', '–')})")
     return lines
 
 
-def subscription_status_lines(subscription: dict) -> list[str]:
+def subscription_status_lines(subscription: dict, customers: list | None = None) -> list[str]:
     """Kurzer Stand einer Subscription: Plan, Preis, Status, Laufzeit, geplante Änderungen, offene Posten."""
     sub_id = subscription.get('subscription_id')
     raw = (_cb(f"subscriptions/{sub_id}") or {}).get('subscription') if sub_id else None
@@ -191,6 +193,8 @@ def subscription_status_lines(subscription: dict) -> list[str]:
     for r in ramps[:2]:
         rp = r.get('ramp', {})
         lines.append(f"• Ramp geplant zum {_d(rp.get('effective_from'))}")
+    if raw.get('customer_id') and customers is not None:
+        customers.append(raw['customer_id'])
     if raw.get('customer_id'):
         inv = _cb('invoices', {'customer_id[is]': raw['customer_id'],
                               'status[in]': '["payment_due","not_paid"]', 'limit': 5}) or {}
@@ -217,6 +221,48 @@ def _guess_name(text: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def instance_status_lines(customer_id: str) -> list[str]:
+    """Instanz-, Lizenz- und Vertragsinfos aus dem CSM-MCP (`customer_lookup`, Instance Manager +
+    Planhat), gesucht über die Debitorennummer. Leer ohne Token oder ohne eindeutigen Treffer."""
+    from sandbox_handler import csm_customer_lookup
+    cust = (_cb(f"customers/{customer_id}") or {}).get('customer', {})
+    query = str(cust.get('cf_debit_number') or '') or cust.get('company') or ''
+    matches = csm_customer_lookup(query, limit=2) if query else []
+    if len(matches) != 1:
+        return []
+    m = matches[0]
+    lines = ["*Instanz & Vertrag* (Instance Manager / Planhat):"]
+    if m.get('instance_url'):
+        status = ' · '.join(x for x in (
+            f"Version {m['xentral_version']}" if m.get('xentral_version') else '',
+            f"Lizenz `{m['license_status']}`" if m.get('license_status') else '',
+            f"Instanz `{m['instance_status']}`" if m.get('instance_status') else '',
+        ) if x)
+        lines.append(f"• {m['instance_url']}" + (f" · {status}" if status else ''))
+    if m.get('serial'):
+        lines.append(f"• Serial: {m['serial']}")
+    lb = ' · '.join(x for x in (
+        f"Leistungsbeschreibung {m['leistungsbeschreibung']}" if m.get('leistungsbeschreibung') else '',
+        f"Servicepaket {m['cs_package']}" if m.get('cs_package') else '',
+    ) if x)
+    if lb:
+        lines.append(f"• {lb}")
+    sandboxes = m.get('sandbox_instances') or []
+    if sandboxes:
+        for sb in sandboxes[:2]:
+            lines.append(
+                f"• Sandbox: {sb.get('instance_url') or 'noch nicht im Instance Manager'}"
+                f" · Abo `{sb.get('subscription_status', '?')}`"
+            )
+    elif m.get('sandbox_note'):
+        lines.append(f"• Sandbox: {m['sandbox_note']}")
+    else:
+        lines.append("• Sandbox: keine Sandbox-Lizenz hinterlegt")
+    if m.get('owner_nickname'):
+        lines.append(f"• CSM/Owner: {m['owner_nickname']}")
+    return lines if len(lines) > 1 else []
+
+
 def build_status_reply(text: str, lookup) -> str | None:
     """Antworttext für eine Status-Frage oder None, wenn nichts Eindeutiges gefunden wurde.
 
@@ -224,22 +270,34 @@ def build_status_reply(text: str, lookup) -> str | None:
     eine Subscription; sie wird nur genutzt, wenn keine Rechnungsnummer im Post steht.
     """
     sections: list[list[str]] = []
+    customers: list[str] = []
     for inv_id in extract_invoice_ids(text):
-        sections.append(invoice_status_lines(inv_id))
+        sections.append(invoice_status_lines(inv_id, customers))
     if not sections:
         from text_utils import extract_company_name
         parsed = {'customer_name': extract_company_name(text) or _guess_name(text) or ''}
         sub = lookup(parsed, text)
         if not sub or sub.get('multiple_links'):
             return None
-        lines = subscription_status_lines(sub)
+        lines = subscription_status_lines(sub, customers)
         if lines:
             sections.append(lines)
     if not sections:
         return None
+    # Instanz-/Lizenzstand aus dem CSM-MCP, einmal je Kunde (max. 2)
+    source = 'Chargebee'
+    for cid in list(dict.fromkeys(customers))[:2]:
+        try:
+            inst = instance_status_lines(cid)
+        except Exception as e:
+            logger.warning(f"instance_status_lines({cid}) failed: {e}")
+            inst = []
+        if inst:
+            sections.append(inst)
+            source = 'Chargebee und Instance Manager'
     body = '\n\n'.join('\n'.join(s) for s in sections)
     return (
-        ":mag: *Stand aus Chargebee* (automatisch, nur lesend):\n\n"
+        f":mag: *Stand aus {source}* (automatisch, nur lesend):\n\n"
         f"{body}\n\n"
         "_Das CS Admin Team schaut bei Bedarf noch drauf. Falsche Antwort? `#bot-stop` in den Thread._"
     )
