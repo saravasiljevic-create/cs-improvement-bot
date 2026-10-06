@@ -14,7 +14,7 @@ import html as _html
 import requests
 
 from config import CS_ADMIN_USER_IDS
-from text_utils import extract_company_name
+from text_utils import extract_company_name, normalize_slack_text
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +253,7 @@ _TIER_CORRECTIONS = {250: 251, 500: 501, 30: 31, 0: 1}
 
 def parse_vertragsanpassung(text: str) -> dict:
     """Extrahiert strukturierte Felder aus einer Vertragsanpassungs-Anfrage im Freitext."""
-    text = _html.unescape(text)
+    text = normalize_slack_text(_html.unescape(text))
     result: dict = {}
     # URLs vor allen Regex-Suchen entfernen, damit URL-Bestandteile (z.B. "0-3" aus
     # HubSpot-Pfaden) nicht als Datum oder Plan-Namen erkannt werden.
@@ -263,9 +263,12 @@ def parse_vertragsanpassung(text: str) -> dict:
     if customer_name is not None:
         result['customer_name'] = customer_name
 
-    urls = _URL_RE.findall(text)
-    if urls:
-        result['offer_link'] = urls[0]
+    # Nur ein echter Angebots-Link (erp.xentral.com) zählt als Angebot. HubSpot-,
+    # Planhat-, Chargebee- oder Credit-Note-Links lösten früher bei jedem Post die
+    # Warnung "Angebots-Link konnte nicht geöffnet werden" aus.
+    offer_urls = [u for u in _URL_RE.findall(text) if 'erp.xentral.com' in u.lower()]
+    if offer_urls:
+        result['offer_link'] = offer_urls[0]
 
     # Datum aus URL-bereinigtem Text suchen (verhindert False Positives wie "0-3" aus HubSpot-URLs)
     m = _DATE_RE.search(text_no_urls)
@@ -283,16 +286,16 @@ def parse_vertragsanpassung(text: str) -> dict:
             result['payment_type'] = 'monatlich'
         else:
             result['payment_type'] = 'quartalsweise'
-    # Fallback: "Monatsvertrag" → monatlich, "Jahresvertrag" → jährlich
+    # Fallback: "Monatsvertrag" → monatlich. "Jahresvertrag" sagt NICHTS über die
+    # Zahlweise (Jahresvertrag mit monatlicher Zahlung ist der Normalfall) und hat
+    # früher erfundene Zyklus-Wechsel-Hinweise erzeugt.
     if not result.get('payment_type'):
         if re.search(r'\bmonatsvertrag\b', text_no_urls, re.IGNORECASE):
             result['payment_type'] = 'monatlich'
-        elif re.search(r'\bjahresvertrag\b', text_no_urls, re.IGNORECASE):
-            result['payment_type'] = 'jährlich'
 
     # Plan: erst "Plan | N-Monatsvertrag [Zahlung] inkl. X"-Format (wie im Angebot)
     _inline_plan = re.compile(
-        r'([\w][\w \-]*?\d+[\w \-]*?)'          # Plan-Name mit Zahl (z.B. "Pro 25")
+        r'\b((?:pro|business|starter|scale|launch|core|connect)[ \-]*\d*[\w \-]*?)'  # Plan-Name (z.B. "Pro 25")
         r'[ ]*\|[ ]*'                             # Pipe
         r'([\d]+[ \-]?(?:Monats|Jahres)vertrag[^\[]*)'  # Vertragstyp
         r'\[([^\]]+)\]'                           # [Zahlweise]
@@ -331,7 +334,11 @@ def parse_vertragsanpassung(text: str) -> dict:
             if pid:
                 result['chargebee_plan_id'] = pid
     else:
-        m = _PLAN_RE.search(text_no_urls)
+        # Kundennamen ausblenden, sonst wird z.B. "MANAX connect GmbH" zu Plan "connect"
+        plan_text = text_no_urls
+        if customer_name:
+            plan_text = re.sub(re.escape(customer_name), ' ', plan_text, flags=re.IGNORECASE)
+        m = _PLAN_RE.search(plan_text)
         if m:
             result['new_plan'] = m.group(0).strip()
 
@@ -983,7 +990,8 @@ def _format_found_fields(parsed: dict, subscription: dict | None = None) -> str:
             date_val = 'Ab sofort / ASAP'
         lines.append(f"• *Vertragsbeginn:* {date_val}")
     if parsed.get('offer_link'):
-        lines.append(f"• *Angebots-Link:* {parsed['offer_link']}")
+        note = " _(nicht lesbar — Werte bitte aus dem Post übernehmen)_" if parsed.get('offer_fetch_failed') else ''
+        lines.append(f"• *Angebots-Link:* {parsed['offer_link']}{note}")
     if parsed.get('addons_add'):
         lines.append(f"• *Add-Ons hinzufügen:* {parsed['addons_add']}")
     if parsed.get('addons_remove'):
@@ -1224,7 +1232,10 @@ def build_va_summary_blocks(parsed: dict, subscription: dict | None, requester: 
             price_line = f"  → `item_price_id`: `{parsed['chargebee_plan_id']}`"
             list_price = parsed.get('chargebee_plan_list_price')
             negotiated_price = parsed.get('negotiated_price')
-            if list_price is not None:
+            if list_price is not None and list_price <= 100:
+                # Basis-Item ohne Versions-Suffix (Platzhalterpreis 1,00 €) → Variante unklar
+                price_line += "  ·  ⚠️ Preis-Variante unklar (Service-Paket fehlt) — bitte in Chargebee wählen"
+            elif list_price is not None:
                 eur_list = f"EUR {list_price / 100:,.2f}"
                 price_line += f"  ·  Listenpreis: *{eur_list}/mo*"
                 if negotiated_price is not None and negotiated_price != list_price:

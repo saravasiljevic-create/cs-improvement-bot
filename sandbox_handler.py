@@ -959,17 +959,12 @@ def _mcp_parse(resp) -> dict | None:
     return resp.json() if resp.text else None
 
 
-def fetch_instance_info_from_csm(query: str) -> dict:
-    """Holt Prod-/Sandbox-URL und -Serial über das Tool `customer_lookup` des CSM-MCP-Servers.
+def csm_customer_lookup(query: str, limit: int = 2) -> list[dict]:
+    """Ruft `customer_lookup` des CSM-MCP-Servers auf und liefert die Trefferliste (read-only).
 
-    `query` ist am besten die Kundennummer (Chargebee cf_debit_number), sonst der Firmenname.
-    Liefert nur Werte, die eindeutig sind: Prod aus genau einem Treffer, Sandbox nur, wenn es
-    genau eine aktive Sandbox im Instance Manager gibt. Ohne CSM_MCP_TOKEN, bei Fehlern oder
-    Mehrdeutigkeit kommt ein leeres bzw. unvollständiges Dict zurück, dann fragt der Bot wie
-    bisher beim CSM nach. Niemals raten.
-    """
+    Leere Liste ohne Token, bei Fehlern oder ohne Treffer."""
     if not (CSM_MCP_TOKEN and query):
-        return {}
+        return []
     headers = {
         'Authorization': f'Bearer {CSM_MCP_TOKEN}',
         'Accept': 'application/json, text/event-stream',
@@ -989,17 +984,51 @@ def fetch_instance_info_from_csm(query: str) -> dict:
                          json={'jsonrpc': '2.0', 'method': 'notifications/initialized'})
             resp = session.post(CSM_MCP_URL, headers=headers, timeout=60, json={
                 'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
-                'params': {'name': 'customer_lookup', 'arguments': {'query': str(query), 'limit': 2}},
+                'params': {'name': 'customer_lookup', 'arguments': {'query': str(query), 'limit': limit}},
             })
             resp.raise_for_status()
             payload = _mcp_parse(resp) or {}
         content = (payload.get('result') or {}).get('content') or []
         data = json.loads(content[0]['text']) if content else {}
     except Exception as e:
-        logger.warning(f"fetch_instance_info_from_csm({query!r}) failed: {e}")
-        return {}
+        logger.warning(f"csm_customer_lookup({query!r}) failed: {e}")
+        return []
+    return data.get('matches') or []
 
-    matches = data.get('matches') or []
+
+def find_chargebee_customer_id_via_csm(query: str) -> str | None:
+    """Chargebee-Customer-ID über den CSM-MCP (Planhat „CB Customer ID“), nur bei genau einem Treffer."""
+    matches = csm_customer_lookup(query, limit=2)
+    if len(matches) != 1:
+        return None
+    return matches[0].get('chargebee_customer_id') or None
+
+
+def get_planhat_chargebee_customer_id(planhat_id: str, api_token: str) -> str | None:
+    """Liest das Planhat-Feld „CB Customer ID“ einer Firma (GET /companies/{id})."""
+    if not (planhat_id and api_token):
+        return None
+    try:
+        resp = requests.get(f'{PLANHAT_BASE_URL}/companies/{planhat_id}',
+                            headers={'Authorization': f'Bearer {api_token}'}, timeout=15)
+        if not resp.ok:
+            return None
+        return ((resp.json() or {}).get('custom') or {}).get('CB Customer ID') or None
+    except Exception as e:
+        logger.warning(f"get_planhat_chargebee_customer_id({planhat_id!r}) failed: {e}")
+        return None
+
+
+def fetch_instance_info_from_csm(query: str) -> dict:
+    """Holt Prod-/Sandbox-URL und -Serial über das Tool `customer_lookup` des CSM-MCP-Servers.
+
+    `query` ist am besten die Kundennummer (Chargebee cf_debit_number), sonst der Firmenname.
+    Liefert nur Werte, die eindeutig sind: Prod aus genau einem Treffer, Sandbox nur, wenn es
+    genau eine aktive Sandbox im Instance Manager gibt. Ohne CSM_MCP_TOKEN, bei Fehlern oder
+    Mehrdeutigkeit kommt ein leeres bzw. unvollständiges Dict zurück, dann fragt der Bot wie
+    bisher beim CSM nach. Niemals raten.
+    """
+    matches = csm_customer_lookup(query, limit=2)
     if len(matches) != 1:
         return {}
     match = matches[0]

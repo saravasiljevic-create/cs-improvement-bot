@@ -5,6 +5,37 @@ Sandbox-Anfrage, ...).
 import html as _html
 import re
 
+# Slack liefert Links als <https://…|Anzeigetext> bzw. <https://…>, Erwähnungen als
+# <@U123>, <!here>, <#C123|channel>. Ohne Normalisierung landen "|Anzeigetext>" und
+# "%7C…" in URLs (Angebots-Link-Warnung bei jedem Link) und Link-Markup in
+# Kundennamen ("…Wein am Limit> auf folgenden Vertrag").
+_SLACK_LINK_RE = re.compile(r'<(https?://[^|>\s]+)(?:\|([^>]*))?>')
+_SLACK_SPECIAL_RE = re.compile(r'<(?:@[A-Z0-9]+|![a-z]+(?:\^[^>]*)?|#[A-Z0-9]+(?:\|[^>]*)?)>')
+_URL_ANY_RE = re.compile(r'https?://\S+')
+
+
+def normalize_slack_text(text: str) -> str:
+    """Wandelt Slack-Markup in lesbaren Klartext um.
+
+    <url|Label> → "Label url" (Label für die Namenserkennung, URL für die Link-Erkennung),
+    <url> → "url", Erwähnungen und <!here> werden entfernt. Idempotent.
+    """
+    if not text:
+        return ''
+    def _link(m):
+        url, label = m.group(1), (m.group(2) or '').strip()
+        if label and label != url:
+            return f'{label} {url}'
+        return url
+    text = _SLACK_LINK_RE.sub(_link, text)
+    text = _SLACK_SPECIAL_RE.sub('', text)
+    return text
+
+
+def strip_urls(text: str) -> str:
+    """Entfernt URLs, damit URL-Bestandteile nicht als Namen, Daten oder Pläne erkannt werden."""
+    return _URL_ANY_RE.sub(' ', text or '')
+
 # Erkennt explizit gelabelte Kundennennungen ("Kunde: X", "Firma X").
 _CUSTOMER_LABELED_RE = re.compile(
     # Colon/dash optional: matches both "Kunde: X" and "Kunde X"
@@ -41,12 +72,18 @@ _SKIP_WORDS = {
 def _clean_company_name(name: str) -> str:
     """Extrahiert nur den eigentlichen Firmennamen (kürzt vorne und hinten)."""
     # Hinten: alles nach dem rechtlichen Suffix abschneiden
+    # Wortgrenzen: ohne sie trifft z.B. "ag" in "Vertragsanpassung" (→ Kunde "Vertrag")
     suffix = re.search(
-        r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?',
+        r'\b(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)\b(?:\s*&\s*Co\.?\s*KG)?',
         name, re.IGNORECASE,
     )
     if suffix:
         name = name[:suffix.end()].strip()
+        # Der Suffix-Treffer beginnt oft am Satzanfang ("Bitte Vertragsanpassung für HNG
+        # Digital GmbH") → nur den Teil nach der letzten Präposition/Kundennennung nehmen.
+        parts = re.split(r'\b(?:für|fuer|bei|beim|von|vom|kunde[n]?|customer|zu)\s+', name, flags=re.IGNORECASE)
+        if len(parts) > 1 and parts[-1].strip():
+            name = parts[-1].strip()
 
     words = name.split()
     start = 0
@@ -82,7 +119,7 @@ def extract_company_name(text: str) -> str | None:
     daher unschädlich falls der Aufrufer (z.B. parse_vertragsanpassung) schon
     unescaped hat.
     """
-    text = _html.unescape(text)
+    text = strip_urls(normalize_slack_text(_html.unescape(text)))
     m = _CUSTOMER_LABELED_RE.search(text)
     if m:
         raw = _STRIP_COMPANY_PREFIX_RE.sub('', m.group(1)).strip()
