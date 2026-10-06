@@ -1,0 +1,245 @@
+"""
+Status-Fragen in #ask-cs-admin direkt aus Chargebee beantworten (read-only).
+
+Typische Fragen aus dem Channel: „Könnt ihr mir den Stand zur Rechnung 68392 mitteilen?",
+„Hat Nordica heute das Upgrade auf Business bekommen?", „Warum sind die zwei Rechnungen noch
+posted?". Der Bot liefert die Fakten aus Chargebee in den Thread. Er entscheidet nichts und
+ändert nichts — die Bewertung bleibt beim CS Admin Team.
+"""
+import logging
+import os
+import re
+from datetime import datetime, timezone
+
+import requests
+
+from text_utils import normalize_slack_text, strip_urls
+
+logger = logging.getLogger(__name__)
+
+CHARGEBEE_SITE = os.environ.get('CHARGEBEE_SITE', 'xentral-dach')
+
+# ---------------------------------------------------------------------------
+# Erkennung
+# ---------------------------------------------------------------------------
+
+_INVOICE_LINK_RE = re.compile(r'chargebee\.com/d/invoices/(?P<id>[A-Za-z0-9_\-]+)', re.IGNORECASE)
+# „Rechnung 68392", „Rechnungen 76999 und 77958", „RE 74766", „invoice #76897", „Rg. 75270"
+_INVOICE_NUMBER_RE = re.compile(
+    r'\b(?:rechnung(?:en|snummer|snr\.?)?|re\.?|rg\.?|invoices?|beleg)\s*(?:nr\.?|nummer)?\s*'
+    r'[#:]?\s*(\d{4,6}(?:\s*(?:,|und|&|/)\s*#?\d{4,6})*)',
+    re.IGNORECASE,
+)
+_STATUS_WORDS_RE = re.compile(
+    r'\b(?:stand|status|offen|bezahlt|beglichen|eingegangen|eingezogen|f[äa]llig|posted|'
+    r'gemahnt|mahnung|storniert|gutschrift|bekommen|umgestellt|aktiv|hinterlegt|'
+    r'upgrade|downgrade|verl[äa]ngert|renewal|laufzeit)\b',
+    re.IGNORECASE,
+)
+_QUESTION_RE = re.compile(
+    r'\?|\b(?:k[öo]nnt\s+ihr\s+(?:mir\s+)?(?:bitte\s+)?(?:den\s+)?(?:aktuellen\s+)?(?:stand|status)|'
+    r'mitteilen|nachschauen|schauen\s+ob|pr[üu]fen\s+ob|wisst\s+ihr|wei[ßs]\s+jemand)\b',
+    re.IGNORECASE,
+)
+# Aufträge statt Fragen: dann ist es eine Vertragsanpassung o. Ä., kein Status
+_ORDER_RE = re.compile(
+    r'\bbitte\b[^.?!\n]{0,80}\b(?:umstellen|anlegen|einrichten|hinterlegen|vornehmen|einstellen|'
+    r'freischalten|stornieren|gutschreiben|erstellen|[äa]ndern|anpassen|k[üu]ndigen)\b',
+    re.IGNORECASE,
+)
+
+
+def extract_invoice_ids(text: str) -> list[str]:
+    """Rechnungsnummern aus Links und aus „Rechnung 12345"-Formulierungen, in Reihenfolge, ohne Duplikate."""
+    text = normalize_slack_text(text or '')
+    ids: list[str] = []
+    for m in _INVOICE_LINK_RE.finditer(text):
+        ids.append(m.group('id'))
+    for m in _INVOICE_NUMBER_RE.finditer(strip_urls(text)):
+        ids.extend(re.findall(r'\d{4,6}', m.group(1)))
+    seen, out = set(), []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out[:3]
+
+
+def detect_status_question(text: str) -> bool:
+    """True, wenn der Post eine Status-Frage ist (Frage + Status-Wort), kein Auftrag."""
+    t = normalize_slack_text(text or '')
+    if not _QUESTION_RE.search(t) or not _STATUS_WORDS_RE.search(t):
+        return False
+    if _ORDER_RE.search(t) and '?' not in t:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Chargebee (read-only)
+# ---------------------------------------------------------------------------
+
+def _cb(path: str, params: dict | None = None) -> dict | None:
+    key = os.environ.get('CHARGEBEE_API_KEY', '')
+    if not key:
+        return None
+    try:
+        resp = requests.get(
+            f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2/{path}",
+            params=params or {}, auth=(key, ''), timeout=10,
+        )
+        if resp.ok:
+            return resp.json()
+        logger.info(f"Status CB {path}: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Status CB {path} failed: {e}")
+    return None
+
+
+def _d(ts) -> str:
+    if not ts:
+        return '–'
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone().strftime('%d.%m.%Y')
+
+
+def _de_date(iso: str | None) -> str:
+    """'2026-11-05' → '05.11.2026'"""
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})', iso or '')
+    return f"{m.group(3)}.{m.group(2)}.{m.group(1)}" if m else ''
+
+
+def _eur(cents) -> str:
+    return f"{(cents or 0) / 100:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.')
+
+
+_INVOICE_STATUS_DE = {
+    'paid': 'bezahlt', 'posted': 'gestellt, noch nicht fällig', 'payment_due': 'fällig, offen',
+    'not_paid': 'nicht bezahlt', 'voided': 'storniert', 'pending': 'Entwurf (noch nicht gestellt)',
+}
+_TXN_STATUS_DE = {
+    'success': 'erfolgreich', 'failure': 'fehlgeschlagen', 'in_progress': 'läuft',
+    'late_failure': 'nachträglich fehlgeschlagen', 'voided': 'storniert', 'needs_attention': 'prüfen',
+}
+
+
+def invoice_status_lines(invoice_id: str) -> list[str]:
+    data = _cb(f"invoices/{invoice_id}")
+    if not data or 'invoice' not in data:
+        return [f"*Rechnung {invoice_id}:* in Chargebee nicht gefunden."]
+    inv = data['invoice']
+    url = f"https://{CHARGEBEE_SITE}.chargebee.com/d/invoices/{inv['id']}"
+    status = _INVOICE_STATUS_DE.get(inv.get('status'), inv.get('status'))
+    lines = [
+        f"*Rechnung <{url}|{inv['id']}>* vom {_d(inv.get('date'))}: *{status}*",
+        f"• Betrag {_eur(inv.get('total'))} brutto · bezahlt {_eur(inv.get('amount_paid'))}"
+        f" · gutgeschrieben {_eur((inv.get('credits_applied') or 0) + (inv.get('amount_adjusted') or 0))}"
+        f" · offen *{_eur(inv.get('amount_due'))}*",
+    ]
+    if inv.get('due_date') and inv.get('status') in ('payment_due', 'not_paid', 'posted'):
+        lines.append(f"• Fällig am {_d(inv.get('due_date'))}")
+    if inv.get('dunning_status'):
+        lines.append(f"• Mahnlauf: `{inv['dunning_status']}`")
+    for p in (inv.get('linked_payments') or [])[:4]:
+        lines.append(
+            f"• Zahlung {_d(p.get('txn_date'))}: {_eur(p.get('applied_amount'))} "
+            f"({_TXN_STATUS_DE.get(p.get('txn_status'), p.get('txn_status'))})"
+        )
+    for cn in (inv.get('issued_credit_notes') or [])[:3]:
+        lines.append(f"• Gutschrift {cn.get('cn_id')}: {_eur(cn.get('cn_total'))} ({cn.get('cn_status')})")
+    sched = _cb(f"invoices/{inv['id']}/payment_schedules") or {}
+    entries = [e for s in (sched.get('payment_schedules') or []) for e in s.get('schedule_entries', [])]
+    if entries:
+        open_e = [e for e in entries if e.get('status') != 'paid']
+        nxt = open_e[0] if open_e else None
+        lines.append(
+            f"• Ratenplan: {len(entries)} Raten, davon {len(entries) - len(open_e)} bezahlt"
+            + (f" · nächste Rate {_eur(nxt.get('amount'))} am {_d(nxt.get('date'))}" if nxt else '')
+        )
+    if inv.get('customer_id'):
+        cust = (_cb(f"customers/{inv['customer_id']}") or {}).get('customer', {})
+        if cust.get('company'):
+            lines.append(f"• Kunde: {cust['company']} (Deb.-Nr. {cust.get('cf_debit_number', '–')})")
+    return lines
+
+
+def subscription_status_lines(subscription: dict) -> list[str]:
+    """Kurzer Stand einer Subscription: Plan, Preis, Status, Laufzeit, geplante Änderungen, offene Posten."""
+    sub_id = subscription.get('subscription_id')
+    raw = (_cb(f"subscriptions/{sub_id}") or {}).get('subscription') if sub_id else None
+    if not raw:
+        return []
+    url = f"https://{CHARGEBEE_SITE}.chargebee.com/d/subscriptions/{sub_id}"
+    plan = next((i for i in raw.get('subscription_items', []) if i.get('item_type') == 'plan'), {})
+    lines = [
+        f"*Subscription <{url}|{sub_id}>*"
+        + (f" · {subscription.get('company')}" if subscription.get('company') else '')
+        + f": `{raw.get('status')}`",
+        f"• Plan `{plan.get('item_price_id', '–')}` zu {_eur(plan.get('unit_price'))} netto"
+        f" · Abrechnung alle {raw.get('billing_period', 1)} {'Jahr(e)' if raw.get('billing_period_unit') == 'year' else 'Monat(e)'}",
+        f"• Verlängerungsdatum: {_de_date(raw.get('cf_renewal_date')) or _d(raw.get('current_term_end'))}"
+        f" · nächste Rechnung {_d(raw.get('next_billing_at'))}",
+    ]
+    if raw.get('cancelled_at'):
+        lines.append(f"• Gekündigt zum {_d(raw.get('cancelled_at'))}")
+    if raw.get('has_scheduled_changes'):
+        sch = (_cb(f"subscriptions/{sub_id}/retrieve_with_scheduled_changes") or {}).get('subscription', {})
+        nplan = next((i for i in sch.get('subscription_items', []) if i.get('item_type') == 'plan'), {})
+        lines.append(
+            f"• Geplante Änderung: `{nplan.get('item_price_id', '?')}` zu {_eur(nplan.get('unit_price'))}"
+        )
+    ramps = (_cb('ramps', {'subscription_id[is]': sub_id, 'status[is]': 'scheduled'}) or {}).get('list', [])
+    for r in ramps[:2]:
+        rp = r.get('ramp', {})
+        lines.append(f"• Ramp geplant zum {_d(rp.get('effective_from'))}")
+    if raw.get('customer_id'):
+        inv = _cb('invoices', {'customer_id[is]': raw['customer_id'],
+                              'status[in]': '["payment_due","not_paid"]', 'limit': 5}) or {}
+        open_inv = [x['invoice'] for x in inv.get('list', [])]
+        if open_inv:
+            lines.append(
+                "• Offene Rechnungen: " + ', '.join(
+                    f"{i['id']} ({_eur(i.get('amount_due'))}, {_INVOICE_STATUS_DE.get(i.get('status'), i.get('status'))})"
+                    for i in open_inv)
+            )
+        else:
+            lines.append("• Keine offenen Rechnungen")
+    return lines
+
+
+_NAME_AFTER_RE = re.compile(
+    r'\b(?:ob|f[üu]r|bei|beim|kunde[n]?|kundin)\s+((?:[A-ZÄÖÜ0-9][\w&.\-]*)(?:\s+[A-ZÄÖÜ0-9][\w&.\-]*){0,3})'
+)
+
+
+def _guess_name(text: str) -> str | None:
+    """Firmenname ohne Rechtsform, z.B. „ob Nordica Coffee heute …“ → „Nordica Coffee“."""
+    m = _NAME_AFTER_RE.search(strip_urls(normalize_slack_text(text)))
+    return m.group(1).strip() if m else None
+
+
+def build_status_reply(text: str, lookup) -> str | None:
+    """Antworttext für eine Status-Frage oder None, wenn nichts Eindeutiges gefunden wurde.
+
+    `lookup(parsed, text)` ist die Kundensuche des Bots (Links → CSM-MCP → Name) und liefert
+    eine Subscription; sie wird nur genutzt, wenn keine Rechnungsnummer im Post steht.
+    """
+    sections: list[list[str]] = []
+    for inv_id in extract_invoice_ids(text):
+        sections.append(invoice_status_lines(inv_id))
+    if not sections:
+        from text_utils import extract_company_name
+        parsed = {'customer_name': extract_company_name(text) or _guess_name(text) or ''}
+        sub = lookup(parsed, text)
+        if not sub or sub.get('multiple_links'):
+            return None
+        lines = subscription_status_lines(sub)
+        if lines:
+            sections.append(lines)
+    if not sections:
+        return None
+    body = '\n\n'.join('\n'.join(s) for s in sections)
+    return (
+        ":mag: *Stand aus Chargebee* (automatisch, nur lesend):\n\n"
+        f"{body}\n\n"
+        "_Das CS Admin Team schaut bei Bedarf noch drauf. Falsche Antwort? `#bot-stop` in den Thread._"
+    )

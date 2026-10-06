@@ -2,6 +2,8 @@ import logging
 import os
 import re
 from text_utils import normalize_slack_text
+import json as _json
+from status_handler import detect_status_question, extract_invoice_ids, build_status_reply
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -147,6 +149,18 @@ _pending_sandbox: dict[tuple[str, str], dict] = {}
 # VA-Zusammenfassungen die auf CS Admin Bestätigung warten (für 48h Reminder)
 # (channel, thread_ts) -> {'sent_at': float, 'reminded': bool}
 _va_pending_approval: dict[tuple[str, str], dict] = {}
+
+# Threads, in denen der Bot eine Status-Frage beantwortet hat (für #bot-stop-Logging)
+_status_answered: dict[tuple[str, str], float] = {}
+
+# Gründe für #bot-stop (Buttons nach dem Stummschalten, geloggt als BOT_STOP_REASON)
+_BOT_STOP_REASONS = [
+    ('falscher_zeitpunkt', 'Falscher Zeitpunkt / keine Anfrage'),
+    ('falsche_daten', 'Falsche Daten'),
+    ('falscher_kunde', 'Falscher Kunde'),
+    ('unnoetig', 'Unnötig, machen wir selbst'),
+    ('anderes', 'Anderes'),
+]
 
 # Threads where the bot has been silenced via #bot-stop
 _muted_threads: set[tuple[str, str]] = set()
@@ -1446,6 +1460,30 @@ def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name,
 # Event handlers
 # ---------------------------------------------------------------------------
 
+_VA_ORDER_RE = re.compile(
+    r'\b(?:bitte|k[öo]nnt\s+ihr|k[öo]nnten\s+wir|w[üu]rdet\s+ihr)\b[^\n]{0,160}?\b(?:umstellen|umzustellen|anlegen|einrichten|'
+    r'hinterlegen|vornehmen|einstellen|upgraden|downgraden|wechseln|verl[äa]ngern|[äa]ndern|anpassen|eintragen|buchen)\b'
+    r'|\bfolgende\w*\s+vertrags\w*\b|\bunterschrieben\w*\s+angebot|\bangebot\b[^\n]{0,60}\bunterschrieben',
+    re.IGNORECASE,
+)
+_FYI_RE = re.compile(r'\b(?:fyi|zur\s+info|zur\s+kenntnis|nur\s+zur\s+info|info\s+an\s+euch)\b', re.IGNORECASE)
+
+
+def _looks_like_va_order(text: str) -> bool:
+    """Auto-Erkennung nur für Aufträge, nicht für Fragen, Meldungen oder FYIs.
+
+    Live-Fehltreffer, die das verhindert: Kilians Winback-Frage (Scaff24), Finance-FYI zur
+    MANAX-Gutschrift, Reklamationen wie „hat eine Jahresrechnung erhalten, sollte aber …".
+    """
+    if _FYI_RE.search(text):
+        return False
+    if not _VA_ORDER_RE.search(text):
+        return False
+    # Eine Frage ohne klaren Auftrag am Satzanfang ("Bitte … umstellen") ist keiner
+    questions = text.count('?')
+    return questions == 0 or bool(re.search(r'(?:^|\n|[.!:])\s*(?:hi\w*\s+\w+,?\s*)?bitte\b', text, re.IGNORECASE))
+
+
 def _handle_message_core(event, say, client):
     """Core message processing logic, shared by the generic and file_share handlers."""
     subtype = event.get('subtype')
@@ -1655,6 +1693,18 @@ def _handle_message_core(event, say, client):
                 except Exception:
                     pass
 
+            # Messbarkeit: welcher Flow war aktiv, als gestoppt wurde (Cloud-Logging: "BOT_STOP")
+            _key = (channel, thread_ts)
+            _active_flows = [name for name, store in (
+                ('improvement', _pending), ('vertragsanpassung', _pending_vertragsanpassung),
+                ('va_freigabe', _va_pending_approval), ('sandbox', _pending_sandbox),
+                ('aehnliche_tickets', _similar_shown), ('status', _status_answered),
+            ) if _key in store]
+            logger.info("BOT_STOP " + _json.dumps({
+                'channel': channel, 'thread_ts': thread_ts, 'user': user_name,
+                'flows': _active_flows or ['unbekannt'], 'jira_key': jira_key or '',
+            }, ensure_ascii=False))
+
             _pending.pop((channel, thread_ts), None)
             _ticket_data.pop((channel, thread_ts), None)
             _similar_shown.pop((channel, thread_ts), None)
@@ -1666,7 +1716,18 @@ def _handle_message_core(event, say, client):
             parts = [":mute: Thread stummgeschaltet — der Bot antwortet hier nicht mehr."]
             if deleted_ticket:
                 parts.append(f":wastebasket: Ticket *{jira_key}* ({deleted_ticket}) gelöscht.")
-            say(text='\n'.join(parts), thread_ts=thread_ts)
+            say(
+                text='\n'.join(parts),
+                blocks=[
+                    {'type': 'section', 'text': {'type': 'mrkdwn', 'text': '\n'.join(parts) + "\n_Was war los? (1 Klick, hilft beim Verbessern)_"}},
+                    {'type': 'actions', 'elements': [
+                        {'type': 'button', 'text': {'type': 'plain_text', 'text': label},
+                         'action_id': f'botstop_reason_{code}', 'value': f'{channel}|{thread_ts}'}
+                        for code, label in _BOT_STOP_REASONS
+                    ]},
+                ],
+                thread_ts=thread_ts,
+            )
             return
 
         if '#bot-remove' in text.lower():
@@ -2308,12 +2369,26 @@ def _handle_message_core(event, say, client):
     # Das Team startet Flows bei Bedarf bewusst per #vertragsanpassung im Thread.
     _auto_detect = user_id not in CS_ADMIN_USER_IDS
 
+    # --- Status-Frage: direkt aus Chargebee beantworten (nur lesend) ---
+    if _auto_detect and _in_va and detect_status_question(text):
+        try:
+            reply = build_status_reply(text, _va_lookup)
+        except Exception as e:
+            logger.warning(f"Status answer failed: {e}")
+            reply = None
+        if reply:
+            say(text=reply, thread_ts=ts)
+            _status_answered[(channel, ts)] = time.time()
+            logger.info("STATUS_ANSWER " + _json.dumps({'channel': channel, 'ts': ts, 'user': user_name,
+                                                        'invoices': extract_invoice_ids(text)}))
+            return
+
     if _auto_detect and (_in_improvement or _in_va) and detect_sandbox_request(text):
         _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text)
         return
 
     # --- Vertragsanpassung: auto-detection (only in VA channel) ---
-    if _auto_detect and _in_va and detect_vertragsanpassung(text):
+    if _auto_detect and _in_va and detect_vertragsanpassung(text) and _looks_like_va_order(text):
         _set_eyes(client, channel, ts)
         parsed = _enrich_from_offer(parse_vertragsanpassung(text))
         # Nicht lesbarer Angebots-Link: kein eigener Warn-Post mehr (führte zu Doppel-
@@ -2705,6 +2780,28 @@ def handle_va_approved(ack, body, say, client):
         )
 
     _va_pending_approval.pop((channel, thread_ts), None)
+
+
+@app.action(re.compile(r"^botstop_reason_"))
+def handle_botstop_reason(ack, body, client):
+    ack()
+    action = (body.get('actions') or [{}])[0]
+    code = action.get('action_id', '').replace('botstop_reason_', '')
+    channel, _, thread_ts = (action.get('value') or '').partition('|')
+    user = (body.get('user') or {}).get('name') or (body.get('user') or {}).get('id', '')
+    logger.info("BOT_STOP_REASON " + _json.dumps({'channel': channel, 'thread_ts': thread_ts,
+                                                  'reason': code, 'user': user}, ensure_ascii=False))
+    label = dict(_BOT_STOP_REASONS).get(code, code)
+    try:
+        msg = body.get('message') or {}
+        client.chat_update(
+            channel=(body.get('channel') or {}).get('id', channel), ts=msg.get('ts'),
+            text=f":mute: Thread stummgeschaltet. Grund notiert: {label}. Danke!",
+            blocks=[{'type': 'section', 'text': {'type': 'mrkdwn',
+                     'text': f":mute: Thread stummgeschaltet. Grund notiert: *{label}*. Danke!"}}],
+        )
+    except Exception as e:
+        logger.warning(f"botstop reason update failed: {e}")
 
 
 @app.action("planhat_link_skip")
@@ -3154,6 +3251,21 @@ def handle_app_mention(event, say, client):
     # Improvement/VA → Message-Handler übernimmt
     if any(kw in text_lower for kw in ('#improvement', '#vertragsanpassung')):
         return
+
+    # Status-Frage per @Bot (auch in Threads): Fakten aus Chargebee
+    _status_text = normalize_slack_text(raw_text)
+    if detect_status_question(_status_text) or extract_invoice_ids(_status_text):
+        try:
+            reply = build_status_reply(_status_text, _va_lookup)
+        except Exception as e:
+            logger.warning(f"Status answer (mention) failed: {e}")
+            reply = None
+        if reply:
+            say(text=reply, thread_ts=thread_ts)
+            _status_answered[(event.get('channel'), thread_ts)] = time.time()
+            logger.info("STATUS_ANSWER " + _json.dumps({'channel': event.get('channel'), 'ts': thread_ts,
+                                                        'via': 'mention', 'invoices': extract_invoice_ids(_status_text)}))
+            return
 
     user_name = get_user_name(client, user_id)
 
