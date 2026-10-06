@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from text_utils import normalize_slack_text
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -76,6 +77,8 @@ from sandbox_handler import (
     build_sandbox_video_blocks,
     create_sandbox_mirroring_ticket,
     fetch_instance_info_from_csm,
+    find_chargebee_customer_id_via_csm,
+    get_planhat_chargebee_customer_id,
     detect_sandbox_request,
     extract_direct_references,
     get_chargebee_contact_email,
@@ -806,6 +809,107 @@ def _cb_lookup(customer_name: str) -> dict | None:
     )
 
 
+_CB_INVOICE_URL_RE = re.compile(r'chargebee\.com/d/invoices/(?P<id>[^\s/|><?#]+)', re.IGNORECASE)
+_PLANHAT_COMPANY_ID_RE = re.compile(r'planhat\.com/\S*?(?:profile=Company\.|/profile/|/customer/)(?P<id>[a-f0-9]{24})', re.IGNORECASE)
+
+
+def _cb_subscriptions_for_customer_id(customer_id: str, company: str = '') -> dict | None:
+    from vertragsanpassung_handler import _fetch_subscriptions_for_customer
+    base = f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2"
+    return _fetch_subscriptions_for_customer(customer_id, base, (CHARGEBEE_API_KEY, ''), CHARGEBEE_SITE, company)
+
+
+def _cb_company_name(customer_id: str) -> str:
+    try:
+        resp = requests.get(
+            f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2/customers/{customer_id}",
+            auth=(CHARGEBEE_API_KEY, ''), timeout=8,
+        )
+        if resp.ok:
+            c = resp.json().get('customer', {})
+            return c.get('company') or f"{c.get('first_name', '')} {c.get('last_name', '')}".strip()
+    except Exception as e:
+        logger.warning(f"CB customer name lookup failed: {e}")
+    return ''
+
+
+def _va_lookup(parsed: dict, raw_text: str = '') -> dict | None:
+    """Findet die Chargebee-Subscription für eine Vertragsanpassung — erst über Links, dann
+    über den CSM-MCP, zuletzt über den (geratenen) Namen.
+
+    Links im Post (Chargebee-Kunde/-Subscription/-Rechnung, Planhat-Firma) sind eindeutig
+    und schlagen den aus dem Satz extrahierten Namen, der live oft falsch war ("Kunde: im
+    Winback. Der Vertrag"). Wird der Kunde gefunden, ersetzt der Chargebee-Firmenname den
+    geratenen Namen in `parsed`.
+    """
+    if not CHARGEBEE_API_KEY:
+        return None
+    text = normalize_slack_text(raw_text or '')
+    customer_id = None
+    sub = None
+
+    m = _CB_URL_RE.search(text)
+    if m and m.group('type'):
+        link_id = (m.group('id') or '').strip()
+        if m.group('type').lower() == 'customers':
+            customer_id = link_id
+        else:
+            sub = _fetch_subscription_by_id(link_id, CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+            customer_id = (sub or {}).get('customer_id')
+    if not customer_id:
+        m = _CB_INVOICE_URL_RE.search(text)
+        if m:
+            try:
+                resp = requests.get(
+                    f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2/invoices/{m.group('id')}",
+                    auth=(CHARGEBEE_API_KEY, ''), timeout=8,
+                )
+                if resp.ok:
+                    inv = resp.json().get('invoice', {})
+                    customer_id = inv.get('customer_id')
+                    if inv.get('subscription_id'):
+                        sub = _fetch_subscription_by_id(inv['subscription_id'], CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+            except Exception as e:
+                logger.warning(f"VA lookup via invoice link failed: {e}")
+    if not customer_id:
+        m = _PLANHAT_COMPANY_ID_RE.search(text)
+        if m:
+            customer_id = get_planhat_chargebee_customer_id(m.group('id'), PLANHAT_API_TOKEN)
+
+    name = parsed.get('customer_name', '')
+    if not customer_id and not sub:
+        found = _cb_lookup(name)
+        if found:
+            return found
+        if name and len(name) >= 4:
+            # Eindeutiger Präfix-Treffer in Chargebee ("Rhehag" → "Rhehag Warenhandel GmbH")
+            try:
+                resp = requests.get(
+                    f"https://{CHARGEBEE_SITE}.chargebee.com/api/v2/customers",
+                    params={'company[starts_with]': name, 'limit': 2},
+                    auth=(CHARGEBEE_API_KEY, ''), timeout=8,
+                )
+                hits = resp.json().get('list', []) if resp.ok else []
+                if len(hits) == 1:
+                    customer_id = hits[0]['customer']['id']
+            except Exception as e:
+                logger.warning(f"VA prefix lookup failed: {e}")
+        if not customer_id and name:
+            customer_id = find_chargebee_customer_id_via_csm(name)
+
+    if not customer_id and not sub:
+        return None
+    company = _cb_company_name(customer_id) if customer_id else ''
+    result = sub or _cb_subscriptions_for_customer_id(customer_id, company)
+    if result:
+        if company:
+            result['company'] = company
+            parsed['customer_name'] = company
+            parsed['customer_name_source'] = 'chargebee'
+        logger.info(f"VA lookup via Link/CSM: customer={customer_id} sub={result.get('subscription_id')}")
+    return result
+
+
 def _process_vertragsanpassung(say, client, channel: str, thread_ts: str,
                                 user_name: str, parsed: dict,
                                 subscription: dict | None = None,
@@ -1266,7 +1370,14 @@ def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name,
 
     step = state.get('step')
     if step == 'awaiting_clarification':
-        corrected_text = (text or '').strip()
+        corrected_text = normalize_slack_text(text or '').strip()
+        # Nur die anfragende Person beantwortet die Rückfrage, und nur mit einem Namen
+        # oder Link — sonst hat der Bot live jede Thread-Unterhaltung (auch zwischen
+        # CS-Admins) als Firmennamen in Chargebee gesucht.
+        if user_id != state.get('user_id'):
+            return True
+        if not extract_direct_references(corrected_text) and len(corrected_text.split()) > 8:
+            return True
         if not corrected_text:
             say(text="Für welchen Kunden soll die Sandbox eingerichtet werden?", thread_ts=thread_ts)
             return True
@@ -1405,7 +1516,9 @@ def _handle_message_core(event, say, client):
 
     _cleanup_expired_pending(client)
 
-    text = event.get('text', '') or ''
+    # Slack-Markup (<url|Label>, <@U…>, <!here>) einmal zentral in Klartext umwandeln —
+    # alle Parser (Links, Kundennamen, Daten) arbeiten danach auf sauberem Text.
+    text = normalize_slack_text(event.get('text', '') or '')
     channel = event.get('channel')
     ts = event.get('ts')
     thread_ts = event.get('thread_ts')
@@ -1608,15 +1721,8 @@ def _handle_message_core(event, say, client):
         # Auch ohne aktiven State reagieren (Bot-Neustart löscht State)
         ph_pending = _pending_planhat_link.get((channel, thread_ts))
         ph_url_match_direct = re.search(r'https?://(?:app|ws)\.planhat\.com/\S+', text)
-        if ph_url_match_direct and user_id in CS_ADMIN_USER_IDS and not ph_pending:
-            # Kein aktiver State — kurze Hinweis-Nachricht dass #planhat-upload neu getriggert werden soll
-            say(
-                text=(
-                    ":wave: Planhat-Link erkannt. Falls der Bot neugestartet wurde, "
-                    "bitte nochmal `#planhat-upload` schreiben — der Link wird dann direkt verwendet."
-                ),
-                thread_ts=thread_ts,
-            )
+        # Früher: Hinweis "Planhat-Link erkannt" auf jede Antwort mit Planhat-Link — hat live
+        # nie geholfen (kam meist nach einer bereits erledigten Antwort) und wurde entfernt.
         if ph_pending and user_id in CS_ADMIN_USER_IDS:
             ph_url_match = re.search(r'https?://(?:app|ws)\.planhat\.com/\S+', text)
             if ph_url_match:
@@ -1739,7 +1845,7 @@ def _handle_message_core(event, say, client):
                     changed = True
             # Try Chargebee lookup now if customer_name just became available
             if not va_state.get('subscription') and va_state['parsed'].get('customer_name'):
-                va_state['subscription'] = _cb_lookup(va_state['parsed']['customer_name'])
+                va_state['subscription'] = _va_lookup(va_state['parsed'], text)
                 if va_state['subscription']:
                     changed = True
             if not changed:
@@ -1918,16 +2024,18 @@ def _handle_message_core(event, say, client):
                 return
             # Alle Thread-Nachrichten lesen (Root + Replies) für maximalen Kontext
             root_text = ''
+            root_author = user_id
             thread_texts = []
             try:
                 result = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
                 messages = result.get('messages', [])
                 if messages:
-                    root_text = messages[0].get('text', '')
+                    root_text = normalize_slack_text(messages[0].get('text', ''))
+                    root_author = messages[0].get('user') or user_id
                     # Alle nicht-Bot-Replies sammeln (außer der aktuellen #vertragsanpassung)
                     for msg in messages[1:]:
                         if not msg.get('bot_id') and msg.get('text') and '#vertragsanpassung' not in msg.get('text', '').lower():
-                            thread_texts.append(msg.get('text', ''))
+                            thread_texts.append(normalize_slack_text(msg.get('text', '')))
                 logger.info(f"VA manual trigger: root + {len(thread_texts)} thread replies")
             except Exception as e:
                 logger.warning(f"conversations_replies failed in VA trigger: {e}")
@@ -1942,18 +2050,9 @@ def _handle_message_core(event, say, client):
                     if v and not parsed.get(k):
                         parsed[k] = v
                         logger.info(f"VA trigger: '{k}' aus Reply ergänzt: {v!r}")
-            if parsed.get('offer_fetch_failed'):
-                say(
-                    text=(
-                        ":warning: Der verlinkte Angebots-Link konnte nicht geöffnet werden "
-                        f"(`{parsed.get('offer_link', '?')}`).\n"
-                        "Bitte entweder:\n"
-                        "• Einen neuen/öffentlich zugänglichen Link hier posten, *oder*\n"
-                        "• Die Infos manuell ergänzen: *Plan*, *Laufzeit*, *Zahlweise*, *Vertragsbeginn*, *Service-Paket*"
-                    ),
-                    thread_ts=thread_ts,
-                )
-            subscription = _cb_lookup(parsed.get('customer_name', ''))
+            # Nicht lesbarer Angebots-Link: kein eigener Warn-Post mehr (führte zu Doppel-
+            # antworten), der Hinweis steht in der Infozeile zum Angebots-Link.
+            subscription = _va_lookup(parsed, '\n'.join([root_text or text] + thread_texts))
             parsed = _inherit_from_subscription(parsed, subscription)
             parsed, jira_tickets = _enrich_from_jira(parsed)
             if jira_tickets:
@@ -1967,8 +2066,10 @@ def _handle_message_core(event, say, client):
                     'subscription': subscription,
                     'created_at': time.time(),
                 }
+                # Ansprechen: wer die Anfrage gestellt hat (Root-Post), nicht die CS-Admin,
+                # die den Flow per #vertragsanpassung gestartet hat
                 say(
-                    blocks=ask_for_va_info_blocks(user_id, missing, parsed, subscription),
+                    blocks=ask_for_va_info_blocks(root_author, missing, parsed, subscription),
                     text="Vertragsanpassung — fehlende Informationen",
                     thread_ts=thread_ts,
                 )
@@ -2202,26 +2303,22 @@ def _handle_message_core(event, say, client):
     # --- Sandbox-Anfrage: auto-detection (Improvement- oder VA-Channel, z.B. #ask-cs-admin) ---
     # Vor dem Vertragsanpassungs-Check platziert, damit es nicht von überlappenden Keywords
     # geschluckt wird — detect_sandbox_request schließt VA-Treffer bereits selbst aus.
-    if (_in_improvement or _in_va) and detect_sandbox_request(text):
+    # Eigene Posts des CS-Admin-Teams (Notizen, Reminder, Ankündigungen) sind keine
+    # Anfragen — live hat der Bot z.B. auf Mirjams POC-Notiz einen VA-Flow gestartet.
+    # Das Team startet Flows bei Bedarf bewusst per #vertragsanpassung im Thread.
+    _auto_detect = user_id not in CS_ADMIN_USER_IDS
+
+    if _auto_detect and (_in_improvement or _in_va) and detect_sandbox_request(text):
         _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text)
         return
 
     # --- Vertragsanpassung: auto-detection (only in VA channel) ---
-    if _in_va and detect_vertragsanpassung(text):
+    if _auto_detect and _in_va and detect_vertragsanpassung(text):
         _set_eyes(client, channel, ts)
         parsed = _enrich_from_offer(parse_vertragsanpassung(text))
-        if parsed.get('offer_fetch_failed'):
-            say(
-                text=(
-                    ":warning: Der verlinkte Angebots-Link konnte nicht geöffnet werden "
-                    f"(`{parsed.get('offer_link', '?')}`).\n"
-                    "Bitte entweder:\n"
-                    "• Einen neuen/öffentlich zugänglichen Link hier posten, *oder*\n"
-                    "• Die Infos manuell ergänzen: *Plan*, *Laufzeit*, *Zahlweise*, *Vertragsbeginn*, *Service-Paket*"
-                ),
-                thread_ts=ts,
-            )
-        subscription = _cb_lookup(parsed.get('customer_name', ''))
+        # Nicht lesbarer Angebots-Link: kein eigener Warn-Post mehr (führte zu Doppel-
+        # antworten), der Hinweis steht in der Infozeile zum Angebots-Link.
+        subscription = _va_lookup(parsed, text)
         parsed = _inherit_from_subscription(parsed, subscription)
         # Jira-Tickets zum Kunden nach fehlenden Infos durchsuchen
         parsed, jira_tickets = _enrich_from_jira(parsed)
@@ -3050,6 +3147,10 @@ def handle_app_mention(event, say, client):
 
     if event.get('bot_id'):
         return
+    # Stummgeschaltete Threads und Bot-Befehle (#bot-stop, …) gehören dem Message-Handler —
+    # live wurde ein #bot-stop mit @-Erwähnung sonst als Chat-Frage beantwortet.
+    if (event.get('channel'), thread_ts) in _muted_threads or _BOT_COMMAND_RE.search(raw_text):
+        return
     # Improvement/VA → Message-Handler übernimmt
     if any(kw in text_lower for kw in ('#improvement', '#vertragsanpassung')):
         return
@@ -3343,6 +3444,12 @@ def _check_unanswered_questions(slack_client) -> None:
             continue
         ts = msg.get('ts', '')
         if not ts or not msg.get('user'):
+            continue
+        # Keine Reminder auf eigene CS-Admin-Posts (Notizen, geplante Reminder) und auf
+        # Ankündigungen an alle (@here/@channel) — beides sind keine offenen Anfragen.
+        if msg.get('user') in CS_ADMIN_USER_IDS:
+            continue
+        if re.search(r'<!(?:here|channel|everyone)', msg.get('text') or ''):
             continue
 
         # Skip if already marked done via ✅ reaction
