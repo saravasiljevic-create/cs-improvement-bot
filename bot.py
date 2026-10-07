@@ -61,6 +61,13 @@ from vertragsanpassung_handler import (
     parse_vertragsanpassung,
     _fetch_subscription_by_id,
 )
+from mirror_request import (
+    ACTION_CANCEL as MIRROR_ACTION_CANCEL,
+    ACTION_CREATE as MIRROR_ACTION_CREATE,
+    build_mirror_request_blocks,
+    detect_mirror_request,
+    resolve_mirror_request,
+)
 from sandbox_handler import (
     LOOM_SANDBOX_ANNUAL_URL,
     LOOM_SANDBOX_FREE_URL,
@@ -106,7 +113,7 @@ _CB_URL_RE = re.compile(
 # State (Sandbox, VA, ...) haben müssen — insbesondere #bot-stop/#bot-remove,
 # damit ein Mute-Befehl nicht von einer aktiven Flow-Rückfrage verschluckt wird.
 _BOT_COMMAND_RE = re.compile(
-    r'#bot-stop|#bot-remove|#vertragsanpassung|#improvement|#planhat-log|#planhat-upload',
+    r'#bot-stop|#bot-remove|#vertragsanpassung|#spiegelung|#improvement|#planhat-log|#planhat-upload',
     re.IGNORECASE,
 )
 
@@ -164,6 +171,11 @@ _BOT_STOP_REASONS = [
 
 # Threads where the bot has been silenced via #bot-stop
 _muted_threads: set[tuple[str, str]] = set()
+
+# Spiegelungs-Anfragen auf bestehende Sandbox, bei denen noch Werte fehlen:
+# (channel, root_ts) -> {'text': gesammelter Text, 'created_at': ts}. Nachgereichte Werte im
+# Thread werden an den Text angehängt und neu abgeglichen.
+_pending_mirror: dict[tuple[str, str], dict] = {}
 
 # (channel, thread_ts) -> Jira key of the ticket created for this thread
 _created_tickets: dict[tuple[str, str], str] = {}
@@ -1578,6 +1590,13 @@ def _handle_message_core(event, say, client):
         if _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name, text):
             return
 
+        # --- Spiegelungs-Anfrage: nachgereichte URL/Serial im Thread ---
+        _pm = _pending_mirror.get((channel, thread_ts))
+        if _pm and time.time() - _pm['created_at'] < 3 * 86400 and re.search(r'xentral\.|[0-9a-f]{8}-[0-9a-f]{4}-', text, re.IGNORECASE):
+            _pm['text'] += '\n' + text
+            _post_mirror_request(say, client, channel, thread_ts, _pm['text'])
+            return
+
         # --- ? Hilfe-Trigger: ein oder mehrere Fragezeichen → Bot erklärt was zu tun ist ---
         if re.fullmatch(r'\?+', text.strip()):
             va_state_check = _pending_vertragsanpassung.get((channel, thread_ts))
@@ -1655,6 +1674,7 @@ def _handle_message_core(event, say, client):
                     text=(
                         ":wave: Kein aktiver Bot-Flow in diesem Thread.\n"
                         "• Für Vertragsanpassungen: `#vertragsanpassung` hier posten (nur CS Admin)\n"
+                        "• Für eine Spiegelung auf bestehende Sandbox: `#spiegelung` hier posten (nur CS Admin)\n"
                         "• Für Feature-Anfragen: `#improvement` in einer neuen Nachricht schreiben"
                     ),
                     thread_ts=thread_ts,
@@ -2075,6 +2095,24 @@ def _handle_message_core(event, say, client):
                 say(text=f":warning: Planhat-Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
             return
 
+        # --- Spiegelung auf bestehende Sandbox: manueller Thread-Trigger (CS Admin only) ---
+        # Für Anfragen, die die Auto-Erkennung verpasst hat oder die vor dem Deploy kamen.
+        if '#spiegelung' in text.lower():
+            if user_id not in CS_ADMIN_USER_IDS:
+                say(text=":no_entry: `#spiegelung` kann nur vom CS Admin Team genutzt werden.",
+                    thread_ts=thread_ts)
+                return
+            texts = []
+            try:
+                msgs = client.conversations_replies(channel=channel, ts=thread_ts, limit=50).get('messages', [])
+                texts = [normalize_slack_text(m.get('text', '')) for m in msgs
+                         if not m.get('bot_id') and m.get('text') and '#spiegelung' not in m.get('text', '').lower()]
+            except Exception as e:
+                logger.warning(f"conversations_replies failed in #spiegelung trigger: {e}")
+            _set_eyes(client, channel, thread_ts)
+            _post_mirror_request(say, client, channel, thread_ts, '\n'.join(texts) or text)
+            return
+
         # --- Vertragsanpassung: manual thread trigger (CS Admin only) ---
         if '#vertragsanpassung' in text.lower():
             if user_id not in CS_ADMIN_USER_IDS:
@@ -2382,6 +2420,13 @@ def _handle_message_core(event, say, client):
             logger.info("STATUS_ANSWER " + _json.dumps({'channel': channel, 'ts': ts, 'user': user_name,
                                                         'invoices': extract_invoice_ids(text)}))
             return
+
+    # --- Spiegelung auf bestehende Sandbox: Werte abgleichen, CCS-Ticket per Button ---
+    # Vor dem Sandbox-Neuanlage-Flow, weil beide auf "Sandbox" + "Spiegelung" reagieren.
+    if _auto_detect and (_in_improvement or _in_va) and detect_mirror_request(text):
+        _set_eyes(client, channel, ts)
+        _post_mirror_request(say, client, channel, ts, text)
+        return
 
     if _auto_detect and (_in_improvement or _in_va) and detect_sandbox_request(text):
         _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text)
@@ -2802,6 +2847,85 @@ def handle_botstop_reason(ack, body, client):
         )
     except Exception as e:
         logger.warning(f"botstop reason update failed: {e}")
+
+
+def _post_mirror_request(say, client, channel: str, root_ts: str, text: str):
+    """Gleicht die Spiegelungs-Anfrage mit dem Instance Manager ab und postet Zusammenfassung + Buttons."""
+    try:
+        res = resolve_mirror_request(text)
+    except Exception as e:
+        logger.warning(f"resolve_mirror_request failed: {e}")
+        return
+    say(blocks=build_mirror_request_blocks(res, channel, root_ts),
+        text="Spiegelung auf bestehende Sandbox erkannt", thread_ts=root_ts)
+    if res['vollstaendig']:
+        _pending_mirror.pop((channel, root_ts), None)
+    else:
+        _pending_mirror[(channel, root_ts)] = {'text': text, 'created_at': time.time()}
+    logger.info("MIRROR_REQUEST " + _json.dumps({'channel': channel, 'ts': root_ts,
+                'customer': res['customer_name'], 'complete': res['vollstaendig'],
+                'conflicts': len(res['konflikte'])}, ensure_ascii=False))
+
+
+def _mirror_button_payload(body) -> tuple[dict, str, str]:
+    action = (body.get('actions') or [{}])[0]
+    try:
+        data = _json.loads(action.get('value') or '{}')
+    except ValueError:
+        data = {}
+    channel = (body.get('channel') or {}).get('id') or data.get('c', '')
+    msg_ts = (body.get('message') or {}).get('ts', '')
+    return data, channel, msg_ts
+
+
+def _mirror_finish_message(client, channel, msg_ts, text):
+    try:
+        client.chat_update(channel=channel, ts=msg_ts, text=text,
+                           blocks=[{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}])
+    except Exception as e:
+        logger.warning(f"mirror message update failed: {e}")
+
+
+@app.action(MIRROR_ACTION_CREATE)
+def handle_mirror_request_create(ack, body, client):
+    ack()
+    user_id = (body.get('user') or {}).get('id', '')
+    data, channel, msg_ts = _mirror_button_payload(body)
+    if user_id not in CS_ADMIN_USER_IDS:
+        try:
+            client.chat_postEphemeral(channel=channel, user=user_id, thread_ts=data.get('t'),
+                                      text="Das CCS-Ticket legt das CS-Admin-Team an, wir sind informiert. :slightly_smiling_face:")
+        except Exception:
+            pass
+        return
+    if not all(data.get(k) for k in ('n', 'prod_url', 'prod_serial', 'sandbox_url', 'sandbox_serial')):
+        _mirror_finish_message(client, channel, msg_ts, ":warning: Daten unvollständig, bitte neu anstoßen.")
+        return
+    ticket = create_sandbox_mirroring_ticket(data['n'], data['prod_url'], data['prod_serial'],
+                                             data['sandbox_url'], data['sandbox_serial'])
+    who = f"<@{user_id}>"
+    if ticket:
+        _mirror_finish_message(client, channel, msg_ts,
+            f":white_check_mark: CCS-Ticket <{ticket['url']}|{ticket['key']}> angelegt (von {who}) · {data['n']}\n"
+            f"Prod: {data['prod_url']} · {data['prod_serial']}\n"
+            f"Sandbox: {data['sandbox_url']} · {data['sandbox_serial']}")
+        if data.get('t'):
+            _set_done(client, channel, data['t'])
+        logger.info("MIRROR_TICKET " + _json.dumps({'channel': channel, 'ts': data.get('t'),
+                    'key': ticket['key'], 'by': user_id}))
+    else:
+        _mirror_finish_message(client, channel, msg_ts,
+            ":warning: Das CCS-Ticket konnte nicht angelegt werden. Bitte manuell im CCS-Projekt anlegen.")
+
+
+@app.action(MIRROR_ACTION_CANCEL)
+def handle_mirror_request_cancel(ack, body, client):
+    ack()
+    user_id = (body.get('user') or {}).get('id', '')
+    data, channel, msg_ts = _mirror_button_payload(body)
+    if user_id not in CS_ADMIN_USER_IDS:
+        return
+    _mirror_finish_message(client, channel, msg_ts, f":no_entry_sign: Kein CCS-Ticket angelegt (<@{user_id}>).")
 
 
 @app.action("planhat_link_skip")
@@ -3575,13 +3699,14 @@ def _check_unanswered_questions(slack_client) -> None:
         if msg.get('reply_count', 0) > 0:
             try:
                 replies = slack_client.conversations_replies(
-                    channel=_ASK_CS_ADMIN_CHANNEL, ts=ts, limit=30,
+                    channel=_ASK_CS_ADMIN_CHANNEL, ts=ts, limit=30, include_all_metadata=True,
                 )
                 for reply in replies.get('messages', [])[1:]:
                     if reply.get('user') in CS_ADMIN_USER_IDS:
                         has_admin_reply = True
                         break
-                    if _REMINDER_MARKER in (reply.get('text') or ''):
+                    if (_REMINDER_MARKER in (reply.get('text') or '')
+                            or (reply.get('metadata') or {}).get('event_type') == _REMINDER_MARKER.replace('-', '_')):
                         already_reminded = True
                         break
             except Exception as e:
@@ -3597,9 +3722,10 @@ def _check_unanswered_questions(slack_client) -> None:
                 channel=_ASK_CS_ADMIN_CHANNEL,
                 thread_ts=ts,
                 text=(
-                    f":wave: {mentions} — diese Anfrage ist noch offen und wurde bisher nicht beantwortet. "
-                    f"<!-- {_REMINDER_MARKER} -->"
+                    f":wave: {mentions} — diese Anfrage ist noch offen und wurde bisher nicht beantwortet."
                 ),
+                # Unsichtbare Markierung (früher als <!-- … --> im Text, das zeigte Slack sichtbar an)
+                metadata={'event_type': _REMINDER_MARKER.replace('-', '_'), 'event_payload': {'ts': ts}},
             )
             logger.info(f"Unanswered reminder posted for {ts}")
         except Exception as e:
