@@ -1319,6 +1319,7 @@ def _finish_sandbox_lookup(say, channel, ts, user_id, user_name, customer_name, 
         )
     _pending_sandbox[(channel, ts)] = {
         'step': 'awaiting_fit_confirmation',
+        'channel': channel,
         'user_id': user_id,
         'user_name': user_name,
         'customer_name': customer_name,
@@ -2906,7 +2907,8 @@ def handle_mirror_request_create(ack, body, client):
         _mirror_finish_message(client, channel, msg_ts, ":warning: Daten unvollständig, bitte neu anstoßen.")
         return
     ticket = create_sandbox_mirroring_ticket(data['n'], data['prod_url'], data['prod_serial'],
-                                             data['sandbox_url'], data['sandbox_serial'])
+                                             data['sandbox_url'], data['sandbox_serial'],
+                                             slack_link=_slack_permalink(client, channel, data.get('t')))
     who = f"<@{user_id}>"
     if ticket:
         _mirror_finish_message(client, channel, msg_ts,
@@ -3027,15 +3029,38 @@ def handle_va_select_plan(ack, body, say, client):
                                     state['user_name'], state['parsed'], state.get('subscription'))
 
 
+def _slack_permalink(client, channel: str | None, ts: str | None) -> str | None:
+    if not (channel and ts):
+        return None
+    try:
+        resp = client.chat_getPermalink(channel=channel, message_ts=ts)
+        return resp.get('permalink') if resp.get('ok') else None
+    except Exception as e:
+        logger.warning(f"chat_getPermalink failed for {channel}/{ts}: {e}")
+        return None
+
+
 def _create_mirroring_ticket_and_report(say, thread_ts, state, info: dict, from_instance_manager: bool = False):
     """Legt das CCS-Spiegelungs-Ticket an und meldet das Ergebnis im Thread."""
+    # Link für das Jira-Ticket: DM-Threads sind für andere nicht sichtbar, daher bevorzugt
+    # der Rechnungs-Post in #ask-cs-admin (verlinkt selbst auf den Ursprung), sonst der Ursprungs-Thread.
+    ref = state.get('billing_ref') or {}
+    slack_link = (_slack_permalink(app.client, ref.get('channel'), ref.get('ts'))
+                  or _slack_permalink(app.client, state.get('channel'), thread_ts))
     ticket = create_sandbox_mirroring_ticket(
         state.get('customer_name', ''),
         info['prod_url'],
         info['prod_serial'],
         info['sandbox_url'],
         info['sandbox_serial'],
+        slack_link=slack_link,
     )
+    if ticket and state.get('billing_ref'):
+        # Abschluss-Check (siehe _check_mirror_tickets) meldet sich im Rechnungs-Post-Thread
+        ref = state['billing_ref']
+        set_issue_property(ticket['key'], MIRROR_PROPERTY,
+                           {'mode': 'billing', 'channel': ref['channel'], 'ts': ref['ts'],
+                            'customer': state.get('customer_name', ''), 'done': False})
     if ticket:
         source = ""
         if from_instance_manager:
@@ -3098,11 +3123,13 @@ def _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope: str)
     requester_name = state.get('user_name', '')
 
     if channel == _ASK_CS_ADMIN_CHANNEL:
-        say(
+        resp = say(
             blocks=build_sandbox_admin_billing_blocks(customer_name, scope, requester_name),
             text="Sandbox-Rechnungsstellung nötig",
             thread_ts=thread_ts,
         )
+        if resp and resp.get('ts'):
+            state['billing_ref'] = {'channel': channel, 'ts': resp['ts']}
         return
 
     origin_permalink = None
@@ -3114,11 +3141,13 @@ def _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope: str)
         logger.warning(f"chat_getPermalink failed for {channel}/{thread_ts}: {e}")
 
     try:
-        client.chat_postMessage(
+        resp = client.chat_postMessage(
             channel=_ASK_CS_ADMIN_CHANNEL,
             blocks=build_sandbox_admin_billing_blocks(customer_name, scope, requester_name, origin_permalink),
             text="Sandbox-Rechnungsstellung nötig",
         )
+        if resp and resp.get('ts'):
+            state['billing_ref'] = {'channel': _ASK_CS_ADMIN_CHANNEL, 'ts': resp['ts']}
     except Exception as e:
         logger.warning(f"Cross-post to #ask-cs-admin failed: {e}")
 
@@ -3240,23 +3269,113 @@ def handle_sandbox_fit_correction(ack, body, say, client):
     _handle_sandbox_fit_button(ack, body, say, client, False)
 
 
+_BILLING_TAKEN = 'sandbox_billing_taken'
+_BILLING_READY = 'sandbox_billing_ready'
+_BILLING_DONE = 'sandbox_billing_done'
+
+
+def _billing_done_button(channel: str, post_ts: str) -> dict:
+    return {'type': 'actions', 'elements': [{
+        'type': 'button', 'style': 'primary', 'action_id': 'sandbox_billing_done',
+        'text': {'type': 'plain_text', 'text': '🧾 Rechnung gestellt'},
+        'value': _json.dumps({'c': channel, 't': post_ts})}]}
+
+
 @app.action("sandbox_admin_take_billing")
 def handle_sandbox_admin_take_billing(ack, body, say, client):
     """Button: CS Admin übernimmt die Rechnungsstellung für eine Sandbox/Spiegelung.
-    Rein informativ (wie va_take_over) — keine automatische Chargebee-Aktion.
-    Markiert die Benachrichtigung selbst zusätzlich mit ✅, damit im Channel auch
-    ohne Thread zu öffnen sichtbar ist, dass sie schon übernommen wurde."""
+    Keine automatische Chargebee-Aktion. Statuskette auf dem Rechnungs-Post:
+    :status_in_progress: (übernommen) → ✅ erst nach Klick auf „Rechnung gestellt“.
+    Mit Spiegelung erscheint der Button erst, wenn das CCS-Ticket abgeschlossen ist
+    (siehe _check_mirror_tickets); ohne Spiegelung (nur neue Sandbox) sofort."""
     ack()
     user_id = body.get('user', {}).get('id', '')
     if user_id not in CS_ADMIN_USER_IDS:
         return
     channel = body.get('channel', {}).get('id', '')
-    own_ts = body.get('message', {}).get('ts')
-    thread_ts = body.get('message', {}).get('thread_ts') or own_ts
-    user_name = get_user_name(client, user_id)
+    msg = body.get('message', {}) or {}
+    own_ts = msg.get('ts')
+    thread_ts = msg.get('thread_ts') or own_ts
+    raw = ((body.get('actions') or [{}])[0].get('value') or '')
+    try:
+        scope = (_json.loads(raw) or {}).get('scope', '')
+    except ValueError:
+        scope = ''  # alte Posts: Wert war nur der Kundenname
     if own_ts:
-        _add_reaction(client, channel, own_ts, 'white_check_mark')
-    say(text=f":white_check_mark: Rechnungsstellung von {user_name} übernommen.", thread_ts=thread_ts)
+        _add_reaction(client, channel, own_ts, 'status_in_progress')
+        # Button entfernen, damit nicht doppelt übernommen wird
+        try:
+            client.chat_update(channel=channel, ts=own_ts, text=msg.get('text', ''),
+                               blocks=[b for b in (msg.get('blocks') or []) if b.get('type') != 'actions'])
+        except Exception as e:
+            logger.warning(f"billing post update failed: {e}")
+    meta = {'event_type': _BILLING_TAKEN, 'event_payload': {'user': user_id}}
+    ready_now = (scope == 'new_only' or not scope
+                 or bool(_billing_thread_state(client, channel, thread_ts)['ready_ts']))
+    try:
+        if ready_now:
+            line = (f":status_in_progress: Rechnungsstellung von <@{user_id}> übernommen. "
+                    f"Bitte nach dem Stellen der Rechnung bestätigen:")
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=line, metadata=meta,
+                                    blocks=[{'type': 'section', 'text': {'type': 'mrkdwn', 'text': line}},
+                                            _billing_done_button(channel, own_ts or thread_ts)])
+        else:
+            client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, metadata=meta,
+                text=(f":status_in_progress: Rechnungsstellung von <@{user_id}> übernommen. Sobald die "
+                      f"Spiegelung im CCS-Ticket abgeschlossen ist, melde ich mich hier mit dem Button "
+                      f"„Rechnung gestellt“."))
+    except Exception as e:
+        logger.warning(f"billing take-over reply failed: {e}")
+    logger.info("BILLING_TAKEN " + _json.dumps({'channel': channel, 'ts': own_ts, 'user': user_id, 'scope': scope}))
+
+
+@app.action("sandbox_billing_done")
+def handle_sandbox_billing_done(ack, body, client):
+    ack()
+    user_id = body.get('user', {}).get('id', '')
+    if user_id not in CS_ADMIN_USER_IDS:
+        return
+    try:
+        data = _json.loads(((body.get('actions') or [{}])[0].get('value') or '{}'))
+    except ValueError:
+        data = {}
+    channel = data.get('c') or body.get('channel', {}).get('id', '')
+    post_ts = data.get('t')
+    msg_ts = (body.get('message') or {}).get('ts')
+    text = f":white_check_mark: Rechnung gestellt (bestätigt von <@{user_id}>)."
+    try:
+        client.chat_update(channel=channel, ts=msg_ts, text=text,
+                           blocks=[{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}}],
+                           metadata={'event_type': _BILLING_DONE, 'event_payload': {'user': user_id}})
+    except Exception as e:
+        logger.warning(f"billing done update failed: {e}")
+    if post_ts:
+        _remove_reaction(client, channel, post_ts, 'status_in_progress')
+        _add_reaction(client, channel, post_ts, 'white_check_mark')
+    logger.info("BILLING_DONE " + _json.dumps({'channel': channel, 'ts': post_ts, 'user': user_id}))
+
+
+def _billing_thread_state(slack_client, channel: str, post_ts: str) -> dict:
+    """Liest aus dem Thread des Rechnungs-Posts (Message-Metadata): wer übernommen hat,
+    ob der Button „Rechnung gestellt“ schon erschienen ist und ob er geklickt wurde."""
+    st = {'taken_by': None, 'ready_ts': None, 'done': False}
+    try:
+        msgs = slack_client.conversations_replies(channel=channel, ts=post_ts, limit=100,
+                                                  include_all_metadata=True).get('messages', [])
+    except Exception as e:
+        logger.warning(f"billing thread read failed {post_ts}: {e}")
+        return st
+    for m in msgs:
+        md = m.get('metadata') or {}
+        et = md.get('event_type')
+        if et == _BILLING_TAKEN:
+            st['taken_by'] = (md.get('event_payload') or {}).get('user')
+        elif et == _BILLING_READY:
+            st['ready_ts'] = m.get('ts')
+        elif et == _BILLING_DONE:
+            st['done'] = True
+    return st
 
 
 @app.action("sandbox_customer_replied")
@@ -3772,6 +3891,30 @@ def _check_mirror_tickets(slack_client) -> None:
         url = f"{JIRA_SERVER_URL.rstrip('/')}/browse/{t['key']}"
         detail = (f"„{hit['body'].strip().splitlines()[0][:120]}“ ({hit['author']})" if hit
                   else f"Status: {t['status']}")
+        if prop.get('mode') == 'billing':
+            st = _billing_thread_state(slack_client, channel, ts)
+            if st['done']:
+                prop['done'] = True
+                set_issue_property(t['key'], MIRROR_PROPERTY, prop)
+                continue
+            who = f"<@{st['taken_by']}>" if st['taken_by'] else ' '.join(
+                f'<@{u}>' for u in sorted(_REMINDER_TAG_IDS))
+            line = (f":white_check_mark: {who} die Spiegelung für {prop.get('customer') or 'den Kunden'} "
+                    f"ist abgeschlossen: <{url}|{t['key']}> {detail}. Bitte jetzt die Rechnung stellen "
+                    f"und hier bestätigen:")
+            try:
+                slack_client.chat_postMessage(
+                    channel=channel, thread_ts=ts, text=line,
+                    blocks=[{'type': 'section', 'text': {'type': 'mrkdwn', 'text': line}},
+                            _billing_done_button(channel, ts)],
+                    metadata={'event_type': _BILLING_READY, 'event_payload': {'key': t['key']}})
+            except Exception as e:
+                logger.warning(f"billing ready post failed for {t['key']}: {e}")
+                continue
+            prop['done'] = True
+            set_issue_property(t['key'], MIRROR_PROPERTY, prop)
+            logger.info("BILLING_READY " + _json.dumps({'key': t['key'], 'channel': channel, 'ts': ts}))
+            continue
         who = f"<@{prop['notify']}> " if prop.get('notify') else ''
         try:
             slack_client.chat_postMessage(
@@ -3788,6 +3931,37 @@ def _check_mirror_tickets(slack_client) -> None:
         prop['done'] = True
         set_issue_property(t['key'], MIRROR_PROPERTY, prop)
         logger.info("MIRROR_DONE " + _json.dumps({'key': t['key'], 'channel': channel, 'ts': ts}))
+
+
+def _remind_open_billing(slack_client) -> None:
+    """Werktags 8 Uhr: Rechnungs-Posts der letzten 30 Tage, die übernommen (:status_in_progress:)
+    und abrechenbar sind (ohne Spiegelung sofort, mit Spiegelung nach „abgeschlossen“), aber noch
+    ohne „Rechnung gestellt“ — die übernehmende Person einmal täglich im Thread erinnern."""
+    oldest = (datetime.now(tz=_BERLIN_TZ) - timedelta(days=30)).timestamp()
+    try:
+        hist = slack_client.conversations_history(channel=_ASK_CS_ADMIN_CHANNEL, oldest=str(oldest), limit=200)
+    except Exception as e:
+        logger.warning(f"billing reminder history failed: {e}")
+        return
+    for m in hist.get('messages', []):
+        if 'Sandbox-Rechnungsstellung nötig' not in (m.get('text') or ''):
+            continue
+        reactions = {r.get('name') for r in m.get('reactions', [])}
+        if 'status_in_progress' not in reactions or reactions & {'white_check_mark', 'heavy_check_mark'}:
+            continue
+        st = _billing_thread_state(slack_client, _ASK_CS_ADMIN_CHANNEL, m['ts'])
+        if st['done'] or not st['taken_by']:
+            continue
+        no_mirror = 'Nur neue Sandbox anlegen' in (m.get('text') or '')
+        if not (no_mirror or st['ready_ts']):
+            continue  # Spiegelung läuft noch, Rechnung erst danach
+        try:
+            slack_client.chat_postMessage(
+                channel=_ASK_CS_ADMIN_CHANNEL, thread_ts=m['ts'],
+                text=(f":receipt: <@{st['taken_by']}> Erinnerung: Für diese Sandbox ist die Rechnung noch "
+                      f"nicht als gestellt bestätigt. Bitte stellen und oben auf „Rechnung gestellt“ klicken."))
+        except Exception as e:
+            logger.warning(f"billing reminder post failed: {e}")
 
 
 def _mirror_check_loop() -> None:
@@ -3813,6 +3987,7 @@ def _daily_reminder_loop() -> None:
             if is_weekday and is_8am and last_run_date != today:
                 last_run_date = today
                 _check_unanswered_questions(app.client)
+                _remind_open_billing(app.client)
         except Exception as e:
             logger.warning(f"Daily reminder loop error: {e}")
         time.sleep(60)
