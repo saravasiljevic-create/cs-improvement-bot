@@ -268,7 +268,10 @@ _NAME_AFTER_RE = re.compile(
 _NAME_STOP = re.compile(
     r'^(?:noch|aktuell|gerade|schon|bitte|eigentlich|mal|denn|jetzt|heute|ist|sind|hat|haben|gibt|'
     r'wurde|werden|wird|kann|k[öo]nnt|offen\w*|bezahlt|f[äa]llig\w*|eingegangen|aktiv|gek[üu]ndigt|'
-    r'im|in|an|auf|mit|seit|bis|und|oder)$', re.IGNORECASE)
+    r'im|in|an|auf|mit|seit|bis|und|oder|umstellen|umgestellt|anlegen|einrichten|[äa]ndern|anpassen|k[üu]ndigen|'
+    r'stornieren|freischalten|wechseln|hinterlegen|pr[üu]fen|erstellen|buchen|upgraden|downgraden|'
+    r'gutschreiben|aktivieren|deaktivieren|schicken|senden|verl[äa]ngern|zur[üu]cksetzen|l[öo]schen)$', re.IGNORECASE)
+_LEGAL_END = re.compile(r'^(?:GmbH|AG|KG|UG|SE|Ltd\.?|LLC|Inc\.?|GbR|OHG)$')
 _NAME_SKIP_FIRST = re.compile(r'^(?:kunde[n]?|kundin|firma|dem|den|die|das|der|des|einem|einer)$', re.IGNORECASE)
 
 
@@ -280,14 +283,18 @@ def _guess_name(text: str) -> str | None:
     t = re.sub(r'<@[A-Z0-9]+>|@\S+\s+(?:Admin\s+)?Bot\b', ' ', t)
     cands = []
     for m in _NAME_AFTER_RE.finditer(t):
-        rest = re.split(r'[?!.,;:\n]', t[m.end():], maxsplit=1)[0]
+        rest = re.split(r'[?!,;:\n]|(?<!Co)(?<!\bmbH)\.(?=\s|$)', t[m.end():], maxsplit=1)[0]
         words = []
-        for w in rest.split():
+        toks = rest.split()
+        for i, w in enumerate(toks):
             if not words and _NAME_SKIP_FIRST.match(w):
                 continue
             if _NAME_STOP.match(w) or (words and _STATUS_WORDS_RE.fullmatch(w)) or len(words) >= 6:
                 break
             words.append(w)
+            nxt = toks[i + 1] if i + 1 < len(toks) else ''
+            if _LEGAL_END.match(w) and nxt != '&':
+                break
         if words and not _STATUS_WORDS_RE.fullmatch(words[0]):
             cands.append(' '.join(words))
     if not cands:

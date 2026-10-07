@@ -2960,11 +2960,41 @@ _MENU_ITEMS = [
 ]
 
 
-def _menu_blocks(user_id: str, channel: str, thread_ts: str) -> list[dict]:
-    value = _json.dumps({'c': channel, 't': thread_ts})
+_LINK_RE = re.compile(r'https?://[^\s|>]*(?:chargebee\.com/d/(?:customers|subscriptions|invoices)|planhat\.com)[^\s|>]*')
+
+
+def _thread_context(client, channel: str, thread_ts: str, skip_ts: str | None = None) -> dict:
+    """Liest den Thread vor dem Menü: Texte (ohne Bot-Posts und @Bot-Aufrufe), Chargebee-/Planhat-Links
+    und den Kundennamen (erst Rechtsform-Treffer, dann Namen aus Fragen, Root-Nachricht zuerst)."""
+    from text_utils import extract_company_name
+    from status_handler import question_customer_name
+    out = {'texts': [], 'links': [], 'name': ''}
+    try:
+        msgs = client.conversations_replies(channel=channel, ts=thread_ts, limit=50).get('messages', [])
+    except Exception as e:
+        logger.warning(f"thread context read failed: {e}")
+        return out
+    for m in msgs:
+        if m.get('bot_id') or m.get('ts') == skip_ts:
+            continue
+        raw = m.get('text') or ''
+        txt = normalize_slack_text(raw)
+        if re.fullmatch(r'\s*(?:<@[A-Z0-9]+>\s*)+\S{0,3}\s*', raw):
+            continue  # nur „@CS Admin Bot“
+        out['texts'].append(txt)
+        out['links'] += [l for l in _LINK_RE.findall(raw) if l not in out['links']]
+    legal = re.compile(r'\b(?:GmbH|AG|KG|UG|SE|Ltd\.?|LLC|Inc\.?|GbR|OHG|e\.\s?K\.?)$')
+    cands = [n for t in out['texts'] for n in (extract_company_name(t), question_customer_name(t)) if n]
+    out['name'] = next((n for n in cands if legal.search(n)), cands[0] if cands else '')
+    return out
+
+
+def _menu_blocks(user_id: str, channel: str, thread_ts: str, customer: str = '') -> list[dict]:
+    value = _json.dumps({'c': channel, 't': thread_ts, 'n': customer[:80]})
+    hint = f"\nIch beziehe mich auf *{customer}* und die Nachrichten in diesem Thread." if customer else ''
     return [
         {'type': 'section', 'text': {'type': 'mrkdwn',
-         'text': f"Hey <@{user_id}>! Wobei kann ich helfen?"}},
+         'text': f"Hey <@{user_id}>! Wobei kann ich helfen?{hint}"}},
         {'type': 'actions', 'block_id': 'bot_menu', 'elements': [
             {'type': 'button', 'action_id': f'menu_{k}', 'value': value,
              'text': {'type': 'plain_text', 'text': label, 'emoji': True}}
@@ -3018,6 +3048,27 @@ def handle_menu_button(ack, body, client, say):
         return
     title, inputs = _MENU_MODALS[kind]
     ctx['u'] = (body.get('user') or {}).get('id', '')
+    menu_ts = (body.get('message') or {}).get('ts')
+    tc = _thread_context(client, ctx.get('c'), ctx.get('t')) if ctx.get('c') and ctx.get('t') != menu_ts else \
+        {'texts': [], 'links': [], 'name': ''}
+    name = ctx.get('n') or tc['name']
+    # Lookup/Rechnungen: Kunde aus dem Thread bekannt → direkt antworten, ohne Formular
+    if kind in ('lookup', 'invoices') and (name or tc['links']):
+        q = (f"für {name}? " if name else '') + ' '.join(tc['links'])
+        reply = (build_status_reply(f"Stand {q}", _va_lookup) if kind == 'lookup'
+                 else open_invoices_reply(f"Offene Rechnungen {q}", _va_lookup))
+        if reply:
+            say(text=reply, thread_ts=ctx.get('t'))
+            logger.info("MENU " + _json.dumps({'kind': kind, 'channel': ctx.get('c'), 'via': 'thread', 'name': name}))
+            return
+    # Sonst Formular, vorbefüllt mit Kunde bzw. Thread-Inhalt
+    prefill = {}
+    if kind in ('lookup', 'invoices') and name:
+        prefill['text'] = name
+    elif kind in ('va', 'sandbox', 'improvement') and tc['texts']:
+        prefill['text'] = '\n'.join(tc['texts'] + tc['links'])[:2900]
+    inputs = [dict(b, element=dict(b['element'], initial_value=prefill[b['block_id']]))
+              if prefill.get(b['block_id']) else b for b in inputs]
     try:
         client.views_open(trigger_id=body['trigger_id'], view={
             'type': 'modal', 'callback_id': f'menu_submit_{kind}', 'private_metadata': _json.dumps(ctx),
@@ -3774,8 +3825,11 @@ def handle_app_mention(event, say, client):
 
     # Einfacher Gruß oder bloße Erwähnung → Menü mit Buttons
     if _is_simple_greeting:
+        _ctx_name = ''
+        if event.get('thread_ts'):
+            _ctx_name = _thread_context(client, event.get('channel', ''), thread_ts, event.get('ts'))['name']
         say(
-            blocks=_menu_blocks(user_id, event.get('channel', ''), thread_ts),
+            blocks=_menu_blocks(user_id, event.get('channel', ''), thread_ts, _ctx_name),
             text=f"Hey {user_name}! Wobei kann ich helfen?",
             thread_ts=thread_ts,
         )
