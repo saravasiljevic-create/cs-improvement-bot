@@ -1500,6 +1500,36 @@ def _looks_like_va_order(text: str) -> bool:
     return questions == 0 or bool(re.search(r'(?:^|\n|[.!:])\s*(?:hi\w*\s+\w+,?\s*)?bitte\b', text, re.IGNORECASE))
 
 
+def _start_va_flow(say, client, channel, ts, user_id, user_name, text, files=None):
+    """Vertragsanpassung aus einem Text starten (Auto-Erkennung oder Menü-Button)."""
+    _set_eyes(client, channel, ts)
+    parsed = _enrich_from_offer(parse_vertragsanpassung(text))
+    # Nicht lesbarer Angebots-Link: kein eigener Warn-Post mehr (führte zu Doppel-
+    # antworten), der Hinweis steht in der Infozeile zum Angebots-Link.
+    subscription = _va_lookup(parsed, text)
+    parsed = _inherit_from_subscription(parsed, subscription)
+    # Jira-Tickets zum Kunden nach fehlenden Infos durchsuchen
+    parsed, jira_tickets = _enrich_from_jira(parsed)
+    if jira_tickets:
+        parsed['_jira_sources'] = jira_tickets
+    missing = missing_va_fields(parsed)
+    if missing:
+        _pending_vertragsanpassung[(channel, ts)] = {
+            'parsed': parsed,
+            'user_id': user_id,
+            'user_name': user_name,
+            'subscription': subscription,
+            'created_at': time.time(),
+        }
+        say(
+            blocks=ask_for_va_info_blocks(user_id, missing, parsed, subscription),
+            text="Vertragsanpassung erkannt — fehlende Informationen",
+            thread_ts=ts,
+        )
+    else:
+        _process_vertragsanpassung(say, client, channel, ts, user_name, parsed, subscription, files=files)
+
+
 def _handle_message_core(event, say, client):
     """Core message processing logic, shared by the generic and file_share handlers."""
     subtype = event.get('subtype')
@@ -2437,34 +2467,8 @@ def _handle_message_core(event, say, client):
 
     # --- Vertragsanpassung: auto-detection (only in VA channel) ---
     if _auto_detect and _in_va and detect_vertragsanpassung(text) and _looks_like_va_order(text):
-        _set_eyes(client, channel, ts)
-        parsed = _enrich_from_offer(parse_vertragsanpassung(text))
-        # Nicht lesbarer Angebots-Link: kein eigener Warn-Post mehr (führte zu Doppel-
-        # antworten), der Hinweis steht in der Infozeile zum Angebots-Link.
-        subscription = _va_lookup(parsed, text)
-        parsed = _inherit_from_subscription(parsed, subscription)
-        # Jira-Tickets zum Kunden nach fehlenden Infos durchsuchen
-        parsed, jira_tickets = _enrich_from_jira(parsed)
-        if jira_tickets:
-            parsed['_jira_sources'] = jira_tickets
-        missing = missing_va_fields(parsed)
-        if missing:
-            _pending_vertragsanpassung[(channel, ts)] = {
-                'parsed': parsed,
-                'user_id': user_id,
-                'user_name': user_name,
-                'subscription': subscription,
-                'created_at': time.time(),
-            }
-            say(
-                blocks=ask_for_va_info_blocks(user_id, missing, parsed, subscription),
-                text="Vertragsanpassung erkannt — fehlende Informationen",
-                thread_ts=ts,
-            )
-        else:
-            event_files = extract_files(event.get('files')) or None
-            _process_vertragsanpassung(say, client, channel, ts, user_name, parsed, subscription,
-                                       files=event_files)
+        _start_va_flow(say, client, channel, ts, user_id, user_name, text,
+                       files=extract_files(event.get('files')) or None)
         return
 
     # --- Improvement: only react to #improvement tag ---
@@ -2940,6 +2944,140 @@ def handle_mirror_request_cancel(ack, body, client):
     _mirror_finish_message(client, channel, msg_ts, f":no_entry_sign: Kein CCS-Ticket angelegt (<@{user_id}>).")
     if data.get('t'):
         _remove_reaction(client, channel, data['t'], 'cs-admin-bot')
+
+
+# ---------------------------------------------------------------------------
+# Menü: @CS Admin Bot ohne Text → Buttons, jeder öffnet ein kurzes Formular (Modal)
+# ---------------------------------------------------------------------------
+
+_MENU_ITEMS = [
+    ('va', ':page_facing_up: Vertragsanpassung'),
+    ('lookup', ':mag: Customer Lookup'),
+    ('invoices', ':receipt: Offene Rechnungen'),
+    ('sandbox', ':test_tube: Sandbox / Spiegelung'),
+    ('improvement', ':bulb: Improvement-Idee'),
+    ('help', ':grey_question: Was kannst du?'),
+]
+
+
+def _menu_blocks(user_id: str, channel: str, thread_ts: str) -> list[dict]:
+    value = _json.dumps({'c': channel, 't': thread_ts})
+    return [
+        {'type': 'section', 'text': {'type': 'mrkdwn',
+         'text': f"Hey <@{user_id}>! Wobei kann ich helfen?"}},
+        {'type': 'actions', 'block_id': 'bot_menu', 'elements': [
+            {'type': 'button', 'action_id': f'menu_{k}', 'value': value,
+             'text': {'type': 'plain_text', 'text': label, 'emoji': True}}
+            for k, label in _MENU_ITEMS]},
+    ]
+
+
+def _menu_input(block_id, label, placeholder, multiline=True, optional=False):
+    return {'type': 'input', 'block_id': block_id, 'optional': optional,
+            'label': {'type': 'plain_text', 'text': label},
+            'element': {'type': 'plain_text_input', 'action_id': 'v', 'multiline': multiline,
+                        'placeholder': {'type': 'plain_text', 'text': placeholder}}}
+
+
+_MENU_MODALS = {
+    'va': ('Vertragsanpassung', [
+        _menu_input('text', 'Was soll angepasst werden?',
+                    'Kunde, neuer Plan/Laufzeit/Servicepaket, ab wann, Link zum Angebot oder zu Chargebee')]),
+    'lookup': ('Customer Lookup', [
+        _menu_input('text', 'Kunde', 'Name, Kundennummer oder Chargebee-/Planhat-Link', multiline=False)]),
+    'invoices': ('Offene Rechnungen', [
+        _menu_input('text', 'Kunde', 'Name, Kundennummer oder Chargebee-Link', multiline=False)]),
+    'sandbox': ('Sandbox / Spiegelung', [
+        _menu_input('text', 'Kunde und Wunsch',
+                    'z. B. Sandbox inkl. Spiegelung für Muster GmbH')]),
+    'improvement': ('Improvement-Idee', [
+        _menu_input('title', 'Titel', 'Kurz: was soll besser werden?', multiline=False),
+        _menu_input('text', 'Use Case', 'Wer braucht es, wofür, was ist heute das Problem?')]),
+}
+
+
+@app.action(re.compile(r"^menu_(va|lookup|invoices|sandbox|improvement|help)$"))
+def handle_menu_button(ack, body, client, say):
+    ack()
+    action = (body.get('actions') or [{}])[0]
+    kind = action.get('action_id', '').replace('menu_', '')
+    try:
+        ctx = _json.loads(action.get('value') or '{}')
+    except ValueError:
+        ctx = {}
+    if kind == 'help':
+        say(text="CS Admin Bot Übersicht", thread_ts=ctx.get('t'),
+            blocks=[{'type': 'section', 'text': {'type': 'mrkdwn', 'text':
+                     "*Das kann ich:*\n"
+                     "• *Vertragsanpassung*: Kunde, Plan und Angebot auslesen, Umstellung vorbereiten\n"
+                     "• *Customer Lookup*: Subscription, Verlängerung, Instanz, offene Rechnungen\n"
+                     "• *Offene Rechnungen*: alle offenen Rechnungen eines Kunden mit Summe\n"
+                     "• *Sandbox / Spiegelung*: Preis, E-Mail-Entwurf, Anleitung, CCS-Ticket\n"
+                     "• *Improvement-Idee*: ähnliche Jira-Tickets suchen oder neues anlegen\n"
+                     "Status-Fragen wie „Ist Rechnung 77324 bezahlt?“ kannst du auch direkt stellen."}}])
+        return
+    title, inputs = _MENU_MODALS[kind]
+    ctx['u'] = (body.get('user') or {}).get('id', '')
+    try:
+        client.views_open(trigger_id=body['trigger_id'], view={
+            'type': 'modal', 'callback_id': f'menu_submit_{kind}', 'private_metadata': _json.dumps(ctx),
+            'title': {'type': 'plain_text', 'text': title[:24]},
+            'submit': {'type': 'plain_text', 'text': 'Los'},
+            'close': {'type': 'plain_text', 'text': 'Abbrechen'},
+            'blocks': inputs,
+        })
+    except Exception as e:
+        logger.warning(f"menu modal open failed: {e}")
+
+
+@app.view(re.compile(r"^menu_submit_(va|lookup|invoices|sandbox|improvement)$"))
+def handle_menu_submit(ack, body, client, view):
+    ack()
+    kind = view.get('callback_id', '').replace('menu_submit_', '')
+    try:
+        ctx = _json.loads(view.get('private_metadata') or '{}')
+    except ValueError:
+        ctx = {}
+    vals = view.get('state', {}).get('values', {})
+    get = lambda b: ((vals.get(b) or {}).get('v') or {}).get('value') or ''
+    channel, thread_ts = ctx.get('c'), ctx.get('t')
+    user_id = (body.get('user') or {}).get('id', '') or ctx.get('u', '')
+    if not (channel and thread_ts):
+        return
+    user_name = get_user_name(client, user_id)
+
+    def say(**kw):
+        kw.setdefault('channel', channel)
+        return client.chat_postMessage(**kw)
+
+    text = get('text').strip()
+    title = get('title').strip()
+    label = dict(_MENU_ITEMS)[kind].split(' ', 1)[1]
+    shown = (f"*{title}*\n{text}" if title else text)
+    say(thread_ts=thread_ts, text=f"<@{user_id}> · {label}:\n>{shown.replace(chr(10), chr(10) + '>')}")
+    logger.info("MENU " + _json.dumps({'kind': kind, 'channel': channel, 'user': user_id}))
+    try:
+        if kind == 'va':
+            _start_va_flow(say, client, channel, thread_ts, user_id, user_name, text)
+        elif kind == 'lookup':
+            reply = build_status_reply(f"Stand für {text}?", _va_lookup)
+            say(thread_ts=thread_ts, text=reply or f":thinking_face: Ich konnte „{text}“ keinem Kunden eindeutig "
+                "zuordnen. Probier es mit Kundennummer oder Chargebee-Link.")
+        elif kind == 'invoices':
+            reply = open_invoices_reply(f"Offene Rechnungen für {text}?", _va_lookup)
+            say(thread_ts=thread_ts, text=reply or f":thinking_face: Ich konnte „{text}“ keinem Kunden eindeutig "
+                "zuordnen. Probier es mit Kundennummer oder Chargebee-Link.")
+        elif kind == 'sandbox':
+            if detect_mirror_request(text):
+                _post_mirror_request(say, client, channel, thread_ts, text)
+            else:
+                _handle_sandbox_intent(say, client, channel, thread_ts, user_id, user_name, text)
+        elif kind == 'improvement':
+            _process_request(say, client, channel, thread_ts, user_id, user_name,
+                             ts_to_date(thread_ts), title, text)
+    except Exception as e:
+        logger.exception(f"menu {kind} failed")
+        say(thread_ts=thread_ts, text=f":warning: Das hat nicht geklappt: {e}")
 
 
 @app.action("planhat_link_skip")
@@ -3634,11 +3772,11 @@ def handle_app_mention(event, say, client):
             ]
         return blocks
 
-    # Einfacher Gruß → kurze Begrüßung
+    # Einfacher Gruß oder bloße Erwähnung → Menü mit Buttons
     if _is_simple_greeting:
         say(
-            blocks=_build_help_blocks(full=False),
-            text=f"Hey {user_name}! Ich bin der CS Admin Bot.",
+            blocks=_menu_blocks(user_id, event.get('channel', ''), thread_ts),
+            text=f"Hey {user_name}! Wobei kann ich helfen?",
             thread_ts=thread_ts,
         )
         return
