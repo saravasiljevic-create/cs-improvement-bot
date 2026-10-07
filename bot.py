@@ -61,6 +61,7 @@ from vertragsanpassung_handler import (
     parse_vertragsanpassung,
     _fetch_subscription_by_id,
 )
+from jira_handler import JIRA_SERVER_URL, MIRROR_PROPERTY, get_issue_property, open_bot_mirror_tickets, set_issue_property
 from mirror_request import (
     ACTION_CANCEL as MIRROR_ACTION_CANCEL,
     ACTION_CREATE as MIRROR_ACTION_CREATE,
@@ -2906,11 +2907,16 @@ def handle_mirror_request_create(ack, body, client):
     who = f"<@{user_id}>"
     if ticket:
         _mirror_finish_message(client, channel, msg_ts,
-            f":white_check_mark: CCS-Ticket <{ticket['url']}|{ticket['key']}> angelegt (von {who}) · {data['n']}\n"
+            f":status_in_progress: CCS-Ticket <{ticket['url']}|{ticket['key']}> angelegt (von {who}) · {data['n']}\n"
+            f"Ich prüfe regelmäßig, ob die Spiegelung abgeschlossen ist, und melde mich dann hier.\n"
             f"Prod: {data['prod_url']} · {data['prod_serial']}\n"
             f"Sandbox: {data['sandbox_url']} · {data['sandbox_serial']}")
         if data.get('t'):
-            _set_done(client, channel, data['t'])
+            _remove_reaction(client, channel, data['t'], 'eyes')
+            _add_reaction(client, channel, data['t'], 'status_in_progress')
+            set_issue_property(ticket['key'], MIRROR_PROPERTY,
+                               {'channel': channel, 'ts': data['t'], 'notify': user_id,
+                                'status_ts': msg_ts, 'customer': data['n'], 'done': False})
         logger.info("MIRROR_TICKET " + _json.dumps({'channel': channel, 'ts': data.get('t'),
                     'key': ticket['key'], 'by': user_id}))
     else:
@@ -3690,7 +3696,7 @@ def _check_unanswered_questions(slack_client) -> None:
 
         # Skip if already marked done via ✅ reaction
         reactions = {r.get('name') for r in msg.get('reactions', [])}
-        if reactions & {'white_check_mark', 'heavy_check_mark'}:
+        if reactions & {'white_check_mark', 'heavy_check_mark', 'status_in_progress'}:
             continue
 
         # Check thread for CS admin reply or existing reminder from this bot
@@ -3730,6 +3736,58 @@ def _check_unanswered_questions(slack_client) -> None:
             logger.info(f"Unanswered reminder posted for {ts}")
         except Exception as e:
             logger.warning(f"Reminder post failed for {ts}: {e}")
+
+
+_MIRROR_DONE_RE = re.compile(
+    r'mirror\w*\s+(?:is\s+|has\s+been\s+|was\s+)?complet|'
+    r'(?:data\s+)?sync\w*\s+(?:has\s+been\s+|is\s+)?complet|spiegelung\s+(?:ist\s+)?abgeschlossen',
+    re.IGNORECASE,
+)
+
+
+def _check_mirror_tickets(slack_client) -> None:
+    """Meldet abgeschlossene Spiegelungen im Slack-Thread: Kommentar "Mirroring complete" (o. ä.)
+    oder Status-Kategorie "done". Dann ✅ statt :status_in_progress: auf der Anfrage und die Person
+    taggen, die das Ticket per Button angelegt hat. Merkt sich die Meldung in der Issue-Property."""
+    for t in open_bot_mirror_tickets():
+        prop = get_issue_property(t['key'], MIRROR_PROPERTY)
+        if not prop or prop.get('done') or not prop.get('channel') or not prop.get('ts'):
+            continue
+        hit = next((c for c in t['comments'] if _MIRROR_DONE_RE.search(c['body'] or '')), None)
+        if not hit and t['status_category'] != 'done':
+            continue
+        channel, ts = prop['channel'], prop['ts']
+        url = f"{JIRA_SERVER_URL.rstrip('/')}/browse/{t['key']}"
+        detail = (f"„{hit['body'].strip().splitlines()[0][:120]}“ ({hit['author']})" if hit
+                  else f"Status: {t['status']}")
+        who = f"<@{prop['notify']}> " if prop.get('notify') else ''
+        try:
+            slack_client.chat_postMessage(
+                channel=channel, thread_ts=ts,
+                text=(f":white_check_mark: {who}die Spiegelung für {prop.get('customer') or 'den Kunden'} "
+                      f"ist abgeschlossen: <{url}|{t['key']}> {detail}. "
+                      f"Der Kunde kann jetzt informiert werden."),
+            )
+        except Exception as e:
+            logger.warning(f"mirror done post failed for {t['key']}: {e}")
+            continue
+        _remove_reaction(slack_client, channel, ts, 'status_in_progress')
+        _add_reaction(slack_client, channel, ts, 'white_check_mark')
+        prop['done'] = True
+        set_issue_property(t['key'], MIRROR_PROPERTY, prop)
+        logger.info("MIRROR_DONE " + _json.dumps({'key': t['key'], 'channel': channel, 'ts': ts}))
+
+
+def _mirror_check_loop() -> None:
+    """Alle 30 Minuten werktags 7–19 Uhr die offenen Spiegelungs-Tickets prüfen."""
+    while True:
+        try:
+            now = datetime.now(tz=_BERLIN_TZ)
+            if now.weekday() < 5 and 7 <= now.hour < 19:
+                _check_mirror_tickets(app.client)
+        except Exception as e:
+            logger.warning(f"Mirror check loop error: {e}")
+        time.sleep(1800)
 
 
 def _daily_reminder_loop() -> None:
@@ -3782,4 +3840,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting CS Improvement Bot on port {port}...")
     threading.Thread(target=_daily_reminder_loop, daemon=True, name="daily-reminder").start()
+    threading.Thread(target=_mirror_check_loop, daemon=True, name="mirror-check").start()
     flask_app.run(host="0.0.0.0", port=port)
