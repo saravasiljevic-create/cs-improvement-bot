@@ -3,7 +3,7 @@ import os
 import re
 from text_utils import normalize_slack_text
 import json as _json
-from status_handler import detect_status_question, extract_invoice_ids, build_status_reply
+from status_handler import detect_status_question, extract_invoice_ids, build_status_reply, detect_open_invoice_question, open_invoices_reply
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -2411,9 +2411,10 @@ def _handle_message_core(event, say, client):
     _auto_detect = user_id not in CS_ADMIN_USER_IDS
 
     # --- Status-Frage: direkt aus Chargebee beantworten (nur lesend) ---
-    if _auto_detect and _in_va and detect_status_question(text):
+    if _auto_detect and _in_va and (detect_status_question(text) or detect_open_invoice_question(text)):
         try:
-            reply = build_status_reply(text, _va_lookup)
+            reply = (open_invoices_reply(text, _va_lookup) if detect_open_invoice_question(text)
+                     else build_status_reply(text, _va_lookup))
         except Exception as e:
             logger.warning(f"Status answer failed: {e}")
             reply = None
@@ -3055,12 +3056,22 @@ def _create_mirroring_ticket_and_report(say, thread_ts, state, info: dict, from_
         info['sandbox_serial'],
         slack_link=slack_link,
     )
-    if ticket and state.get('billing_ref'):
-        # Abschluss-Check (siehe _check_mirror_tickets) meldet sich im Rechnungs-Post-Thread
-        ref = state['billing_ref']
-        set_issue_property(ticket['key'], MIRROR_PROPERTY,
-                           {'mode': 'billing', 'channel': ref['channel'], 'ts': ref['ts'],
-                            'customer': state.get('customer_name', ''), 'done': False})
+    if ticket:
+        # Abschluss-Check (siehe _check_mirror_tickets): bei kostenpflichtigen Fällen im Thread des
+        # Rechnungs-Posts in #ask-cs-admin (Button „Rechnung gestellt“), zusätzlich immer im
+        # Ursprungs-Thread (DM oder Channel) mit Tag an die anfragende Person.
+        origin = {'channel': state.get('channel'), 'ts': thread_ts, 'user': state.get('user_id')}
+        ref = state.get('billing_ref')
+        if ref:
+            prop = {'mode': 'billing', 'channel': ref['channel'], 'ts': ref['ts'], 'origin': origin}
+        elif origin['channel']:
+            prop = {'mode': 'sandbox', 'channel': origin['channel'], 'ts': thread_ts,
+                    'notify': origin['user']}
+        else:
+            prop = None
+        if prop:
+            prop.update({'customer': state.get('customer_name', ''), 'done': False})
+            set_issue_property(ticket['key'], MIRROR_PROPERTY, prop)
     if ticket:
         source = ""
         if from_instance_manager:
@@ -3515,6 +3526,18 @@ def handle_app_mention(event, say, client):
 
     # Status-Frage per @Bot (auch in Threads): Fakten aus Chargebee
     _status_text = normalize_slack_text(raw_text)
+    if detect_open_invoice_question(_status_text):
+        try:
+            reply = open_invoices_reply(_status_text, _va_lookup)
+        except Exception as e:
+            logger.warning(f"Open invoices answer (mention) failed: {e}")
+            reply = None
+        if reply:
+            say(text=reply, thread_ts=thread_ts)
+            _status_answered[(event.get('channel'), thread_ts)] = time.time()
+            logger.info("STATUS_ANSWER " + _json.dumps({'channel': event.get('channel'), 'ts': thread_ts,
+                                                        'via': 'mention', 'kind': 'open_invoices'}))
+            return
     if detect_status_question(_status_text) or extract_invoice_ids(_status_text):
         try:
             reply = build_status_reply(_status_text, _va_lookup)
@@ -3911,6 +3934,16 @@ def _check_mirror_tickets(slack_client) -> None:
             except Exception as e:
                 logger.warning(f"billing ready post failed for {t['key']}: {e}")
                 continue
+            org = prop.get('origin') or {}
+            if org.get('channel') and org.get('ts') and (org['channel'], org['ts']) != (channel, ts):
+                try:
+                    slack_client.chat_postMessage(
+                        channel=org['channel'], thread_ts=org['ts'],
+                        text=(f":white_check_mark: {'<@' + org['user'] + '> ' if org.get('user') else ''}"
+                              f"die Spiegelung für {prop.get('customer') or 'den Kunden'} ist abgeschlossen: "
+                              f"<{url}|{t['key']}>. Du kannst den Kunden jetzt informieren."))
+                except Exception as e:
+                    logger.warning(f"origin notify failed for {t['key']}: {e}")
             prop['done'] = True
             set_issue_property(t['key'], MIRROR_PROPERTY, prop)
             logger.info("BILLING_READY " + _json.dumps({'key': t['key'], 'channel': channel, 'ts': ts}))
@@ -3921,7 +3954,8 @@ def _check_mirror_tickets(slack_client) -> None:
                 channel=channel, thread_ts=ts,
                 text=(f":white_check_mark: {who}die Spiegelung für {prop.get('customer') or 'den Kunden'} "
                       f"ist abgeschlossen: <{url}|{t['key']}> {detail}. "
-                      f"Der Kunde kann jetzt informiert werden."),
+                      + ("Du kannst den Kunden jetzt informieren." if prop.get('mode') == 'sandbox'
+                         else "Der Kunde kann jetzt informiert werden.")),
             )
         except Exception as e:
             logger.warning(f"mirror done post failed for {t['key']}: {e}")

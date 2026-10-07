@@ -31,7 +31,7 @@ _INVOICE_NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 _STATUS_WORDS_RE = re.compile(
-    r'\b(?:stand|status|offen|bezahlt|beglichen|eingegangen|eingezogen|f[äa]llig|posted|'
+    r'\b(?:stand|status|offen\w*|bezahlt|beglichen|eingegangen|eingezogen|f[äa]llig|posted|'
     r'gemahnt|mahnung|storniert|gutschrift|bekommen|umgestellt|aktiv|hinterlegt|'
     r'upgrade|downgrade|verl[äa]ngert|renewal|laufzeit)\b',
     re.IGNORECASE,
@@ -63,6 +63,59 @@ def extract_invoice_ids(text: str) -> list[str]:
             seen.add(i)
             out.append(i)
     return out[:3]
+
+
+_OPEN_INVOICE_RE = re.compile(
+    r'\b(?:offen\w*|unbezahlt\w*|ausstehend\w*|[üu]berf[äa]llig\w*|nicht\s+bezahlt\w*|r[üu]ckst[äa]nd\w*|'
+    r'zahlungsr[üu]ckstand\w*|schuld\w*|f[äa]llig\w*)\b[^.?!\n]{0,40}\b(?:rechnung\w*|posten|betr[äa]g\w*|zahlung\w*|invoices?)\b'
+    r'|\b(?:rechnung\w*|posten|invoices?)\b[^.?!\n]{0,40}\b(?:offen\w*|unbezahlt\w*|ausstehend\w*|[üu]berf[äa]llig\w*|nicht\s+bezahlt)\b'
+    r'|\bopen\s+invoices?\b|\boffene\s+posten\b',
+    re.IGNORECASE,
+)
+
+
+def detect_open_invoice_question(text: str) -> bool:
+    """„Haben wir offene Rechnungen bei X?“, „Ist bei X noch etwas unbezahlt?“ (ohne Rechnungsnummer)."""
+    t = normalize_slack_text(text or '')
+    return bool(_OPEN_INVOICE_RE.search(t)) and not extract_invoice_ids(t)
+
+
+def open_invoices_reply(text: str, lookup) -> str | None:
+    """Alle offenen Rechnungen des Kunden (gestellt, fällig oder nicht bezahlt) mit Summe.
+    None, wenn kein eindeutiger Kunde gefunden wurde."""
+    from text_utils import extract_company_name
+    parsed = {'customer_name': extract_company_name(text) or _guess_name(text) or ''}
+    sub = lookup(parsed, text)
+    if not sub or sub.get('multiple_links'):
+        return None
+    raw = (_cb(f"subscriptions/{sub.get('subscription_id')}") or {}).get('subscription') or {}
+    cid = raw.get('customer_id') or sub.get('customer_id')
+    if not cid:
+        return None
+    cust = (_cb(f"customers/{cid}") or {}).get('customer', {})
+    name = cust.get('company') or sub.get('company') or parsed['customer_name']
+    curl = f"https://{CHARGEBEE_SITE}.chargebee.com/d/customers/{cid}"
+    data = _cb('invoices', {'customer_id[is]': cid, 'status[in]': '["payment_due","not_paid","posted"]',
+                            'limit': 20, 'sort_by[asc]': 'date'}) or {}
+    invs = [x['invoice'] for x in data.get('list', [])]
+    head = f":receipt: *Offene Rechnungen · <{curl}|{name}>* (Deb.-Nr. {cust.get('cf_debit_number', '–')})"
+    if not invs:
+        body = "Aktuell sind *keine offenen Rechnungen* in Chargebee hinterlegt."
+    else:
+        lines = []
+        for i in invs:
+            url = f"https://{CHARGEBEE_SITE}.chargebee.com/d/invoices/{i['id']}"
+            line = (f"• <{url}|{i['id']}> vom {_d(i.get('date'))}: offen *{_eur(i.get('amount_due'))}*"
+                    f" von {_eur(i.get('total'))} · {_INVOICE_STATUS_DE.get(i.get('status'), i.get('status'))}")
+            if i.get('due_date'):
+                line += f" · fällig {_d(i.get('due_date'))}"
+            if i.get('dunning_status'):
+                line += f" · Mahnlauf `{i['dunning_status']}`"
+            lines.append(line)
+        total = sum(i.get('amount_due') or 0 for i in invs)
+        body = '\n'.join(lines) + f"\n*Summe offen: {_eur(total)}* ({len(invs)} Rechnung{'en' if len(invs) != 1 else ''})"
+    return (f"{head}\n{body}\n\n"
+            "_Automatisch aus Chargebee, nur lesend. Falsche Antwort? `#bot-stop` in den Thread._")
 
 
 def detect_status_question(text: str) -> bool:
