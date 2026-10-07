@@ -2110,7 +2110,6 @@ def _handle_message_core(event, say, client):
                          if not m.get('bot_id') and m.get('text') and '#spiegelung' not in m.get('text', '').lower()]
             except Exception as e:
                 logger.warning(f"conversations_replies failed in #spiegelung trigger: {e}")
-            _set_eyes(client, channel, thread_ts)
             _post_mirror_request(say, client, channel, thread_ts, '\n'.join(texts) or text)
             return
 
@@ -2425,7 +2424,6 @@ def _handle_message_core(event, say, client):
     # --- Spiegelung auf bestehende Sandbox: Werte abgleichen, CCS-Ticket per Button ---
     # Vor dem Sandbox-Neuanlage-Flow, weil beide auf "Sandbox" + "Spiegelung" reagieren.
     if _auto_detect and (_in_improvement or _in_va) and detect_mirror_request(text):
-        _set_eyes(client, channel, ts)
         _post_mirror_request(say, client, channel, ts, text)
         return
 
@@ -2859,6 +2857,9 @@ def _post_mirror_request(say, client, channel: str, root_ts: str, text: str):
         return
     say(blocks=build_mirror_request_blocks(res, channel, root_ts),
         text="Spiegelung auf bestehende Sandbox erkannt", thread_ts=root_ts)
+    # Status-Reaktionen auf der Anfrage: 🤖 = Bot kann das CCS-Ticket anlegen (wartet auf
+    # Entscheidung), :status_in_progress: = Ticket angelegt, ✅ = Spiegelung abgeschlossen.
+    _add_reaction(client, channel, root_ts, 'robot_face')
     if res['vollstaendig']:
         _pending_mirror.pop((channel, root_ts), None)
     else:
@@ -2912,7 +2913,7 @@ def handle_mirror_request_create(ack, body, client):
             f"Prod: {data['prod_url']} · {data['prod_serial']}\n"
             f"Sandbox: {data['sandbox_url']} · {data['sandbox_serial']}")
         if data.get('t'):
-            _remove_reaction(client, channel, data['t'], 'eyes')
+            _remove_reaction(client, channel, data['t'], 'robot_face')
             _add_reaction(client, channel, data['t'], 'status_in_progress')
             set_issue_property(ticket['key'], MIRROR_PROPERTY,
                                {'channel': channel, 'ts': data['t'], 'notify': user_id,
@@ -2932,6 +2933,8 @@ def handle_mirror_request_cancel(ack, body, client):
     if user_id not in CS_ADMIN_USER_IDS:
         return
     _mirror_finish_message(client, channel, msg_ts, f":no_entry_sign: Kein CCS-Ticket angelegt (<@{user_id}>).")
+    if data.get('t'):
+        _remove_reaction(client, channel, data['t'], 'robot_face')
 
 
 @app.action("planhat_link_skip")
