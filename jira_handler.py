@@ -312,3 +312,73 @@ def create_ticket(summary: str, use_case: str, user_name: str, request_date: str
     except Exception as e:
         print(f"Error creating ticket: {str(e)}")
         raise
+
+
+# ---------------------------------------------------------------------------
+# Spiegelungs-Tickets: Slack-Bezug unsichtbar als Issue-Property speichern und
+# den Abschluss ("Mirroring complete") erkennen. Nur Lesen + eigene Property.
+# ---------------------------------------------------------------------------
+
+MIRROR_PROPERTY = 'csAdminBotSlack'
+
+
+def _rest(method: str, path: str, **kw):
+    return rq.request(method, f"{JIRA_SERVER_URL.rstrip('/')}/rest/api/3/{path}",
+                      auth=(JIRA_USER_EMAIL, JIRA_API_TOKEN), timeout=30, **kw)
+
+
+def set_issue_property(issue_key: str, prop: str, data: dict) -> bool:
+    try:
+        r = _rest('PUT', f'issue/{issue_key}/properties/{prop}', json=data)
+        return r.status_code in (200, 201)
+    except Exception as e:
+        print(f"set_issue_property({issue_key}) failed: {e}")
+        return False
+
+
+def get_issue_property(issue_key: str, prop: str) -> dict | None:
+    try:
+        r = _rest('GET', f'issue/{issue_key}/properties/{prop}')
+        return (r.json() or {}).get('value') if r.status_code == 200 else None
+    except Exception as e:
+        print(f"get_issue_property({issue_key}) failed: {e}")
+        return None
+
+
+def open_bot_mirror_tickets(days: int = 60) -> list[dict]:
+    """CCS-Spiegelungs-Tickets, die dieser Bot (Jira-User des Tokens) angelegt hat, mit Status und
+    Kommentaren. [{key, status, status_category, comments: [{author, body}]}]"""
+    jql = (f'project = CCS AND summary ~ "Mirror data from Prod to Sandbox" '
+           f'AND reporter = currentUser() AND created >= -{days}d ORDER BY created ASC')
+    try:
+        r = _rest('POST', 'search/jql', json={'jql': jql, 'maxResults': 50,
+                                               'fields': ['status', 'comment']})
+        r.raise_for_status()
+        out = []
+        for it in r.json().get('issues', []):
+            f = it.get('fields') or {}
+            comments = []
+            for c in ((f.get('comment') or {}).get('comments') or []):
+                comments.append({'author': (c.get('author') or {}).get('displayName', ''),
+                                 'body': _adf_text(c.get('body'))})
+            st = f.get('status') or {}
+            out.append({'key': it.get('key'), 'status': st.get('name', ''),
+                        'status_category': (st.get('statusCategory') or {}).get('key', ''),
+                        'comments': comments})
+        return out
+    except Exception as e:
+        print(f"open_bot_mirror_tickets failed: {e}")
+        return []
+
+
+def _adf_text(node) -> str:
+    """Atlassian Document Format → Klartext (nur Text-Knoten)."""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, dict):
+        if node.get('type') == 'text':
+            return node.get('text', '')
+        return ' '.join(_adf_text(c) for c in node.get('content') or [])
+    if isinstance(node, list):
+        return ' '.join(_adf_text(c) for c in node)
+    return ''
