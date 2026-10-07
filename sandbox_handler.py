@@ -800,7 +800,7 @@ def build_sandbox_admin_billing_blocks(
                     'type': 'button',
                     'text': {'type': 'plain_text', 'text': 'Für Rechnungsstellung übernehmen'},
                     'action_id': 'sandbox_admin_take_billing',
-                    'value': customer_name,
+                    'value': json.dumps({'n': customer_name, 'scope': scope}, ensure_ascii=False),
                 },
             ],
         },
