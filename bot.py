@@ -73,6 +73,7 @@ from sandbox_handler import (
     LOOM_SANDBOX_ANNUAL_URL,
     LOOM_SANDBOX_FREE_URL,
     LOOM_SANDBOX_MONTHLY_URL,
+    LOOM_SANDBOX_STANDARD_L_URL,
     build_customer_email,
     build_existing_sandbox_mirroring_email,
     build_existing_sandbox_result_blocks,
@@ -100,6 +101,7 @@ from sandbox_handler import (
     resolve_paragraph_variants,
     resolve_spiegelung_only_variant,
     sandbox_is_free,
+    sandbox_is_standard_l,
     sandbox_scope_needs_billing,
 )
 
@@ -3144,6 +3146,13 @@ def _apply_sandbox_scope(say, client, channel, thread_ts, state, scope: str):
             say(
                 blocks=build_sandbox_video_blocks(LOOM_SANDBOX_FREE_URL),
                 text="Anleitung: Sandbox erstellen (kostenlos)",
+                thread_ts=thread_ts,
+            )
+            _continue_sandbox_after_video(say, channel, thread_ts, state, scope)
+        elif sandbox_is_standard_l(variant):
+            say(
+                blocks=build_sandbox_video_blocks(LOOM_SANDBOX_STANDARD_L_URL),
+                text="Anleitung: Sandbox erstellen (Standard L)",
                 thread_ts=thread_ts,
             )
             _continue_sandbox_after_video(say, channel, thread_ts, state, scope)

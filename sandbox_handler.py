@@ -738,9 +738,17 @@ def build_sandbox_mirroring_question_blocks(has_existing_sandbox: bool) -> list[
 # free/kombinierten-Premium-L-Fall) bzw. — falls nicht kostenlos — danach, ob der
 # Kunde in seiner Antwort einen Monats- oder Jahresvertrag für die Sandbox gewählt
 # hat (das weiß nur der CSM, dafür gibt es die Rückfrage unten).
-LOOM_SANDBOX_FREE_URL = "https://www.loom.com/share/a9d44ca176ce4b11be81c2046e51be40"
-LOOM_SANDBOX_MONTHLY_URL = "https://www.loom.com/share/a7791adbc4704e5cb120a8535b425144"
-LOOM_SANDBOX_ANNUAL_URL = "https://www.loom.com/share/de525d7045844f3f9ef9f575d57655b2"
+# Stand 07.10.2026 (neu aufgenommen). Standard L hat eine eigene Variante zum reduzierten Preis,
+# dort entfällt die Rückfrage Monats-/Jahresvertrag.
+LOOM_SANDBOX_FREE_URL = "https://www.loom.com/share/937db068a30b40888f66c812adc0bd52"
+LOOM_SANDBOX_MONTHLY_URL = "https://www.loom.com/share/332200b3b0f24373bed3ba6565e16f19"
+LOOM_SANDBOX_ANNUAL_URL = "https://www.loom.com/share/0ff1310e02e547bf92585e632cf4e380"
+LOOM_SANDBOX_STANDARD_L_URL = "https://www.loom.com/share/06a70c07bfec47958796cacc7cf47f59"
+
+
+def sandbox_is_standard_l(variant: dict) -> bool:
+    """True, wenn Schritt 1 die Standard-L-Variante erkannt hat (Planhat-Feld `Sandbox` = '49€')."""
+    return variant.get('mode') == 'standard' and variant.get('sandbox_key') == 'standard_l'
 
 
 def sandbox_is_free(variant: dict) -> bool:
