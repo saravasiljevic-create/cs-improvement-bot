@@ -113,7 +113,7 @@ _CB_URL_RE = re.compile(
 # State (Sandbox, VA, ...) haben müssen — insbesondere #bot-stop/#bot-remove,
 # damit ein Mute-Befehl nicht von einer aktiven Flow-Rückfrage verschluckt wird.
 _BOT_COMMAND_RE = re.compile(
-    r'#bot-stop|#bot-remove|#vertragsanpassung|#improvement|#planhat-log|#planhat-upload',
+    r'#bot-stop|#bot-remove|#vertragsanpassung|#spiegelung|#improvement|#planhat-log|#planhat-upload',
     re.IGNORECASE,
 )
 
@@ -1674,6 +1674,7 @@ def _handle_message_core(event, say, client):
                     text=(
                         ":wave: Kein aktiver Bot-Flow in diesem Thread.\n"
                         "• Für Vertragsanpassungen: `#vertragsanpassung` hier posten (nur CS Admin)\n"
+                        "• Für eine Spiegelung auf bestehende Sandbox: `#spiegelung` hier posten (nur CS Admin)\n"
                         "• Für Feature-Anfragen: `#improvement` in einer neuen Nachricht schreiben"
                     ),
                     thread_ts=thread_ts,
@@ -2092,6 +2093,24 @@ def _handle_message_core(event, say, client):
                     )
             except Exception as e:
                 say(text=f":warning: Planhat-Note fehlgeschlagen: `{e}`", thread_ts=thread_ts)
+            return
+
+        # --- Spiegelung auf bestehende Sandbox: manueller Thread-Trigger (CS Admin only) ---
+        # Für Anfragen, die die Auto-Erkennung verpasst hat oder die vor dem Deploy kamen.
+        if '#spiegelung' in text.lower():
+            if user_id not in CS_ADMIN_USER_IDS:
+                say(text=":no_entry: `#spiegelung` kann nur vom CS Admin Team genutzt werden.",
+                    thread_ts=thread_ts)
+                return
+            texts = []
+            try:
+                msgs = client.conversations_replies(channel=channel, ts=thread_ts, limit=50).get('messages', [])
+                texts = [normalize_slack_text(m.get('text', '')) for m in msgs
+                         if not m.get('bot_id') and m.get('text') and '#spiegelung' not in m.get('text', '').lower()]
+            except Exception as e:
+                logger.warning(f"conversations_replies failed in #spiegelung trigger: {e}")
+            _set_eyes(client, channel, thread_ts)
+            _post_mirror_request(say, client, channel, thread_ts, '\n'.join(texts) or text)
             return
 
         # --- Vertragsanpassung: manual thread trigger (CS Admin only) ---
