@@ -66,6 +66,13 @@ def _detect_intent(text: str) -> list[str]:
 
 def _extract_customer_name(text: str) -> str:
     """Extrahiert einen Kundennamen aus einer Frage."""
+    try:
+        from status_handler import question_customer_name
+        name = question_customer_name(text)
+        if name:
+            return name
+    except Exception:
+        pass
     # "von X", "für X", "bei X", "zu X" → X als Name
     for prep_pattern in [
         r'(?:von|für|bei|zu|des|kunden?)\s+([A-ZÄÖÜ][^\?\.!,\n]{2,50}?)(?:\?|$|\.|,|!|\s+(?:hat|ist|haben|sind|gibt))',
@@ -125,7 +132,7 @@ def _fmt_health(data: dict) -> str:
     if 'error' in data:
         return f"⚠️ {data['error']}"
     lines = [f"💚 *{data.get('name', '?')}* (Planhat)"]
-    if data.get('health_score') is not None:
+    if data.get('health_score') not in (None, ''):
         lines.append(f"• Health Score: *{data['health_score']}*")
     if data.get('phase'):
         lines.append(f"• Phase: {data['phase']}")
@@ -133,7 +140,7 @@ def _fmt_health(data: dict) -> str:
         lines.append(f"• CSM: {data['csm_owner']}")
     if data.get('mrr'):
         lines.append(f"• MRR: {data['mrr']}")
-    if data.get('churn_score') is not None:
+    if data.get('churn_score') not in (None, ''):
         lines.append(f"• Churn-Score: {data['churn_score']}")
     if data.get('last_activity'):
         lines.append(f"• Letzte Aktivität: {data['last_activity']}")

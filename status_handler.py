@@ -84,7 +84,7 @@ def open_invoices_reply(text: str, lookup) -> str | None:
     """Alle offenen Rechnungen des Kunden (gestellt, fällig oder nicht bezahlt) mit Summe.
     None, wenn kein eindeutiger Kunde gefunden wurde."""
     from text_utils import extract_company_name
-    parsed = {'customer_name': extract_company_name(text) or _guess_name(text) or ''}
+    parsed = {'customer_name': question_customer_name(text)}
     sub = lookup(parsed, text)
     if not sub or sub.get('multiple_links'):
         return None
@@ -264,14 +264,45 @@ def subscription_status_lines(subscription: dict, customers: list | None = None)
 
 
 _NAME_AFTER_RE = re.compile(
-    r'\b(?:ob|f[üu]r|bei|beim|kunde[n]?|kundin)\s+((?:[A-ZÄÖÜ0-9][\w&.\-]*)(?:\s+[A-ZÄÖÜ0-9][\w&.\-]*){0,3})'
-)
+    r'\b(?:ob|f[üu]r|bei|beim|vom|von|der|des|zum|zur|zu|kunde[n]?|kundin)\s+(?=\S)', re.IGNORECASE)
+_NAME_STOP = re.compile(
+    r'^(?:noch|aktuell|gerade|schon|bitte|eigentlich|mal|denn|jetzt|heute|ist|sind|hat|haben|gibt|'
+    r'wurde|werden|wird|kann|k[öo]nnt|offen\w*|bezahlt|f[äa]llig\w*|eingegangen|aktiv|gek[üu]ndigt|'
+    r'im|in|an|auf|mit|seit|bis|und|oder)$', re.IGNORECASE)
+_NAME_SKIP_FIRST = re.compile(r'^(?:kunde[n]?|kundin|firma|dem|den|die|das|der|des|einem|einer)$', re.IGNORECASE)
 
 
 def _guess_name(text: str) -> str | None:
-    """Firmenname ohne Rechtsform, z.B. „ob Nordica Coffee heute …“ → „Nordica Coffee“."""
-    m = _NAME_AFTER_RE.search(strip_urls(normalize_slack_text(text)))
-    return m.group(1).strip() if m else None
+    """Kundenname aus einer Frage: Teil nach der letzten Präposition („… der otom Group?“,
+    „… beim Kunden Nordica Coffee GmbH?“), bis zum ersten Füll-/Statuswort, höchstens 6 Wörter.
+    Kleinschreibung am Anfang ist erlaubt (otom, wev …)."""
+    t = strip_urls(normalize_slack_text(text or ''))
+    t = re.sub(r'<@[A-Z0-9]+>|@\S+\s+(?:Admin\s+)?Bot\b', ' ', t)
+    cands = []
+    for m in _NAME_AFTER_RE.finditer(t):
+        rest = re.split(r'[?!.,;:\n]', t[m.end():], maxsplit=1)[0]
+        words = []
+        for w in rest.split():
+            if not words and _NAME_SKIP_FIRST.match(w):
+                continue
+            if _NAME_STOP.match(w) or (words and _STATUS_WORDS_RE.fullmatch(w)) or len(words) >= 6:
+                break
+            words.append(w)
+        if words and not _STATUS_WORDS_RE.fullmatch(words[0]):
+            cands.append(' '.join(words))
+    if not cands:
+        return None
+    # Mit Rechtsform: der längste Kandidat, der auf GmbH/AG/... endet („ob Feines von Hemmen GmbH“
+    # statt „Hemmen GmbH“). Ohne Rechtsform: der letzte („Renewal date der otom Group“ → „otom Group“).
+    legal = [c for c in cands if re.search(r'\b(?:GmbH|AG|KG|UG|SE|Ltd\.?|LLC|Inc\.?|GbR|e\.\s?K\.?|OHG)$', c)]
+    legal = [c for c in legal if not re.search(r'\s(?:bei|beim|f[üu]r|zum|zur|der|des|ob|kunde[n]?)\s', c, re.IGNORECASE)] or legal
+    return max(legal, key=len) if legal else cands[-1]
+
+
+def question_customer_name(text: str) -> str:
+    """Bester Kundenname für Status-/Rechnungsfragen: erst die Fragen-Logik, dann die Rechtsform-Suche."""
+    from text_utils import extract_company_name
+    return _guess_name(text) or extract_company_name(text) or ''
 
 
 def instance_status_lines(customer_id: str) -> list[str]:
@@ -328,7 +359,7 @@ def build_status_reply(text: str, lookup) -> str | None:
         sections.append(invoice_status_lines(inv_id, customers))
     if not sections:
         from text_utils import extract_company_name
-        parsed = {'customer_name': extract_company_name(text) or _guess_name(text) or ''}
+        parsed = {'customer_name': question_customer_name(text)}
         sub = lookup(parsed, text)
         if not sub or sub.get('multiple_links'):
             return None
