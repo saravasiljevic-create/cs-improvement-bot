@@ -1317,6 +1317,7 @@ def _finish_sandbox_lookup(say, channel, ts, user_id, user_name, customer_name, 
         )
     _pending_sandbox[(channel, ts)] = {
         'step': 'awaiting_fit_confirmation',
+        'channel': channel,
         'user_id': user_id,
         'user_name': user_name,
         'customer_name': customer_name,
@@ -2904,7 +2905,8 @@ def handle_mirror_request_create(ack, body, client):
         _mirror_finish_message(client, channel, msg_ts, ":warning: Daten unvollständig, bitte neu anstoßen.")
         return
     ticket = create_sandbox_mirroring_ticket(data['n'], data['prod_url'], data['prod_serial'],
-                                             data['sandbox_url'], data['sandbox_serial'])
+                                             data['sandbox_url'], data['sandbox_serial'],
+                                             slack_link=_slack_permalink(client, channel, data.get('t')))
     who = f"<@{user_id}>"
     if ticket:
         _mirror_finish_message(client, channel, msg_ts,
@@ -3025,14 +3027,31 @@ def handle_va_select_plan(ack, body, say, client):
                                     state['user_name'], state['parsed'], state.get('subscription'))
 
 
+def _slack_permalink(client, channel: str | None, ts: str | None) -> str | None:
+    if not (channel and ts):
+        return None
+    try:
+        resp = client.chat_getPermalink(channel=channel, message_ts=ts)
+        return resp.get('permalink') if resp.get('ok') else None
+    except Exception as e:
+        logger.warning(f"chat_getPermalink failed for {channel}/{ts}: {e}")
+        return None
+
+
 def _create_mirroring_ticket_and_report(say, thread_ts, state, info: dict, from_instance_manager: bool = False):
     """Legt das CCS-Spiegelungs-Ticket an und meldet das Ergebnis im Thread."""
+    # Link für das Jira-Ticket: DM-Threads sind für andere nicht sichtbar, daher bevorzugt
+    # der Rechnungs-Post in #ask-cs-admin (verlinkt selbst auf den Ursprung), sonst der Ursprungs-Thread.
+    ref = state.get('billing_ref') or {}
+    slack_link = (_slack_permalink(app.client, ref.get('channel'), ref.get('ts'))
+                  or _slack_permalink(app.client, state.get('channel'), thread_ts))
     ticket = create_sandbox_mirroring_ticket(
         state.get('customer_name', ''),
         info['prod_url'],
         info['prod_serial'],
         info['sandbox_url'],
         info['sandbox_serial'],
+        slack_link=slack_link,
     )
     if ticket and state.get('billing_ref'):
         # Abschluss-Check (siehe _check_mirror_tickets) meldet sich im Rechnungs-Post-Thread

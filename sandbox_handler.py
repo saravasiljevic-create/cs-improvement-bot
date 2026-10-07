@@ -1053,7 +1053,8 @@ def fetch_instance_info_from_csm(query: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def create_sandbox_mirroring_ticket(
-    customer_name: str, prod_url: str, prod_serial: str, sandbox_url: str, sandbox_serial: str
+    customer_name: str, prod_url: str, prod_serial: str, sandbox_url: str, sandbox_serial: str,
+    slack_link: str | None = None,
 ) -> dict | None:
     """Legt das Jira-Ticket für die Sandbox-Spiegelung im CCS-Projekt an.
 
@@ -1079,7 +1080,10 @@ def create_sandbox_mirroring_ticket(
         "**Sandbox/Target:**\n"
         f"URL: {sandbox_url}\n"
         f"Serial: {sandbox_serial}\n\n"
-        "* Please see Zendesk Support tab for further comments and attachments."
+        # Der Bot legt Tickets nur aus Slack an: Verweis auf den Slack-Verlauf statt auf
+        # Zendesk. Tickets aus Zendesk (Pool-Routine, ccs-ticket-text.sh) behalten den Zendesk-Satz.
+        + (f"* Request and further details in Slack: {slack_link}" if slack_link
+           else "* Request and further details in the Slack thread of the CS Admin Bot.")
     )
     try:
         return create_ccs_mirroring_ticket(summary, description)
