@@ -2857,9 +2857,9 @@ def _post_mirror_request(say, client, channel: str, root_ts: str, text: str):
         return
     say(blocks=build_mirror_request_blocks(res, channel, root_ts),
         text="Spiegelung auf bestehende Sandbox erkannt", thread_ts=root_ts)
-    # Status-Reaktionen auf der Anfrage: 🤖 = Bot kann das CCS-Ticket anlegen (wartet auf
+    # Status-Reaktionen auf der Anfrage: :cs-admin-bot: = Bot kann das CCS-Ticket anlegen (wartet auf
     # Entscheidung), :status_in_progress: = Ticket angelegt, ✅ = Spiegelung abgeschlossen.
-    _add_reaction(client, channel, root_ts, 'robot_face')
+    _add_reaction(client, channel, root_ts, 'cs-admin-bot')
     if res['vollstaendig']:
         _pending_mirror.pop((channel, root_ts), None)
     else:
@@ -2913,7 +2913,7 @@ def handle_mirror_request_create(ack, body, client):
             f"Prod: {data['prod_url']} · {data['prod_serial']}\n"
             f"Sandbox: {data['sandbox_url']} · {data['sandbox_serial']}")
         if data.get('t'):
-            _remove_reaction(client, channel, data['t'], 'robot_face')
+            _remove_reaction(client, channel, data['t'], 'cs-admin-bot')
             _add_reaction(client, channel, data['t'], 'status_in_progress')
             set_issue_property(ticket['key'], MIRROR_PROPERTY,
                                {'channel': channel, 'ts': data['t'], 'notify': user_id,
@@ -2934,7 +2934,7 @@ def handle_mirror_request_cancel(ack, body, client):
         return
     _mirror_finish_message(client, channel, msg_ts, f":no_entry_sign: Kein CCS-Ticket angelegt (<@{user_id}>).")
     if data.get('t'):
-        _remove_reaction(client, channel, data['t'], 'robot_face')
+        _remove_reaction(client, channel, data['t'], 'cs-admin-bot')
 
 
 @app.action("planhat_link_skip")
