@@ -1072,12 +1072,12 @@ def create_sandbox_mirroring_ticket(
     summary = "Mirror data from Prod to Sandbox"
     description = (
         "Hi Team,\n\n"
-        f"for the customer **{customer_name}**, could you please mirror the data from "
+        f"for the customer *{customer_name}*, could you please mirror the data from "
         "their Prod instance to their Sandbox?\n\n"
-        "**Prod/Source:**\n"
+        "*Prod/Source:*\n"
         f"URL: {prod_url}\n"
         f"Serial: {prod_serial}\n\n"
-        "**Sandbox/Target:**\n"
+        "*Sandbox/Target:*\n"
         f"URL: {sandbox_url}\n"
         f"Serial: {sandbox_serial}\n\n"
         # Der Bot legt Tickets nur aus Slack an: Verweis auf den Slack-Verlauf statt auf
