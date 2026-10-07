@@ -1570,6 +1570,26 @@ def _handle_message_core(event, say, client):
             _handle_sandbox_intent(say, client, channel, dm_ts, user_id, user_name, text)
             return
 
+        # Leere Nachricht, nur @Bot oder Gruß → Menü mit Buttons (für alle, auch CSMs)
+        _dm_clean = re.sub(r'<@[A-Z0-9]+>', '', text).strip().lower()
+        if _dm_clean in ('', '?', 'hi', 'hallo', 'hey', 'moin', 'servus', 'menü', 'menu', 'hilfe', 'help') \
+                or len(_dm_clean) <= 3:
+            say(blocks=_menu_blocks(user_id, channel, dm_thread_ts or dm_ts),
+                text="Wobei kann ich helfen?", thread_ts=dm_thread_ts)
+            return
+        # „customer lookup X“ / „lookup X“ / „offene Rechnungen X“ → dieselben Antworten wie im Menü
+        _m = re.match(r'^(?:customer\s+)?lookup\s+(?:f[üu]r\s+|von\s+|zu\s+)?(.+)$', _dm_clean, re.IGNORECASE)
+        if _m:
+            reply = build_status_reply(f"Stand für {_m.group(1).strip()}?", _va_lookup)
+            say(text=reply or f":thinking_face: Ich konnte „{_m.group(1).strip()}“ keinem Kunden eindeutig zuordnen.",
+                thread_ts=dm_thread_ts)
+            return
+        if detect_open_invoice_question(text):
+            reply = open_invoices_reply(normalize_slack_text(text), _va_lookup)
+            if reply:
+                say(text=reply, thread_ts=dm_thread_ts)
+                return
+
         if user_id not in CS_ADMIN_USER_IDS:
             say(text="Die Chat-Funktion ist aktuell nur für das CS Admin Team verfügbar.")
             return
