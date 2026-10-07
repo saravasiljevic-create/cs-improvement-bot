@@ -202,7 +202,7 @@ def _rule_based_answer(question: str) -> str:
     results = []
 
     for intent in intents:
-        if intent in ('subscription', 'overview', 'invoices') and 'subscription' in intents or intent == 'subscription':
+        if intent in ('subscription', 'overview', 'invoices'):
             raw = skill_registry.execute('chargebee_customer_lookup', {'company_name': customer}, {})
             try:
                 data = json.loads(raw)
