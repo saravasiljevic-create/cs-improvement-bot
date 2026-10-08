@@ -564,27 +564,78 @@ _SPIEGELUNG_EXPLANATIONS = {
 }
 
 
-def _fit_confirmation_buttons_block() -> dict:
+def _fit_confirmation_buttons_block(with_package: bool = False) -> dict:
     """Buttons als Alternative zum Freitext-Weg ('ja'/Korrekturtext) bei der
-    E-Mail-Entwurfs-Bestätigung — beide Wege funktionieren nebeneinander."""
-    return {
-        'type': 'actions',
-        'elements': [
-            {
-                'type': 'button',
-                'text': {'type': 'plain_text', 'text': '✅ Passt'},
-                'action_id': 'sandbox_fit_confirmed',
-                'value': 'confirmed',
-                'style': 'primary',
-            },
-            {
-                'type': 'button',
-                'text': {'type': 'plain_text', 'text': '✏️ Korrektur nötig'},
-                'action_id': 'sandbox_fit_correction',
-                'value': 'correction',
-            },
-        ],
-    }
+    E-Mail-Entwurfs-Bestätigung — beide Wege funktionieren nebeneinander.
+    `with_package`: dritter Button „Anderes Success-Paket“ (nur bei neuer Sandbox)."""
+    elements = [
+        {
+            'type': 'button',
+            'text': {'type': 'plain_text', 'text': '✅ Passt'},
+            'action_id': 'sandbox_fit_confirmed',
+            'value': 'confirmed',
+            'style': 'primary',
+        },
+        {
+            'type': 'button',
+            'text': {'type': 'plain_text', 'text': '✏️ Korrektur nötig'},
+            'action_id': 'sandbox_fit_correction',
+            'value': 'correction',
+        },
+    ]
+    if with_package:
+        elements.append({
+            'type': 'button',
+            'text': {'type': 'plain_text', 'text': '🔄 Anderes Success-Paket'},
+            'action_id': 'sandbox_fit_other_package',
+            'value': 'other_package',
+        })
+    return {'type': 'actions', 'elements': elements}
+
+
+# Preiskategorien für „Anderes Success-Paket“: bestimmen E-Mail-Absatz und später das Video.
+SANDBOX_PACKAGE_CHOICES = {
+    'free': ('Kostenlos', 'growth_s_premium_m'),
+    'standard_l': ('Standard L', 'standard_l'),
+    'paid': ('Monatsvertrag 130 € / Jahresvertrag 99 €', 'kein_neues_servicepaket_oder_standard_sm'),
+}
+
+
+def build_sandbox_package_choice_blocks() -> list[dict]:
+    return [
+        {'type': 'section', 'text': {'type': 'mrkdwn',
+         'text': "Welche Preiskategorie gilt für die Sandbox? Ich schreibe den E-Mail-Entwurf dann neu."}},
+        {'type': 'actions', 'elements': [
+            {'type': 'button', 'action_id': f'sandbox_pkg_{k}', 'value': k,
+             'text': {'type': 'plain_text', 'text': label}}
+            for k, (label, _) in SANDBOX_PACKAGE_CHOICES.items()]},
+    ]
+
+
+def build_sandbox_created_pause_blocks() -> list[dict]:
+    """Pause zwischen Sandbox-Anlage und Spiegelung: Für die Spiegelung muss die Sandbox existieren."""
+    return [
+        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': (
+            ":hourglass_flowing_sand: Leg jetzt bitte die Sandbox an. Sobald sie erstellt ist (die Instanz-URL "
+            "steht dann in Chargebee in den Custom Fields der Sandbox-Subscription), klick auf den Button. "
+            "Danach frage ich nach der Spiegelung.")}},
+        {'type': 'actions', 'elements': [
+            {'type': 'button', 'style': 'primary', 'action_id': 'sandbox_created', 'value': 'created',
+             'text': {'type': 'plain_text', 'text': '✅ Sandbox ist erstellt'}}]},
+    ]
+
+
+def build_mirror_done_customer_email(first_name: str | None, sandbox_url: str | None) -> str:
+    """E-Mail an den Kunden nach abgeschlossener Spiegelung (zum Rauskopieren)."""
+    url = sandbox_url or '‹Sandbox-URL›'
+    return (
+        f"{_greeting(first_name)}\n\n"
+        "die Spiegelung eurer Daten aus der Hauptinstanz in eure Sandbox ist abgeschlossen. "
+        f"Unter {url} findet ihr ab sofort den aktuellen Datenstand eurer Hauptinstanz.\n\n"
+        "Änderungen, die ihr in der Sandbox vornehmt, wirken sich nicht auf eure Hauptinstanz aus. "
+        "Ihr könnt dort also in Ruhe testen.\n\n"
+        "Wenn ihr Fragen habt, meldet euch gerne."
+    )
 
 
 def _hubspot_reminder_line(planhat_result: dict) -> str:
@@ -624,7 +675,7 @@ def build_sandbox_lookup_result_blocks(
     text += "\n\nPasst das so? Antworte mit *ja* oder beschreibe kurz, was nicht passt — oder nutze die Buttons:"
     return [
         {'type': 'section', 'text': {'type': 'mrkdwn', 'text': text}},
-        _fit_confirmation_buttons_block(),
+        _fit_confirmation_buttons_block(with_package=True),
     ]
 
 
@@ -790,6 +841,15 @@ def build_sandbox_admin_billing_blocks(
     umgesetzt und muss berechnet werden. `origin_permalink` wird nur beim
     Cross-Posting aus einem anderen Channel/DM mitgegeben, damit CS Admin den
     vollen Kontext im Ursprungs-Thread findet."""
+    if scope == 'new_only':
+        # Nur neue Sandbox: reine Info für CS Admin, kein To-do (der Bot setzt direkt ✅).
+        lines = [
+            f":information_source: *FYI: Neue Sandbox wird angelegt* — {customer_name}",
+            f"*Angefragt von:* {requester_name}",
+        ]
+        if origin_permalink:
+            lines.append(f"*Ursprungs-Thread:* {origin_permalink}")
+        return [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': '\n'.join(lines)}}]
     admin_mentions = ' '.join(f'<@{uid}>' for uid in CS_ADMIN_USER_IDS)
     lines = [
         f"💰 {admin_mentions} *Sandbox-Rechnungsstellung nötig* — {customer_name}",

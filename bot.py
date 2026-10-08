@@ -78,6 +78,10 @@ from sandbox_handler import (
     build_existing_sandbox_mirroring_email,
     build_existing_sandbox_result_blocks,
     build_sandbox_admin_billing_blocks,
+    build_sandbox_created_pause_blocks,
+    build_sandbox_package_choice_blocks,
+    build_mirror_done_customer_email,
+    SANDBOX_PACKAGE_CHOICES,
     build_sandbox_clarification_blocks,
     build_sandbox_come_back_later_blocks,
     build_sandbox_contract_type_question_blocks,
@@ -1436,12 +1440,14 @@ def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name,
         return True
 
     if step == 'awaiting_customer_reply':
-        say(
-            blocks=build_sandbox_mirroring_question_blocks(state.get('has_existing_sandbox', False)),
-            text="Möchte der Kunde eine Spiegelung?",
-            thread_ts=thread_ts,
-        )
-        state['step'] = 'awaiting_scope_choice'
+        _after_customer_reply(say, channel, thread_ts, state)
+        return True
+
+    if step == 'awaiting_sandbox_created':
+        if re.search(r'\b(erstellt|angelegt|fertig|done|ist da)\b', text or '', re.IGNORECASE):
+            _ask_mirroring_after_creation(say, thread_ts, state)
+        else:
+            say(text="Klick bitte auf „Sandbox ist erstellt“, sobald die Sandbox angelegt ist 👆", thread_ts=thread_ts)
         return True
 
     if step == 'awaiting_scope_choice':
@@ -2945,7 +2951,7 @@ def handle_mirror_request_create(ack, body, client):
             _remove_reaction(client, channel, data['t'], 'cs-admin-bot')
             _add_reaction(client, channel, data['t'], 'status_in_progress')
             set_issue_property(ticket['key'], MIRROR_PROPERTY,
-                               {'channel': channel, 'ts': data['t'], 'notify': user_id,
+                               {'channel': channel, 'ts': data['t'], 'notify': user_id, 'sandbox_url': data.get('sandbox_url', ''),
                                 'status_ts': msg_ts, 'customer': data['n'], 'done': False})
         logger.info("MIRROR_TICKET " + _json.dumps({'channel': channel, 'ts': data.get('t'),
                     'key': ticket['key'], 'by': user_id}))
@@ -3279,7 +3285,9 @@ def _create_mirroring_ticket_and_report(say, thread_ts, state, info: dict, from_
         else:
             prop = None
         if prop:
-            prop.update({'customer': state.get('customer_name', ''), 'done': False})
+            prop.update({'customer': state.get('customer_name', ''), 'done': False,
+                         'first_name': (state.get('chargebee_result') or {}).get('first_name') or '',
+                         'sandbox_url': info.get('sandbox_url') or ''})
             set_issue_property(ticket['key'], MIRROR_PROPERTY, prop)
     if ticket:
         source = ""
@@ -3324,16 +3332,6 @@ def _request_instance_info_or_create_ticket(say, thread_ts, state):
     state['step'] = 'awaiting_instance_info'
 
 
-def _continue_sandbox_after_video(say, channel, thread_ts, state, scope: str):
-    """Nach dem Zeigen des passenden Loom-Videos (oder direkt, falls kein Video
-    nötig war) geht es weiter wie bisher: bei new_plus_mirror Instanz-Infos für
-    das Jira-Ticket abfragen, sonst ist der Flow für diesen Scope abgeschlossen."""
-    if scope == 'new_plus_mirror':
-        _request_instance_info_or_create_ticket(say, thread_ts, state)
-    else:
-        state['step'] = 'done'
-
-
 def _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope: str):
     """Benachrichtigt #ask-cs-admin, dass für diese Sandbox/Spiegelung eine Rechnung
     nötig ist — als Thread-Antwort wenn der Flow ohnehin schon dort läuft, sonst als
@@ -3349,7 +3347,10 @@ def _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope: str)
             thread_ts=thread_ts,
         )
         if resp and resp.get('ts'):
-            state['billing_ref'] = {'channel': channel, 'ts': resp['ts']}
+            if scope == 'new_only':
+                _add_reaction(client, channel, resp['ts'], 'white_check_mark')
+            else:
+                state['billing_ref'] = {'channel': channel, 'ts': resp['ts']}
         return
 
     origin_permalink = None
@@ -3368,55 +3369,30 @@ def _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope: str)
         )
         if resp and resp.get('ts'):
             state['billing_ref'] = {'channel': _ASK_CS_ADMIN_CHANNEL, 'ts': resp['ts']}
+            if scope == 'new_only':
+                _add_reaction(client, _ASK_CS_ADMIN_CHANNEL, resp['ts'], 'white_check_mark')
+                state.pop('billing_ref', None)
     except Exception as e:
         logger.warning(f"Cross-post to #ask-cs-admin failed: {e}")
 
 
 def _apply_sandbox_scope(say, client, channel, thread_ts, state, scope: str):
-    """Postet die Schritt-2-Anleitung für den aufgelösten Scope und leitet je nach
-    Fall zum Video/zur Vertragsart-Frage oder direkt zur Instanz-Info-Abfrage weiter.
-
-    `scope` ist bereits aufgelöst (siehe `_handle_sandbox_mirroring_choice`) —
-    diese Funktion selbst trifft keine Ja/Nein-Entscheidung mehr, sie war früher
-    der Körper der 3-Wege-Scope-Buttons, ist jetzt aber die gemeinsame Anwendungs-
-    logik für alle Wege dorthin.
-    """
-    say(blocks=build_sandbox_step2_stub_blocks(scope), text="Nächste Schritte", thread_ts=thread_ts)
-
+    """Setzt den Scope nach der Spiegelungsfrage um. Bei neuer Sandbox kamen Video und Pause schon vorher.
+    - new_only: FYI an CS Admin (ohne Button, ✅), Flow fertig
+    - new_plus_mirror: Rechnungs-Post (falls kostenpflichtig), CCS-Ticket mit Daten der neuen Sandbox
+    - mirror_existing: Anleitung, Rechnungs-Post (falls kostenpflichtig), CCS-Ticket"""
+    if scope == 'new_only':
+        _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope)
+        say(text=":white_check_mark: Alles klar, nur die neue Sandbox, keine Spiegelung. CS Admin ist informiert, "
+                 "für dich ist nichts weiter zu tun.", thread_ts=thread_ts)
+        state['step'] = 'done'
+        return
+    if scope == 'mirror_existing':
+        say(blocks=build_sandbox_step2_stub_blocks(scope), text="Nächste Schritte", thread_ts=thread_ts)
     if sandbox_scope_needs_billing(scope, state.get('variant') or {}):
         _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope)
-
-    if scope in ('new_only', 'new_plus_mirror'):
-        # Loom-Anleitung zur Sandbox-Erstellung: kostenlos direkt aus der schon in
-        # Schritt 1 berechneten Preis-Variante ableitbar, sonst muss der CSM sagen,
-        # ob der Kunde Monats- oder Jahresvertrag gewählt hat (weiß nur er/sie).
-        variant = state.get('variant') or {}
-        if sandbox_is_free(variant):
-            say(
-                blocks=build_sandbox_video_blocks(LOOM_SANDBOX_FREE_URL),
-                text="Anleitung: Sandbox erstellen (kostenlos)",
-                thread_ts=thread_ts,
-            )
-            _continue_sandbox_after_video(say, channel, thread_ts, state, scope)
-        elif sandbox_is_standard_l(variant):
-            say(
-                blocks=build_sandbox_video_blocks(LOOM_SANDBOX_STANDARD_L_URL),
-                text="Anleitung: Sandbox erstellen (Standard L)",
-                thread_ts=thread_ts,
-            )
-            _continue_sandbox_after_video(say, channel, thread_ts, state, scope)
-        else:
-            say(
-                blocks=build_sandbox_contract_type_question_blocks(),
-                text="Monats- oder Jahresvertrag?",
-                thread_ts=thread_ts,
-            )
-            state['pending_video_scope'] = scope
-            state['step'] = 'awaiting_contract_type'
-    elif scope == 'mirror_existing':
-        # Instanz-Werte zuerst aus dem Instance Manager (CSM-MCP); nur was dort fehlt,
-        # wird beim CSM erfragt (awaiting_instance_info, siehe _advance_sandbox_thread).
-        _request_instance_info_or_create_ticket(say, thread_ts, state)
+    # Instanz-Werte zuerst aus dem Instance Manager (CSM-MCP); nur was dort fehlt, wird beim CSM erfragt.
+    _request_instance_info_or_create_ticket(say, thread_ts, state)
 
 
 def _handle_sandbox_contract_type(ack, body, say, client, contract_type: str):
@@ -3440,8 +3416,7 @@ def _handle_sandbox_contract_type(ack, body, say, client, contract_type: str):
         text=f"Anleitung: Sandbox erstellen ({contract_type})",
         thread_ts=thread_ts,
     )
-    scope = state.pop('pending_video_scope', 'new_only')
-    _continue_sandbox_after_video(say, channel, thread_ts, state, scope)
+    _pause_until_sandbox_created(say, thread_ts, state)
 
 
 @app.action("sandbox_contract_monthly")
@@ -3598,6 +3573,101 @@ def _billing_thread_state(slack_client, channel: str, post_ts: str) -> dict:
     return st
 
 
+def _after_customer_reply(say, channel, thread_ts, state):
+    """Kunde hat geantwortet. Bestehende Sandbox: direkt die Spiegelungsfrage. Neue Sandbox: erst das passende
+    Anleitungsvideo (kostenlos / Standard L direkt, sonst Rückfrage Monats- oder Jahresvertrag), danach Pause bis
+    die Sandbox erstellt ist, erst dann die Spiegelungsfrage (für die Spiegelung muss die Sandbox existieren)."""
+    if state.get('has_existing_sandbox'):
+        say(blocks=build_sandbox_mirroring_question_blocks(True), text="Möchte der Kunde eine Spiegelung?",
+            thread_ts=thread_ts)
+        state['step'] = 'awaiting_scope_choice'
+        return
+    variant = state.get('variant') or {}
+    if sandbox_is_free(variant):
+        say(blocks=build_sandbox_video_blocks(LOOM_SANDBOX_FREE_URL), text="Anleitung: Sandbox erstellen (kostenlos)",
+            thread_ts=thread_ts)
+        _pause_until_sandbox_created(say, thread_ts, state)
+    elif sandbox_is_standard_l(variant):
+        say(blocks=build_sandbox_video_blocks(LOOM_SANDBOX_STANDARD_L_URL),
+            text="Anleitung: Sandbox erstellen (Standard L)", thread_ts=thread_ts)
+        _pause_until_sandbox_created(say, thread_ts, state)
+    else:
+        say(blocks=build_sandbox_contract_type_question_blocks(), text="Monats- oder Jahresvertrag?",
+            thread_ts=thread_ts)
+        state['step'] = 'awaiting_contract_type'
+
+
+def _pause_until_sandbox_created(say, thread_ts, state):
+    say(blocks=build_sandbox_created_pause_blocks(), text="Sandbox anlegen, dann bestätigen", thread_ts=thread_ts)
+    state['step'] = 'awaiting_sandbox_created'
+
+
+def _ask_mirroring_after_creation(say, thread_ts, state):
+    say(blocks=build_sandbox_mirroring_question_blocks(False), text="Möchte der Kunde eine Spiegelung?",
+        thread_ts=thread_ts)
+    state['step'] = 'awaiting_scope_choice'
+
+
+@app.action("sandbox_created")
+def handle_sandbox_created(ack, body, say, client):
+    """Button: Sandbox ist erstellt → weiter mit der Spiegelungsfrage."""
+    ack()
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    state = _pending_sandbox.get((channel, thread_ts)) if thread_ts else None
+    if not state or state.get('step') != 'awaiting_sandbox_created':
+        say(text=":wave: Kein aktiver Sandbox-Flow in diesem Thread mehr — bitte die Anfrage neu stellen.",
+            thread_ts=thread_ts)
+        return
+    _ask_mirroring_after_creation(say, thread_ts, state)
+
+
+@app.action("sandbox_fit_other_package")
+def handle_sandbox_fit_other_package(ack, body, say, client):
+    """Button: Anderes Success-Paket → Preiskategorie wählen, E-Mail-Entwurf wird neu gebaut."""
+    ack()
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    state = _pending_sandbox.get((channel, thread_ts)) if thread_ts else None
+    if not state or state.get('step') != 'awaiting_fit_confirmation':
+        say(text=":wave: Kein aktiver Sandbox-Flow in diesem Thread mehr — bitte die Anfrage neu stellen.",
+            thread_ts=thread_ts)
+        return
+    say(blocks=build_sandbox_package_choice_blocks(), text="Welche Preiskategorie?", thread_ts=thread_ts)
+
+
+@app.action(re.compile(r"^sandbox_pkg_(free|standard_l|paid)$"))
+def handle_sandbox_package_choice(ack, body, say, client):
+    """Preiskategorie gewählt → Variante setzen, E-Mail-Entwurf neu bauen und erneut zur Freigabe zeigen.
+    Die Variante bestimmt später auch das Anleitungsvideo."""
+    ack()
+    action = (body.get('actions') or [{}])[0]
+    choice = action.get('action_id', '').replace('sandbox_pkg_', '')
+    thread_ts = body.get('message', {}).get('thread_ts') or body.get('message', {}).get('ts')
+    channel = body.get('channel', {}).get('id', '')
+    state = _pending_sandbox.get((channel, thread_ts)) if thread_ts else None
+    if not state or state.get('step') != 'awaiting_fit_confirmation':
+        say(text=":wave: Kein aktiver Sandbox-Flow in diesem Thread mehr — bitte die Anfrage neu stellen.",
+            thread_ts=thread_ts)
+        return
+    label, sandbox_key = SANDBOX_PACKAGE_CHOICES[choice]
+    old = state.get('variant') or {}
+    spiegelung_key = old.get('spiegelung_key') or 'kein_servicepaket'
+    variant = {'mode': 'standard', 'sandbox_key': sandbox_key, 'spiegelung_key': spiegelung_key,
+               'override_reason': 'manual_package'}
+    cb = state.get('chargebee_result') or {}
+    email_text = build_customer_email(cb.get('first_name'), cb.get('email'), variant)
+    state.update({'variant': variant, 'email_text': email_text})
+    note = f":arrows_counterclockwise: Neu berechnet für *{label}*."
+    if not old.get('spiegelung_key'):
+        note += " Den Spiegelungs-Absatz bitte kurz prüfen (Standardpreis eingesetzt)."
+    say(text=note, thread_ts=thread_ts)
+    say(blocks=build_sandbox_lookup_result_blocks(state.get('customer_name', ''), cb,
+                                                  state.get('planhat_result') or {}, variant, email_text),
+        text="Sandbox-Anfrage — neuer E-Mail-Entwurf", thread_ts=thread_ts)
+    logger.info("SANDBOX_PACKAGE " + _json.dumps({'channel': channel, 'ts': thread_ts, 'choice': choice}))
+
+
 @app.action("sandbox_customer_replied")
 def handle_sandbox_customer_replied(ack, body, say, client):
     """Button: 'Kunde hat sich zurückgemeldet' — Alternative zur Text-Antwort im
@@ -3616,12 +3686,7 @@ def handle_sandbox_customer_replied(ack, body, say, client):
             thread_ts=thread_ts,
         )
         return
-    say(
-        blocks=build_sandbox_mirroring_question_blocks(state.get('has_existing_sandbox', False)),
-        text="Möchte der Kunde eine Spiegelung?",
-        thread_ts=thread_ts,
-    )
-    state['step'] = 'awaiting_scope_choice'
+    _after_customer_reply(say, channel, thread_ts, state)
 
 
 def _handle_sandbox_mirroring_choice(ack, body, say, client, wants_mirroring: bool):
@@ -4156,6 +4221,7 @@ def _check_mirror_tickets(slack_client) -> None:
                               f"<{url}|{t['key']}>. Du kannst den Kunden jetzt informieren."))
                 except Exception as e:
                     logger.warning(f"origin notify failed for {t['key']}: {e}")
+            _post_customer_mirror_email(slack_client, prop, channel, ts)
             prop['done'] = True
             set_issue_property(t['key'], MIRROR_PROPERTY, prop)
             logger.info("BILLING_READY " + _json.dumps({'key': t['key'], 'channel': channel, 'ts': ts}))
@@ -4174,6 +4240,7 @@ def _check_mirror_tickets(slack_client) -> None:
             continue
         _remove_reaction(slack_client, channel, ts, 'status_in_progress')
         _add_reaction(slack_client, channel, ts, 'white_check_mark')
+        _post_customer_mirror_email(slack_client, prop, channel, ts)
         prop['done'] = True
         set_issue_property(t['key'], MIRROR_PROPERTY, prop)
         logger.info("MIRROR_DONE " + _json.dumps({'key': t['key'], 'channel': channel, 'ts': ts}))
@@ -4208,6 +4275,19 @@ def _remind_open_billing(slack_client) -> None:
                       f"nicht als gestellt bestätigt. Bitte stellen und oben auf „Rechnung gestellt“ klicken."))
         except Exception as e:
             logger.warning(f"billing reminder post failed: {e}")
+
+
+def _post_customer_mirror_email(slack_client, prop: dict, channel: str, ts: str) -> None:
+    """Fertige Kunden-E-Mail nach abgeschlossener Spiegelung zum Rauskopieren; geht in den Thread des CSM
+    (Ursprung), sonst in den Thread, in dem die Spiegelung angefragt wurde."""
+    org = prop.get('origin') or {}
+    ch, th = (org.get('channel'), org.get('ts')) if org.get('channel') and org.get('ts') else (channel, ts)
+    mail = build_mirror_done_customer_email(prop.get('first_name'), prop.get('sandbox_url'))
+    try:
+        slack_client.chat_postMessage(channel=ch, thread_ts=th,
+                                      text=f":email: E-Mail an den Kunden zum Rauskopieren:\n```\n{mail}\n```")
+    except Exception as e:
+        logger.warning(f"customer mirror email post failed: {e}")
 
 
 def _mirror_check_loop() -> None:
