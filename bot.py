@@ -2937,8 +2937,10 @@ def handle_mirror_request_create(ack, body, client):
     if not all(data.get(k) for k in ('n', 'prod_url', 'prod_serial', 'sandbox_url', 'sandbox_serial')):
         _mirror_finish_message(client, channel, msg_ts, ":warning: Daten unvollständig, bitte neu anstoßen.")
         return
+    req_name, req_email = _slack_person(client, user_id)
     ticket = create_sandbox_mirroring_ticket(data['n'], data['prod_url'], data['prod_serial'],
                                              data['sandbox_url'], data['sandbox_serial'],
+                                             requested_by=req_name or None, reporter_email=req_email or None,
                                              slack_link=_slack_permalink(client, channel, data.get('t')))
     who = f"<@{user_id}>"
     if ticket:
@@ -3245,6 +3247,19 @@ def handle_va_select_plan(ack, body, say, client):
                                     state['user_name'], state['parsed'], state.get('subscription'))
 
 
+def _slack_person(client, user_id: str | None) -> tuple[str, str]:
+    """(Name, E-Mail) einer Slack-Person für „Requested by“ und den Jira-Reporter."""
+    if not user_id:
+        return '', ''
+    try:
+        u = (client.users_info(user=user_id) or {}).get('user') or {}
+        prof = u.get('profile') or {}
+        return (prof.get('real_name') or u.get('real_name') or u.get('name') or ''), (prof.get('email') or '')
+    except Exception as e:
+        logger.warning(f"users_info({user_id}) failed: {e}")
+        return '', ''
+
+
 def _slack_permalink(client, channel: str | None, ts: str | None) -> str | None:
     if not (channel and ts):
         return None
@@ -3263,6 +3278,7 @@ def _create_mirroring_ticket_and_report(say, thread_ts, state, info: dict, from_
     ref = state.get('billing_ref') or {}
     slack_link = (_slack_permalink(app.client, ref.get('channel'), ref.get('ts'))
                   or _slack_permalink(app.client, state.get('channel'), thread_ts))
+    req_name, req_email = _slack_person(app.client, state.get('user_id'))
     ticket = create_sandbox_mirroring_ticket(
         state.get('customer_name', ''),
         info['prod_url'],
@@ -3270,6 +3286,8 @@ def _create_mirroring_ticket_and_report(say, thread_ts, state, info: dict, from_
         info['sandbox_url'],
         info['sandbox_serial'],
         slack_link=slack_link,
+        requested_by=req_name or state.get('user_name') or None,
+        reporter_email=req_email or None,
     )
     if ticket:
         # Abschluss-Check (siehe _check_mirror_tickets): bei kostenpflichtigen Fällen im Thread des
