@@ -1122,9 +1122,11 @@ def fetch_instance_info_from_csm(query: str) -> dict:
 
 def create_sandbox_mirroring_ticket(
     customer_name: str, prod_url: str, prod_serial: str, sandbox_url: str, sandbox_serial: str,
-    slack_link: str | None = None,
+    slack_link: str | None = None, requested_by: str | None = None, reporter_email: str | None = None,
 ) -> dict | None:
     """Legt das Jira-Ticket für die Sandbox-Spiegelung im CCS-Projekt an.
+    `requested_by` erscheint als „Requested by“ in der Beschreibung, `reporter_email` wird (falls in Jira
+    eindeutig auffindbar) als Reporter gesetzt, statt des Kontos hinter dem Jira-Token.
 
     Format 1:1 aus dem realen Produktions-Ticket CCS-1956 übernommen: Projekt CCS,
     Issue-Type Task, feste generische Summary, Description mit Kundenname und den
@@ -1150,11 +1152,12 @@ def create_sandbox_mirroring_ticket(
         f"Serial: {sandbox_serial}\n\n"
         # Der Bot legt Tickets nur aus Slack an: Verweis auf den Slack-Verlauf statt auf
         # Zendesk. Tickets aus Zendesk (Pool-Routine, ccs-ticket-text.sh) behalten den Zendesk-Satz.
+        + (f"Requested by: {requested_by}\n\n" if requested_by else "")
         + (f"* Request and further details in Slack: {slack_link}" if slack_link
            else "* Request and further details in the Slack thread of the CS Admin Bot.")
     )
     try:
-        return create_ccs_mirroring_ticket(summary, description)
+        return create_ccs_mirroring_ticket(summary, description, reporter_email=reporter_email)
     except Exception as e:
         logger.warning(f"create_sandbox_mirroring_ticket({customer_name!r}) failed: {e}")
         return None

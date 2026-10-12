@@ -198,7 +198,20 @@ def delete_ticket(issue_key: str) -> dict:
         raise
 
 
-def create_ccs_mirroring_ticket(summary: str, description: str) -> dict:
+def _jira_account_id(email: str | None) -> str | None:
+    if not email:
+        return None
+    try:
+        users = _get_client().search_users(query=email, maxResults=2)
+        exact = [u for u in users if (getattr(u, 'emailAddress', '') or '').lower() == email.lower()]
+        users = exact or users
+        return users[0].accountId if len(users) == 1 else None
+    except Exception as e:
+        print(f"Jira user lookup failed for {email}: {e}")
+        return None
+
+
+def create_ccs_mirroring_ticket(summary: str, description: str, reporter_email: str | None = None) -> dict:
     """Create a Jira Task ticket in the CCS (Customer cloud service) project.
 
     Used for Sandbox-Spiegelung requests from the Sandbox-Anfrage flow — a separate
@@ -214,7 +227,16 @@ def create_ccs_mirroring_ticket(summary: str, description: str) -> dict:
             'description': description,
             'issuetype': {'name': 'Task'},
         }
-        new_issue = _get_client().create_issue(fields=issue_dict)
+        account_id = _jira_account_id(reporter_email)
+        new_issue = None
+        if account_id:
+            try:
+                new_issue = _get_client().create_issue(fields={**issue_dict, 'reporter': {'accountId': account_id}})
+            except Exception as e:
+                # z. B. fehlende Berechtigung „Reporter ändern“: ohne Reporter anlegen, „Requested by“ steht im Text
+                print(f"CCS ticket with reporter failed, retrying without: {e}")
+        if new_issue is None:
+            new_issue = _get_client().create_issue(fields=issue_dict)
         print(f"Created Jira ticket {new_issue.key}")
 
         return {
