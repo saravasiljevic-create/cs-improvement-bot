@@ -45,8 +45,10 @@ _CUSTOMER_LABELED_RE = re.compile(
     re.IGNORECASE,
 )
 _COMPANY_SUFFIX_RE = re.compile(
-    r'([A-ZÄÖÜ][a-zA-ZäöüÄÖÜ\s&.\-]{1,40}'
-    r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?)',
+    # „+“ gehört bei manchen Firmen zum Namen („Huber + Söhne GmbH + Co. KG“), sonst
+    # schneidet die Erkennung am „+“ ab und sucht nur nach „Söhne GmbH“.
+    r'([A-ZÄÖÜ][a-zA-ZäöüÄÖÜ\s&+.\-]{1,40}'
+    r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*[&+]\s*Co\.?\s*KG)?)',
 )
 # Nur "Artikel + häufiges Nomen" am Anfang entfernen ("Der Kunde X" → "X")
 # "The Glow GmbH" bleibt unverändert — "The" ohne folgendes Nomen wird NICHT gestripped
@@ -74,7 +76,7 @@ def _clean_company_name(name: str) -> str:
     # Hinten: alles nach dem rechtlichen Suffix abschneiden
     # Wortgrenzen: ohne sie trifft z.B. "ag" in "Vertragsanpassung" (→ Kunde "Vertrag")
     suffix = re.search(
-        r'\b(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)\b(?:\s*&\s*Co\.?\s*KG)?',
+        r'\b(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)\b(?:\s*[&+]\s*Co\.?\s*KG)?',
         name, re.IGNORECASE,
     )
     if suffix:
