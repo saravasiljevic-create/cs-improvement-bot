@@ -1116,6 +1116,33 @@ def fetch_instance_info_from_csm(query: str) -> dict:
     return info
 
 
+def fetch_sandbox_url_from_chargebee(customer_id: str, api_key: str, site: str) -> str | None:
+    """Fallback, wenn der Instance Manager eine frisch angelegte Sandbox noch nicht kennt:
+    liest die Instanz-URL aus dem Custom Field „instance url“ der aktiven Sandbox-Subscription
+    des Kunden in Chargebee. Nur bei genau einer aktiven Sandbox mit URL, sonst None (nie raten).
+    Die Sandbox-Serial steht nicht in Chargebee, die fragt der Bot weiter beim CSM ab."""
+    if not customer_id or not api_key:
+        return None
+    try:
+        resp = requests.get(
+            f"https://{site}.chargebee.com/api/v2/subscriptions",
+            params={'customer_id[is]': customer_id, 'status[is]': 'active', 'limit': 20},
+            auth=(api_key, ''), timeout=10,
+        )
+        if not resp.ok:
+            return None
+        subs = [e['subscription'] for e in resp.json().get('list', [])]
+    except Exception as e:
+        logger.warning(f"fetch_sandbox_url_from_chargebee({customer_id!r}) failed: {e}")
+        return None
+    urls = [
+        s.get('cf_instance_url') for s in subs
+        if any((i.get('item_price_id') or '').startswith('sandbox-') for i in s.get('subscription_items') or [])
+        and s.get('cf_instance_url')
+    ]
+    return urls[0] if len(urls) == 1 else None
+
+
 # ---------------------------------------------------------------------------
 # Jira-Ticket (Spiegelung) — reales, verifiziertes Format (siehe CCS-1956).
 # ---------------------------------------------------------------------------

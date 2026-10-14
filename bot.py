@@ -92,6 +92,7 @@ from sandbox_handler import (
     build_sandbox_video_blocks,
     create_sandbox_mirroring_ticket,
     fetch_instance_info_from_csm,
+    fetch_sandbox_url_from_chargebee,
     find_chargebee_customer_id_via_csm,
     get_planhat_chargebee_customer_id,
     detect_sandbox_request,
@@ -3337,6 +3338,13 @@ def _request_instance_info_or_create_ticket(say, thread_ts, state):
     chargebee_result = state.get('chargebee_result') or {}
     query = chargebee_result.get('debit_number') or state.get('customer_name', '')
     info = fetch_instance_info_from_csm(query)
+    if not info.get('sandbox_url'):
+        # Frisch angelegte Sandboxen kennt der Instance Manager oft noch nicht, die URL steht
+        # aber schon in Chargebee (Custom Field der Sandbox-Subscription). Serial bleibt offen.
+        sandbox_url = fetch_sandbox_url_from_chargebee(
+            chargebee_result.get('customer_id'), CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+        if sandbox_url:
+            info = {**info, 'sandbox_url': sandbox_url}
     required = ('prod_url', 'prod_serial', 'sandbox_url', 'sandbox_serial')
     if all(info.get(k) for k in required):
         _create_mirroring_ticket_and_report(say, thread_ts, state, info, from_instance_manager=True)
