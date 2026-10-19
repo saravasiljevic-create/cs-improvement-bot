@@ -115,7 +115,7 @@ def open_invoices_reply(text: str, lookup) -> str | None:
         total = sum(i.get('amount_due') or 0 for i in invs)
         body = '\n'.join(lines) + f"\n*Summe offen: {_eur(total)}* ({len(invs)} Rechnung{'en' if len(invs) != 1 else ''})"
     return (f"{head}\n{body}\n\n"
-            "_Automatisch aus Chargebee, nur lesend. Falsche Antwort? `#bot-stop` in den Thread._")
+            "_Automatisch aus Chargebee, nur lesend._")
 
 
 def detect_status_question(text: str) -> bool:
@@ -389,6 +389,5 @@ def build_status_reply(text: str, lookup) -> str | None:
     body = '\n\n'.join('\n'.join(s) for s in sections)
     return (
         f":mag: *Stand aus {source}* (automatisch, nur lesend):\n\n"
-        f"{body}\n\n"
-        "_Das CS Admin Team schaut bei Bedarf noch drauf. Falsche Antwort? `#bot-stop` in den Thread._"
+        f"{body}"
     )
