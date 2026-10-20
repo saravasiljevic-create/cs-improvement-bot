@@ -81,6 +81,7 @@ from sandbox_handler import (
     build_sandbox_created_pause_blocks,
     build_sandbox_package_choice_blocks,
     build_mirror_done_customer_email,
+    build_sandbox_ready_customer_email,
     SANDBOX_PACKAGE_CHOICES,
     build_sandbox_clarification_blocks,
     build_sandbox_come_back_later_blocks,
@@ -3629,9 +3630,24 @@ def _pause_until_sandbox_created(say, thread_ts, state):
 
 
 def _ask_mirroring_after_creation(say, thread_ts, state):
+    _post_sandbox_ready_email(say, thread_ts, state)
     say(blocks=build_sandbox_mirroring_question_blocks(False), text="Möchte der Kunde eine Spiegelung?",
         thread_ts=thread_ts)
     state['step'] = 'awaiting_scope_choice'
+
+
+def _post_sandbox_ready_email(say, thread_ts, state):
+    """Nach „Sandbox ist erstellt“: fertige Kunden-Mail „Sandbox freigeschaltet“ zum Rauskopieren.
+    Instanz-URL aus Chargebee (Custom Field der Sandbox-Subscription), sonst Platzhalter."""
+    cb = state.get('chargebee_result') or {}
+    sandbox_url = fetch_sandbox_url_from_chargebee(cb.get('customer_id'), CHARGEBEE_API_KEY, CHARGEBEE_SITE)
+    if sandbox_url:
+        state['sandbox_url'] = sandbox_url
+    mail = build_sandbox_ready_customer_email(cb.get('first_name'), cb.get('email'), sandbox_url)
+    hint = "" if sandbox_url else (
+        "\n:warning: Instanz-URL noch nicht in Chargebee gefunden, bitte ‹Sandbox-URL› vor dem Versand ersetzen.")
+    say(text=f"✉️ *Kunden-Mail: Sandbox ist freigeschaltet* (zum Rauskopieren){hint}\n```\n{mail}\n```",
+        thread_ts=thread_ts)
 
 
 @app.action("sandbox_created")

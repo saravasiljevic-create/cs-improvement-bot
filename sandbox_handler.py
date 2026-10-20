@@ -638,13 +638,36 @@ def build_mirror_done_customer_email(first_name: str | None, sandbox_url: str | 
     )
 
 
-def _hubspot_reminder_line(planhat_result: dict) -> str:
-    """Hinweis an den CSM, den Chargebee-Kontakt auch in HubSpot zu prüfen —
-    immer als Text, plus Link falls Planhats `custom.Hubspot`-Feld vorhanden ist."""
+def build_sandbox_ready_customer_email(first_name: str | None, decider_email: str | None,
+                                      sandbox_url: str | None) -> str:
+    """E-Mail an den Kunden, sobald die Sandbox erstellt ist (zum Rauskopieren, Feedback Daniel Löffler)."""
+    url = sandbox_url or '‹Sandbox-URL›'
+    email = decider_email or '‹E-Mail des Entscheidungsträgers›'
+    return (
+        f"{_greeting(first_name)}\n\n"
+        f"eure Sandbox ist eingerichtet und unter {url} erreichbar.\n\n"
+        f"Den Link zum Festlegen eures Passworts schicken wir an {email}. Bitte nutzt ihn zeitnah, "
+        "da er nur begrenzt gültig ist. Falls keine E-Mail ankommt oder der Link abgelaufen ist, meldet euch "
+        "einfach kurz, dann senden wir ihn erneut.\n\n"
+        "Weitere Nutzer könnt ihr nach dem ersten Login jederzeit selbst in der Sandbox hinzufügen.\n\n"
+        "Wenn ihr Fragen habt, meldet euch gerne."
+    )
+
+
+def _hubspot_reminder_line(planhat_result: dict, decider_email: str | None = None) -> str:
+    """Hinweis an den CSM, den Chargebee-Kontakt auch in HubSpot zu prüfen, mit konkretem Prüfweg
+    (Feedback Daniel Löffler): Die Login-Mail für die Sandbox geht an den HubSpot-Kontakt mit genau
+    dieser E-Mail-Adresse. Link auf HubSpot, falls Planhats `custom.Hubspot`-Feld vorhanden ist."""
     hubspot_url = planhat_result.get('hubspot_url')
-    if hubspot_url:
-        return f"💡 Bitte prüfen, ob der Chargebee-Kontakt auch in <{hubspot_url}|HubSpot> hinterlegt ist."
-    return "💡 Bitte prüfen, ob der Chargebee-Kontakt auch in HubSpot hinterlegt ist."
+    hubspot = f"<{hubspot_url}|HubSpot>" if hubspot_url else "HubSpot"
+    email = f"`{decider_email}`" if decider_email else "der Chargebee-Kontakt-E-Mail"
+    return (
+        f"💡 *HubSpot prüfen:* In {hubspot} beim Unternehmen unter *Kontakte* muss ein Kontakt mit genau "
+        f"{email} hinterlegt und mit dem Unternehmen verknüpft sein, denn an diese Adresse (Feld „Email ID“ der "
+        "Chargebee-Subscription) geht die Login-Mail. Fehlt er oder ist die Adresse anders geschrieben: vor der "
+        "Sandbox-Anlage anlegen bzw. korrigieren. Kommt keine Login-Mail an oder ist der Link abgelaufen: Kontakt "
+        "in HubSpot öffnen und den Set-Password-Link manuell senden (Meldungen dazu in #hs-loginmail-notification)."
+    )
 
 
 def build_sandbox_lookup_result_blocks(
@@ -656,7 +679,7 @@ def build_sandbox_lookup_result_blocks(
         lines.append(f"*Chargebee-Kontakt (Decider):* {chargebee_result['email']}")
     if planhat_result.get('planhat_url'):
         lines.append(f"*Planhat:* <{planhat_result['planhat_url']}|{planhat_result.get('name', customer_name)}>")
-    lines.append(_hubspot_reminder_line(planhat_result))
+    lines.append(_hubspot_reminder_line(planhat_result, chargebee_result.get('email')))
 
     if variant.get('override_reason') == 'success_package':
         lines.append(":warning: Servicepaket enthält 'Success' → Basis-Variante erzwungen (Datenqualitäts-Fix)")
@@ -693,7 +716,7 @@ def build_existing_sandbox_result_blocks(
         lines.append(f"*Chargebee-Kontakt (Decider):* {chargebee_result['email']}")
     if planhat_result.get('planhat_url'):
         lines.append(f"*Planhat:* <{planhat_result['planhat_url']}|{planhat_result.get('name', customer_name)}>")
-    lines.append(_hubspot_reminder_line(planhat_result))
+    lines.append(_hubspot_reminder_line(planhat_result, chargebee_result.get('email')))
 
     if variant.get('override_reason') == 'success_package':
         lines.append(":warning: Servicepaket enthält 'Success' → Basis-Variante erzwungen (Datenqualitäts-Fix)")
