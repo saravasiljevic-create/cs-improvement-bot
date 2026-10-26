@@ -624,7 +624,7 @@ def _ts_to_date(ts: int | None) -> str:
 
 
 _LEGAL_SUFFIX_RE = re.compile(
-    r'\s*(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*&\s*Co\.?\s*KG)?\s*$',
+    r'\s*(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV|GbR|OHG|e\.\s?K\.)(?:\s*&\s*Co\.?\s*KG)?\s*$',
     re.IGNORECASE,
 )
 
@@ -659,6 +659,8 @@ def _chargebee_customer_search(base: str, auth: tuple, customer_name: str, lenie
     `_names_match` — Default bleibt exakt wie bisher, keine Verhaltensänderung
     für bestehende Aufrufer.
     """
+    # Slack liefert '&' als '&amp;' — sonst findet "Jörg & Michael Hunger GbR" nichts.
+    customer_name = _html.unescape(customer_name or '')
     name_no_suffix = _strip_legal_suffix(customer_name)
 
     first_word = customer_name.split()[0] if customer_name else ''

@@ -48,7 +48,7 @@ _COMPANY_SUFFIX_RE = re.compile(
     # „+“ gehört bei manchen Firmen zum Namen („Huber + Söhne GmbH + Co. KG“), sonst
     # schneidet die Erkennung am „+“ ab und sucht nur nach „Söhne GmbH“.
     r'([A-ZÄÖÜ][a-zA-ZäöüÄÖÜ\s&+.\-]{1,40}'
-    r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV)(?:\s*[&+]\s*Co\.?\s*KG)?)',
+    r'(?:GmbH|AG|Ltd\.?|SE|KG|UG|LLC|Inc\.?|SAS|NV|BV|GbR|OHG|e\.\s?K\.)(?:\s*[&+]\s*Co\.?\s*KG)?)',
 )
 # Nur "Artikel + häufiges Nomen" am Anfang entfernen ("Der Kunde X" → "X")
 # "The Glow GmbH" bleibt unverändert — "The" ohne folgendes Nomen wird NICHT gestripped

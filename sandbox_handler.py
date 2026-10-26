@@ -11,7 +11,7 @@ import re
 
 import requests
 
-from config import CS_ADMIN_USER_IDS
+from config import CHARGEBEE_SITE, CS_ADMIN_USER_IDS
 from text_utils import extract_company_name
 from vertragsanpassung_handler import (
     _chargebee_customer_search,
@@ -184,7 +184,16 @@ def get_chargebee_contact_email_by_id(customer_id: str, api_key: str, site: str)
     try:
         resp = requests.get(f"{base}/customers/{customer_id}", auth=auth, timeout=10)
         if not resp.ok:
-            return None
+            # Oft wird statt der Kunden- die Subscription-ID genannt → Kunde darüber auflösen.
+            sub = requests.get(f"{base}/subscriptions/{customer_id}", auth=auth, timeout=10)
+            if not sub.ok:
+                return None
+            cid = (sub.json().get('subscription') or {}).get('customer_id')
+            if not cid:
+                return None
+            resp = requests.get(f"{base}/customers/{cid}", auth=auth, timeout=10)
+            if not resp.ok:
+                return None
         customer = resp.json().get('customer') or {}
     except Exception as e:
         logger.warning(f"get_chargebee_contact_email_by_id({customer_id!r}) failed: {e}")
@@ -197,15 +206,22 @@ def get_chargebee_contact_email_by_id(customer_id: str, api_key: str, site: str)
 # Erkennt einen direkt gepasteten Chargebee-Kunden- oder Planhat-Firmen-Link im
 # Text — damit der CSM bei Mehrdeutigkeit/keinem Treffer einfach den Link zum
 # richtigen Datensatz schicken kann, statt (erfolglos) nochmal den Namen zu tippen.
-_CB_CUSTOMER_URL_RE = re.compile(r'chargebee\.com/d/customers/(?P<id>[^\s/\|><?]+)', re.IGNORECASE)
+# Nur echte ID-Zeichen: Slack kürzt Link-Labels mit „…“ ("…/d/customers/…"), das darf nicht als ID gelten.
+_CB_CUSTOMER_URL_RE = re.compile(r'chargebee\.com/d/customers/(?P<id>[A-Za-z0-9_-]{5,})', re.IGNORECASE)
 _PLANHAT_PROFILE_URL_RE = re.compile(r'planhat\.com/\S*[?&]profile=Company\.(?P<id>[a-zA-Z0-9]+)', re.IGNORECASE)
+# Nackte Chargebee-Kunden-ID ohne Link ("die Chargebee-ID lautet 198epbVSqKmM22Aix").
+# Chargebee-IDs sind 14–20 Zeichen, gemischt Groß/Klein mit Ziffern — so werden normale
+# Wörter und Debitorennummern nicht erfasst. Ob die ID existiert, prüft der Lookup selbst.
+_CB_BARE_ID_RE = re.compile(
+    r'(?<![\w/.-])(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])(?P<id>[A-Za-z0-9]{14,20})(?![\w/.-])'
+)
 
 
 def extract_direct_references(text: str) -> dict:
     """Extrahiert eine Chargebee-Kunden-ID und/oder Planhat-Firmen-ID aus gepasteten
-    Links im Text. Leeres Dict wenn keiner der beiden Link-Typen gefunden wurde."""
+    Links im Text (Chargebee-ID auch ohne Link). Leeres Dict wenn keiner der beiden Link-Typen gefunden wurde."""
     result = {}
-    m = _CB_CUSTOMER_URL_RE.search(text)
+    m = _CB_CUSTOMER_URL_RE.search(text) or _CB_BARE_ID_RE.search(text)
     if m:
         result['chargebee_customer_id'] = m.group('id')
     m = _PLANHAT_PROFILE_URL_RE.search(text)
@@ -850,6 +866,53 @@ def sandbox_scope_needs_billing(scope: str, variant: dict) -> bool:
     return True
 
 
+# Kommunizierte Preise je Variante (identisch zu den Texten in _SANDBOX_PARAGRAPHS /
+# _SPIEGELUNG_PARAGRAPHS), damit CS Admin die Rechnung ohne Nachschlagen stellen kann.
+_SANDBOX_COST = {
+    'kein_neues_servicepaket_oder_standard_sm': {'monthly': '130 €/Monat (Monatsvertrag)',
+                                                  'annual': '99 €/Monat (Jahresvertrag)'},
+    'standard_l': {'monthly': '49 €/Monat (Standard L)'},
+    'growth_s_premium_m': {'monthly': 'kostenfrei'},
+}
+_SPIEGELUNG_COST = {
+    'kein_servicepaket': 'einmalig 149 €',
+    'standard_s_l': 'einmalig 299 €',
+    'growth_s_l': 'einmalig 199 €',
+    'premium_s_m': 'einmalig 99 €',
+    'premium_l': 'kostenfrei',
+}
+
+
+def sandbox_billing_cost_line(scope: str, variant: dict, contract_type: str | None = None) -> str:
+    """Kurzzeile mit den dem Kunden kommunizierten Kosten für den Rechnungs-Post,
+    z.B. "Sandbox 130 €/Monat (Monatsvertrag) · Spiegelung einmalig 199 €".
+    Leer, wenn die Variante unbekannt ist (dann lieber nichts als etwas Falsches)."""
+    variant = variant or {}
+    parts = []
+    if scope in ('new_only', 'new_plus_mirror'):
+        if variant.get('mode') == 'combined_premium_l':
+            parts.append('Sandbox kostenfrei')
+        else:
+            prices = _SANDBOX_COST.get(variant.get('sandbox_key') or '')
+            if prices:
+                if contract_type in prices:
+                    parts.append(f"Sandbox {prices[contract_type]}")
+                else:
+                    parts.append('Sandbox ' + ' bzw. '.join(prices.values()))
+    if scope in ('new_plus_mirror', 'mirror_existing'):
+        if variant.get('mode') == 'combined_premium_l':
+            parts.append('Spiegelung kostenfrei')
+        else:
+            cost = _SPIEGELUNG_COST.get(variant.get('spiegelung_key') or '')
+            if cost:
+                parts.append(f"Spiegelung {cost}")
+    return ' · '.join(parts)
+
+
+def chargebee_customer_url(customer_id: str | None) -> str:
+    return f"https://{CHARGEBEE_SITE}.chargebee.com/d/customers/{customer_id}" if customer_id else ''
+
+
 _SCOPE_LABELS = {
     'new_only': 'Nur neue Sandbox anlegen',
     'new_plus_mirror': 'Neue Sandbox anlegen + Spiegelung',
@@ -858,7 +921,8 @@ _SCOPE_LABELS = {
 
 
 def build_sandbox_admin_billing_blocks(
-    customer_name: str, scope: str, requester_name: str, origin_permalink: str | None = None
+    customer_name: str, scope: str, requester_name: str, origin_permalink: str | None = None,
+    chargebee_customer_id: str | None = None, cost_line: str = '',
 ) -> list[dict]:
     """CS-Admin-Benachrichtigung: eine (neue oder gespiegelte) Sandbox wird
     umgesetzt und muss berechnet werden. `origin_permalink` wird nur beim
@@ -879,6 +943,10 @@ def build_sandbox_admin_billing_blocks(
         f"*Szenario:* {_SCOPE_LABELS.get(scope, scope)}",
         f"*Angefragt von:* {requester_name}",
     ]
+    if cost_line:
+        lines.append(f"*Kommunizierte Kosten:* {cost_line}")
+    if chargebee_customer_id:
+        lines.append(f"*Chargebee:* {chargebee_customer_url(chargebee_customer_id)}")
     if origin_permalink:
         lines.append(f"*Ursprungs-Thread:* {origin_permalink}")
     text = '\n'.join(lines)
