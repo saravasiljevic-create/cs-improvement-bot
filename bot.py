@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from html import unescape as _html_unescape
 from text_utils import normalize_slack_text
 import json as _json
 from status_handler import detect_status_question, extract_invoice_ids, build_status_reply, detect_open_invoice_question, open_invoices_reply
@@ -109,6 +110,8 @@ from sandbox_handler import (
     sandbox_is_free,
     sandbox_is_standard_l,
     sandbox_scope_needs_billing,
+    sandbox_billing_cost_line,
+    chargebee_customer_url,
 )
 
 # Erkennt Chargebee-Links (Subscription ODER Customer) und Standard-IDs
@@ -1406,7 +1409,7 @@ def _advance_sandbox_thread(say, client, channel, thread_ts, user_id, user_name,
 
     step = state.get('step')
     if step == 'awaiting_clarification':
-        corrected_text = normalize_slack_text(text or '').strip()
+        corrected_text = normalize_slack_text(_html_unescape(text or '')).strip()
         # Nur die anfragende Person beantwortet die Rückfrage, und nur mit einem Namen
         # oder Link — sonst hat der Bot live jede Thread-Unterhaltung (auch zwischen
         # CS-Admins) als Firmennamen in Chargebee gesucht.
@@ -3306,6 +3309,10 @@ def _create_mirroring_ticket_and_report(say, thread_ts, state, info: dict, from_
             prop = None
         if prop:
             prop.update({'customer': state.get('customer_name', ''), 'done': False,
+                         'cb_customer_id': (state.get('chargebee_result') or {}).get('customer_id') or '',
+                         'costs': sandbox_billing_cost_line(state.get('sandbox_scope') or '',
+                                                            state.get('variant') or {},
+                                                            state.get('contract_type')),
                          'first_name': (state.get('chargebee_result') or {}).get('first_name') or '',
                          'sandbox_url': info.get('sandbox_url') or ''})
             set_issue_property(ticket['key'], MIRROR_PROPERTY, prop)
@@ -3366,10 +3373,14 @@ def _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope: str)
     anderer Channel), damit CS Admin den vollen Kontext hat."""
     customer_name = state.get('customer_name', '')
     requester_name = state.get('user_name', '')
+    extra = {
+        'chargebee_customer_id': (state.get('chargebee_result') or {}).get('customer_id'),
+        'cost_line': sandbox_billing_cost_line(scope, state.get('variant') or {}, state.get('contract_type')),
+    }
 
     if channel == _ASK_CS_ADMIN_CHANNEL:
         resp = say(
-            blocks=build_sandbox_admin_billing_blocks(customer_name, scope, requester_name),
+            blocks=build_sandbox_admin_billing_blocks(customer_name, scope, requester_name, **extra),
             text="Sandbox-Rechnungsstellung nötig",
             thread_ts=thread_ts,
         )
@@ -3391,7 +3402,8 @@ def _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope: str)
     try:
         resp = client.chat_postMessage(
             channel=_ASK_CS_ADMIN_CHANNEL,
-            blocks=build_sandbox_admin_billing_blocks(customer_name, scope, requester_name, origin_permalink),
+            blocks=build_sandbox_admin_billing_blocks(customer_name, scope, requester_name, origin_permalink,
+                                                      **extra),
             text="Sandbox-Rechnungsstellung nötig",
         )
         if resp and resp.get('ts'):
@@ -3408,6 +3420,7 @@ def _apply_sandbox_scope(say, client, channel, thread_ts, state, scope: str):
     - new_only: FYI an CS Admin (ohne Button, ✅), Flow fertig
     - new_plus_mirror: Rechnungs-Post (falls kostenpflichtig), CCS-Ticket mit Daten der neuen Sandbox
     - mirror_existing: Anleitung, Rechnungs-Post (falls kostenpflichtig), CCS-Ticket"""
+    state['sandbox_scope'] = scope
     if scope == 'new_only':
         _notify_cs_admin_billing(say, client, channel, thread_ts, state, scope)
         say(text=":white_check_mark: Alles klar, nur die neue Sandbox, keine Spiegelung. CS Admin ist informiert, "
@@ -3437,6 +3450,7 @@ def _handle_sandbox_contract_type(ack, body, say, client, contract_type: str):
         )
         return
 
+    state['contract_type'] = contract_type
     loom_url = LOOM_SANDBOX_MONTHLY_URL if contract_type == 'monthly' else LOOM_SANDBOX_ANNUAL_URL
     say(
         blocks=build_sandbox_video_blocks(loom_url),
@@ -4244,6 +4258,10 @@ def _check_mirror_tickets(slack_client) -> None:
             line = (f":white_check_mark: {who} die Spiegelung für {prop.get('customer') or 'den Kunden'} "
                     f"ist abgeschlossen: <{url}|{t['key']}> {detail}. Bitte jetzt die Rechnung stellen "
                     f"und hier bestätigen:")
+            if prop.get('costs'):
+                line += f"\n*Kommunizierte Kosten:* {prop['costs']}"
+            if prop.get('cb_customer_id'):
+                line += f"\n*Chargebee:* {chargebee_customer_url(prop['cb_customer_id'])}"
             try:
                 slack_client.chat_postMessage(
                     channel=channel, thread_ts=ts, text=line,
