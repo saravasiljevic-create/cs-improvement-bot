@@ -207,7 +207,8 @@ def get_chargebee_contact_email_by_id(customer_id: str, api_key: str, site: str)
 # Text — damit der CSM bei Mehrdeutigkeit/keinem Treffer einfach den Link zum
 # richtigen Datensatz schicken kann, statt (erfolglos) nochmal den Namen zu tippen.
 # Nur echte ID-Zeichen: Slack kürzt Link-Labels mit „…“ ("…/d/customers/…"), das darf nicht als ID gelten.
-_CB_CUSTOMER_URL_RE = re.compile(r'chargebee\.com/d/customers/(?P<id>[A-Za-z0-9_-]{5,})', re.IGNORECASE)
+# Subscription-Links ebenfalls: get_chargebee_contact_email_by_id löst Subscription-IDs auf den Kunden auf.
+_CB_CUSTOMER_URL_RE = re.compile(r'chargebee\.com/d/(?:customers|subscriptions)/(?P<id>[A-Za-z0-9_-]{5,})', re.IGNORECASE)
 _PLANHAT_PROFILE_URL_RE = re.compile(r'planhat\.com/\S*[?&]profile=Company\.(?P<id>[a-zA-Z0-9]+)', re.IGNORECASE)
 # Nackte Chargebee-Kunden-ID ohne Link ("die Chargebee-ID lautet 198epbVSqKmM22Aix").
 # Chargebee-IDs sind 14–20 Zeichen, gemischt Groß/Klein mit Ziffern — so werden normale

@@ -3102,6 +3102,26 @@ def handle_menu_button(ack, body, client, say):
             say(text=reply, thread_ts=ctx.get('t'))
             logger.info("MENU " + _json.dumps({'kind': kind, 'channel': ctx.get('c'), 'via': 'thread', 'name': name}))
             return
+    # Sandbox: Kunde aus dem Thread bekannt (Name oder Chargebee-/Planhat-Link) → direkt starten,
+    # ohne Formular. Links haben Vorrang vor dem Namen (eindeutig per ID).
+    if kind == 'sandbox' and (name or tc['links']):
+        def _say(**kw):
+            kw.setdefault('channel', ctx.get('c'))
+            return client.chat_postMessage(**kw)
+        thread_text = '\n'.join(tc['texts'])
+        sb_text = ' '.join(filter(None, [f"Sandbox für {name}" if name else 'Sandbox', *tc['links']]))
+        user_id = ctx['u']
+        logger.info("MENU " + _json.dumps({'kind': kind, 'channel': ctx.get('c'), 'via': 'thread', 'name': name}))
+        try:
+            if detect_mirror_request(thread_text):
+                _post_mirror_request(_say, client, ctx.get('c'), ctx.get('t'), thread_text + ' ' + sb_text)
+            else:
+                _handle_sandbox_intent(_say, client, ctx.get('c'), ctx.get('t'), user_id,
+                                       get_user_name(client, user_id), sb_text)
+        except Exception as e:
+            logger.exception("menu sandbox (thread) failed")
+            _say(thread_ts=ctx.get('t'), text=f":warning: Das hat nicht geklappt: {e}")
+        return
     # Sonst Formular, vorbefüllt mit Kunde bzw. Thread-Inhalt
     prefill = {}
     if kind in ('lookup', 'invoices') and name:
@@ -3160,6 +3180,9 @@ def handle_menu_submit(ack, body, client, view):
             say(thread_ts=thread_ts, text=reply or f":thinking_face: Ich konnte „{text}“ keinem Kunden eindeutig "
                 "zuordnen. Probier es mit Kundennummer oder Chargebee-Link.")
         elif kind == 'sandbox':
+            if ctx.get('n') and not parse_sandbox_request(text).get('customer_name') \
+                    and not extract_direct_references(normalize_slack_text(text)):
+                text = f"{text}\nSandbox für {ctx['n']}"
             if detect_mirror_request(text):
                 _post_mirror_request(say, client, channel, thread_ts, text)
             else:
