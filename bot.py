@@ -1345,6 +1345,14 @@ def _finish_sandbox_lookup(say, channel, ts, user_id, user_name, customer_name, 
 def _handle_sandbox_intent(say, client, channel, ts, user_id, user_name, text):
     """Parst die Sandbox-Anfrage und startet den Lookup — siehe _run_sandbox_lookup."""
     parsed = parse_sandbox_request(text)
+    # Chargebee-/Planhat-Link oder Chargebee-ID direkt in der Anfrage → per ID statt per Namen.
+    refs = extract_direct_references(normalize_slack_text(_html_unescape(text or '')))
+    if refs:
+        _run_sandbox_lookup_by_reference(
+            say, client, channel, ts, user_id, user_name,
+            refs, parsed.get('wants_spiegelung'), parsed.get('custom_code'),
+        )
+        return
     customer_name = parsed.get('customer_name')
     if not customer_name:
         say(
@@ -3985,9 +3993,17 @@ def handle_app_mention(event, say, client):
         )
         return
 
+    # Sandbox-/Spiegelungs-Anfrage direkt per @Bot ("@CS Admin Bot Sandbox erstellen für X")
+    # → Sandbox-Flow statt Chat. Live war das sonst im Chat gelandet und hat nach "Jörg &amp"
+    # gesucht.
+    if re.search(r'\bsandbox|spiegel', clean_lower):
+        _handle_sandbox_intent(say, client, event.get('channel', ''), thread_ts, user_id, user_name,
+                               _html_unescape(clean_mention))
+        return
+
     # CS Admin mit echter Frage: Chat nutzen
     if user_id in CS_ADMIN_USER_IDS:
-        _handle_chat(raw_text, user_id, user_name, say, thread_ts, is_dm=False)
+        _handle_chat(_html_unescape(raw_text), user_id, user_name, say, thread_ts, is_dm=False)
         return
 
     # Alle anderen ohne erkennbares Keyword: kurze Hilfe
