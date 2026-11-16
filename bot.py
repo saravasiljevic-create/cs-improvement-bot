@@ -4166,25 +4166,61 @@ except ImportError:
 _ASK_CS_ADMIN_CHANNEL = 'C06MK1QGMTR'
 _REMINDER_TAG_IDS = {'U07TRKK8BH9', 'U07G83YH6RW'}  # Sara, Mirjam
 _REMINDER_MARKER = 'noch-offen-reminder'
+_REMINDER_MAX = 3            # höchstens drei Erinnerungen je Anfrage
+_REMINDER_LOOKBACK_DAYS = 14  # reicht für 3 Werktage plus Wochenende und Feiertage
+_REMINDER_TEXTS = {
+    1: "diese Anfrage ist noch offen und wurde bisher nicht beantwortet.",
+    2: "zweite Erinnerung: diese Anfrage ist seit 2 Werktagen offen.",
+    3: "dritte und letzte Erinnerung: diese Anfrage ist seit 3 Werktagen offen.",
+}
+
+
+def _business_hours_between(start: datetime, end: datetime) -> float:
+    """Stunden zwischen start und end, ohne Samstag und Sonntag (Europe/Berlin)."""
+    if end <= start:
+        return 0.0
+    total = 0.0
+    cur = start
+    while cur < end:
+        next_midnight = (cur + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        seg_end = min(next_midnight, end)
+        if cur.weekday() < 5:
+            total += (seg_end - cur).total_seconds() / 3600
+        cur = seg_end
+    return total
+
+
+def _is_unanswered_reminder(reply: dict) -> bool:
+    if (reply.get('metadata') or {}).get('event_type') == _REMINDER_MARKER.replace('-', '_'):
+        return True
+    text = reply.get('text') or ''
+    return _REMINDER_MARKER in text or (
+        bool(reply.get('bot_id')) and 'diese Anfrage ist' in text and 'offen' in text)
 
 
 def _check_unanswered_questions(slack_client) -> None:
+    """Werktags 8 Uhr: Anfragen in #ask-cs-admin ohne Antwort aus dem CS-Admin-Team.
+    Erste Erinnerung, wenn die Anfrage mindestens 1 Werktag (24 Std. ohne Wochenende) offen ist,
+    zweite nach 2, dritte nach 3 Werktagen. Danach keine weitere Erinnerung."""
     now = datetime.now(tz=_BERLIN_TZ)
-    # On Mondays look back 72h to catch Friday messages
-    lookback_hours = 72 if now.weekday() == 0 else 48
-    oldest = (now - timedelta(hours=lookback_hours)).timestamp()
+    oldest = (now - timedelta(days=_REMINDER_LOOKBACK_DAYS)).timestamp()
 
+    messages, cursor = [], None
     try:
-        history = slack_client.conversations_history(
-            channel=_ASK_CS_ADMIN_CHANNEL,
-            oldest=str(oldest),
-            limit=50,
-        )
+        while True:
+            kwargs = {'channel': _ASK_CS_ADMIN_CHANNEL, 'oldest': str(oldest), 'limit': 200}
+            if cursor:
+                kwargs['cursor'] = cursor
+            history = slack_client.conversations_history(**kwargs)
+            messages.extend(history.get('messages', []))
+            cursor = (history.get('response_metadata') or {}).get('next_cursor')
+            if not history.get('has_more') or not cursor:
+                break
     except Exception as e:
         logger.warning(f"ask-cs-admin history fetch failed: {e}")
         return
 
-    for msg in history.get('messages', []):
+    for msg in messages:
         if msg.get('bot_id') or msg.get('subtype'):
             continue
         ts = msg.get('ts', '')
@@ -4202,41 +4238,47 @@ def _check_unanswered_questions(slack_client) -> None:
         if reactions & {'white_check_mark', 'heavy_check_mark', 'status_in_progress'}:
             continue
 
-        # Check thread for CS admin reply or existing reminder from this bot
-        already_reminded = False
+        # Wie viele Werktage ist die Anfrage offen? Fällig ist Erinnerung Nr. 1, 2, 3 nach
+        # 1, 2, 3 Werktagen. Eine Anfrage von gestern Abend bekommt heute früh noch keine.
+        open_hours = _business_hours_between(datetime.fromtimestamp(float(ts), tz=_BERLIN_TZ), now)
+        due = min(int(open_hours // 24), _REMINDER_MAX)
+        if due < 1:
+            continue
+
+        # Thread prüfen: Antwort aus dem CS-Admin-Team oder schon gesendete Erinnerungen
+        reminders_sent = 0
         has_admin_reply = False
         if msg.get('reply_count', 0) > 0:
             try:
                 replies = slack_client.conversations_replies(
-                    channel=_ASK_CS_ADMIN_CHANNEL, ts=ts, limit=30, include_all_metadata=True,
+                    channel=_ASK_CS_ADMIN_CHANNEL, ts=ts, limit=100, include_all_metadata=True,
                 )
                 for reply in replies.get('messages', [])[1:]:
                     if reply.get('user') in CS_ADMIN_USER_IDS:
                         has_admin_reply = True
                         break
-                    if (_REMINDER_MARKER in (reply.get('text') or '')
-                            or (reply.get('metadata') or {}).get('event_type') == _REMINDER_MARKER.replace('-', '_')):
-                        already_reminded = True
-                        break
+                    if _is_unanswered_reminder(reply):
+                        reminders_sent += 1
             except Exception as e:
                 logger.warning(f"Thread fetch for {ts} failed: {e}")
                 continue
 
-        if has_admin_reply or already_reminded:
+        if has_admin_reply or reminders_sent >= due:
             continue
 
+        number = reminders_sent + 1
         mentions = ' '.join(f'<@{uid}>' for uid in sorted(_REMINDER_TAG_IDS))
+        icon = ':wave:' if number == 1 else ':bell:'
         try:
             slack_client.chat_postMessage(
                 channel=_ASK_CS_ADMIN_CHANNEL,
                 thread_ts=ts,
-                text=(
-                    f":wave: {mentions} — diese Anfrage ist noch offen und wurde bisher nicht beantwortet."
-                ),
+                text=f"{icon} {mentions} — {_REMINDER_TEXTS[number]}",
                 # Unsichtbare Markierung (früher als <!-- … --> im Text, das zeigte Slack sichtbar an)
-                metadata={'event_type': _REMINDER_MARKER.replace('-', '_'), 'event_payload': {'ts': ts}},
+                metadata={'event_type': _REMINDER_MARKER.replace('-', '_'),
+                          'event_payload': {'ts': ts, 'number': number}},
             )
-            logger.info(f"Unanswered reminder posted for {ts}")
+            logger.info(f"Unanswered reminder {number} posted for {ts}")
         except Exception as e:
             logger.warning(f"Reminder post failed for {ts}: {e}")
 
