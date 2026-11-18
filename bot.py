@@ -4054,6 +4054,13 @@ def handle_reaction_added(event, say, client):
     if not ts:
         return
 
+    # --- 👀 von CS Admin → eigenes 👀 des Bots entfernen (ein Mensch hat übernommen) ---
+    # reactions_remove entfernt nur die Reaktion des Bots, das 👀 des Admins bleibt stehen.
+    if reaction == 'eyes' and user_id in CS_ADMIN_USER_IDS:
+        logger.info(f"EYES_HANDOVER: {user_id} hat 👀 gesetzt auf {channel}/{ts}, Bot-👀 wird entfernt")
+        _remove_reaction(client, channel, ts, 'eyes')
+        return
+
     # --- Feedback-Emoji: 🆘 auf Bot-Nachrichten → Fehler melden ---
     if reaction == FEEDBACK_EMOJI:
         user_name = get_user_name(client, user_id)
