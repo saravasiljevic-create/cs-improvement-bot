@@ -1655,6 +1655,15 @@ def _handle_message_core(event, say, client):
     if thread_ts and (channel, thread_ts) in _muted_threads:
         return
 
+    # --- Neue Anfrage in #ask-cs-admin: Uhr setzen (Saras Wunsch 20.11.2026) ---
+    # Jeder neue Top-Level-Post außerhalb des CS-Admin-Teams bekommt :status_in_progress: vom Bot.
+    # Die Bot-Uhr bedeutet „eingegangen, offen“, nicht „von CS Admin übernommen“ (siehe
+    # _clock_taken_by_human). Nach 7 Tagen ohne ✅/❌ erinnert _remind_request_authors die Person.
+    if (not thread_ts and channel == _ASK_CS_ADMIN_CHANNEL and user_id
+            and user_id not in CS_ADMIN_USER_IDS
+            and not re.search(r'<!(?:here|channel|everyone)', event.get('text') or '')):
+        _add_reaction(client, channel, ts, 'status_in_progress')
+
     # -----------------------------------------------------------------------
     # THREAD REPLY
     # -----------------------------------------------------------------------
@@ -4054,6 +4063,11 @@ def handle_reaction_added(event, say, client):
     if not ts:
         return
 
+    # --- ✅ / ✔️ / ❌ in #ask-cs-admin → Bot-Uhr entfernen (Anfrage erledigt bzw. nicht mehr relevant) ---
+    # reactions_remove entfernt nur die Reaktion des Bots; hat er keine gesetzt, passiert nichts.
+    if channel == _ASK_CS_ADMIN_CHANNEL and reaction in _REQUEST_CLOSED_REACTIONS:
+        _remove_reaction(client, channel, ts, 'status_in_progress')
+
     # --- 👀 von CS Admin → eigenes 👀 des Bots entfernen (ein Mensch hat übernommen) ---
     # reactions_remove entfernt nur die Reaktion des Bots, das 👀 des Admins bleibt stehen.
     if reaction == 'eyes' and user_id in CS_ADMIN_USER_IDS:
@@ -4182,6 +4196,37 @@ _REMINDER_TEXTS = {
 }
 
 
+_REQUEST_CLOSED_REACTIONS = {'white_check_mark', 'heavy_check_mark', 'x'}
+_AUTHOR_REMINDER_MARKER = 'eine-woche-offen-reminder'
+_AUTHOR_REMINDER_DAYS = 7
+_AUTHOR_REMINDER_LOOKBACK_DAYS = 21
+_AUTHOR_REMINDER_TEXT = (
+    ":wave: <@{user}> deine Anfrage ist seit einer Woche offen. Wenn sie erledigt ist oder du sie "
+    "anderweitig gelöst hast, setz bitte ein :white_check_mark: auf deine Nachricht. Ist sie nicht mehr "
+    "relevant, setz bitte ein :x:, dann nehmen wir sie aus unserer Liste."
+)
+_bot_user_id_cache: dict = {}
+
+
+def _bot_user_id(slack_client) -> str:
+    if 'id' not in _bot_user_id_cache:
+        try:
+            _bot_user_id_cache['id'] = slack_client.auth_test().get('user_id', '')
+        except Exception as e:
+            logger.warning(f"auth_test failed: {e}")
+            return ''
+    return _bot_user_id_cache['id']
+
+
+def _reaction_users(msg: dict, name: str) -> set:
+    return {u for r in msg.get('reactions', []) if r.get('name') == name for u in r.get('users', [])}
+
+
+def _clock_taken_by_human(msg: dict, bot_id: str) -> bool:
+    """:status_in_progress: von einem Menschen = übernommen. Die automatische Uhr des Bots zählt nicht."""
+    return bool(_reaction_users(msg, 'status_in_progress') - {bot_id})
+
+
 def _business_hours_between(start: datetime, end: datetime) -> float:
     """Stunden zwischen start und end, ohne Samstag und Sonntag (Europe/Berlin)."""
     if end <= start:
@@ -4211,6 +4256,7 @@ def _check_unanswered_questions(slack_client) -> None:
     zweite nach 2, dritte nach 3 Werktagen. Danach keine weitere Erinnerung."""
     now = datetime.now(tz=_BERLIN_TZ)
     oldest = (now - timedelta(days=_REMINDER_LOOKBACK_DAYS)).timestamp()
+    bot_id = _bot_user_id(slack_client)
 
     messages, cursor = [], None
     try:
@@ -4240,9 +4286,12 @@ def _check_unanswered_questions(slack_client) -> None:
         if re.search(r'<!(?:here|channel|everyone)', msg.get('text') or ''):
             continue
 
-        # Skip if already marked done via ✅ reaction
+        # Skip if already marked done via ✅ reaction oder von einem Menschen per Uhr übernommen.
+        # Die automatische Uhr des Bots auf neuen Anfragen zählt nicht als übernommen.
         reactions = {r.get('name') for r in msg.get('reactions', [])}
-        if reactions & {'white_check_mark', 'heavy_check_mark', 'status_in_progress'}:
+        if reactions & _REQUEST_CLOSED_REACTIONS:  # ✅ ✔️ erledigt, ❌ nicht mehr relevant
+            continue
+        if _clock_taken_by_human(msg, bot_id):
             continue
 
         # Wie viele Werktage ist die Anfrage offen? Fällig ist Erinnerung Nr. 1, 2, 3 nach
@@ -4263,6 +4312,9 @@ def _check_unanswered_questions(slack_client) -> None:
                 for reply in replies.get('messages', [])[1:]:
                     if reply.get('user') in CS_ADMIN_USER_IDS:
                         has_admin_reply = True
+                        break
+                    if reply.get('bot_id') and (reply.get('text') or '').startswith(':status_in_progress:'):
+                        has_admin_reply = True  # Flow hat übernommen (z. B. CCS-Ticket angelegt)
                         break
                     if _is_unanswered_reminder(reply):
                         reminders_sent += 1
@@ -4288,6 +4340,66 @@ def _check_unanswered_questions(slack_client) -> None:
             logger.info(f"Unanswered reminder {number} posted for {ts}")
         except Exception as e:
             logger.warning(f"Reminder post failed for {ts}: {e}")
+
+
+def _remind_request_authors(slack_client) -> None:
+    """Werktags 8 Uhr: Anfragen in #ask-cs-admin mit Bot-Uhr, die seit 7 Tagen weder ✅ noch ❌ haben,
+    bekommen einmal eine Erinnerung an die Person, die gepostet hat. Nur Posts mit der automatischen Uhr
+    (also ab Einführung am 20.11.2026), der Bestand davor wird bewusst nicht nachgezogen."""
+    now = datetime.now(tz=_BERLIN_TZ)
+    oldest = (now - timedelta(days=_AUTHOR_REMINDER_LOOKBACK_DAYS)).timestamp()
+    latest = (now - timedelta(days=_AUTHOR_REMINDER_DAYS)).timestamp()
+    bot_id = _bot_user_id(slack_client)
+    if not bot_id:
+        return
+    messages, cursor = [], None
+    try:
+        while True:
+            kwargs = {'channel': _ASK_CS_ADMIN_CHANNEL, 'oldest': str(oldest), 'latest': str(latest), 'limit': 200}
+            if cursor:
+                kwargs['cursor'] = cursor
+            history = slack_client.conversations_history(**kwargs)
+            messages.extend(history.get('messages', []))
+            cursor = (history.get('response_metadata') or {}).get('next_cursor')
+            if not history.get('has_more') or not cursor:
+                break
+    except Exception as e:
+        logger.warning(f"ask-cs-admin history fetch (author reminder) failed: {e}")
+        return
+
+    for msg in messages:
+        if msg.get('bot_id') or msg.get('subtype') or not msg.get('user'):
+            continue
+        if msg.get('user') in CS_ADMIN_USER_IDS:
+            continue
+        if bot_id not in _reaction_users(msg, 'status_in_progress'):
+            continue  # keine automatische Uhr → Bestand oder bereits erledigt
+        if {r.get('name') for r in msg.get('reactions', [])} & _REQUEST_CLOSED_REACTIONS:
+            continue
+        ts = msg['ts']
+        already = False
+        if msg.get('reply_count', 0) > 0:
+            try:
+                replies = slack_client.conversations_replies(
+                    channel=_ASK_CS_ADMIN_CHANNEL, ts=ts, limit=200, include_all_metadata=True)
+                already = any(
+                    (r.get('metadata') or {}).get('event_type') == _AUTHOR_REMINDER_MARKER.replace('-', '_')
+                    for r in replies.get('messages', [])[1:])
+            except Exception as e:
+                logger.warning(f"Thread fetch for {ts} (author reminder) failed: {e}")
+                continue
+        if already:
+            continue
+        try:
+            slack_client.chat_postMessage(
+                channel=_ASK_CS_ADMIN_CHANNEL, thread_ts=ts,
+                text=_AUTHOR_REMINDER_TEXT.format(user=msg['user']),
+                metadata={'event_type': _AUTHOR_REMINDER_MARKER.replace('-', '_'),
+                          'event_payload': {'ts': ts}},
+            )
+            logger.info(f"Author reminder posted for {ts}")
+        except Exception as e:
+            logger.warning(f"Author reminder post failed for {ts}: {e}")
 
 
 _MIRROR_DONE_RE = re.compile(
@@ -4438,6 +4550,7 @@ def _daily_reminder_loop() -> None:
             if is_weekday and is_8am and last_run_date != today:
                 last_run_date = today
                 _check_unanswered_questions(app.client)
+                _remind_request_authors(app.client)
                 _remind_open_billing(app.client)
         except Exception as e:
             logger.warning(f"Daily reminder loop error: {e}")
