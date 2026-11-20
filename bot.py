@@ -4068,12 +4068,14 @@ def handle_reaction_added(event, say, client):
     if channel == _ASK_CS_ADMIN_CHANNEL and reaction in _REQUEST_CLOSED_REACTIONS:
         _remove_reaction(client, channel, ts, 'status_in_progress')
 
-    # --- 👀 von CS Admin → eigenes 👀 des Bots entfernen (ein Mensch hat übernommen) ---
-    # reactions_remove entfernt nur die Reaktion des Bots, das 👀 des Admins bleibt stehen.
-    if reaction == 'eyes' and user_id in CS_ADMIN_USER_IDS:
-        logger.info(f"EYES_HANDOVER: {user_id} hat 👀 gesetzt auf {channel}/{ts}, Bot-👀 wird entfernt")
+    # --- Status-Emoji von CS Admin → eigenes 👀 des Bots entfernen (ein Mensch hat übernommen
+    # bzw. die Anfrage ist erledigt). Bisher nur bei 👀, Saras Wunsch 20.11.2026: auch bei ✅, ❌,
+    # Uhr und 🙌. reactions_remove entfernt nur die Reaktion des Bots, die des Admins bleibt stehen.
+    if reaction in _ADMIN_STATUS_REACTIONS and user_id in CS_ADMIN_USER_IDS:
+        logger.info(f"EYES_HANDOVER: {user_id} hat :{reaction}: gesetzt auf {channel}/{ts}, Bot-👀 wird entfernt")
         _remove_reaction(client, channel, ts, 'eyes')
-        return
+        if reaction == 'eyes':
+            return
 
     # --- Feedback-Emoji: 🆘 auf Bot-Nachrichten → Fehler melden ---
     if reaction == FEEDBACK_EMOJI:
@@ -4197,6 +4199,7 @@ _REMINDER_TEXTS = {
 
 
 _REQUEST_CLOSED_REACTIONS = {'white_check_mark', 'heavy_check_mark', 'x'}
+_ADMIN_STATUS_REACTIONS = {'eyes', 'status_in_progress', 'raised_hands'} | _REQUEST_CLOSED_REACTIONS
 _AUTHOR_REMINDER_MARKER = 'eine-woche-offen-reminder'
 _AUTHOR_REMINDER_DAYS = 7
 _AUTHOR_REMINDER_LOOKBACK_DAYS = 21
