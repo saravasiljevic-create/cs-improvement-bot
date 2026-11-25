@@ -3553,6 +3553,9 @@ def handle_sandbox_admin_take_billing(ack, body, say, client):
                                blocks=[b for b in (msg.get('blocks') or []) if b.get('type') != 'actions'])
         except Exception as e:
             logger.warning(f"billing post update failed: {e}")
+    # 👀 auf die Anfrage (Thread-Start), sobald CS Admin die Rechnung übernimmt
+    if thread_ts:
+        _set_eyes(client, channel, thread_ts)
     meta = {'event_type': _BILLING_TAKEN, 'event_payload': {'user': user_id}}
     ready_now = (scope == 'new_only' or not scope
                  or bool(_billing_thread_state(client, channel, thread_ts)['ready_ts']))
@@ -3597,6 +3600,10 @@ def handle_sandbox_billing_done(ack, body, client):
     if post_ts:
         _remove_reaction(client, channel, post_ts, 'status_in_progress')
         _add_reaction(client, channel, post_ts, 'white_check_mark')
+    # ✅ statt 👀 auf die Anfrage (Thread-Start): Rechnung gestellt = Anfrage erledigt
+    root_ts = (body.get('message') or {}).get('thread_ts') or post_ts
+    if root_ts:
+        _set_done(client, channel, root_ts)
     logger.info("BILLING_DONE " + _json.dumps({'channel': channel, 'ts': post_ts, 'user': user_id}))
 
 
