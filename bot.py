@@ -4291,10 +4291,22 @@ def _check_unanswered_questions(slack_client) -> None:
 
 
 _MIRROR_DONE_RE = re.compile(
-    r'mirror\w*\s+(?:is\s+|has\s+been\s+|was\s+)?complet|'
-    r'(?:data\s+)?sync\w*\s+(?:has\s+been\s+|is\s+)?complet|spiegelung\s+(?:ist\s+)?abgeschlossen',
+    r'\b(?:mirror\w*|(?:data\s+)?sync\w*|copy)\s+(?:is\s+|has\s+been\s+|was\s+|got\s+)?'
+    r'(?:now\s+)?(?:complet\w*|done|finished|ready)\b|'
+    r'\bspiegelung\s+(?:ist\s+|wurde\s+)?(?:jetzt\s+|nun\s+)?(?:abgeschlossen|fertig|erledigt|durchgeführt)\b',
     re.IGNORECASE,
 )
+_MIRROR_NOT_DONE_RE = re.compile(r'\b(?:not|nicht|noch\s+nicht|isn\'t|wasn\'t)\b', re.IGNORECASE)
+
+
+def _mirror_done_comment(comments: list[dict]) -> dict | None:
+    """Erster Kommentar, der den Abschluss der Spiegelung meldet (ohne Verneinung im selben Satz)."""
+    for c in comments:
+        for sentence in re.split(r'(?<=[.!?\n])\s*', c.get('body') or ''):
+            m = _MIRROR_DONE_RE.search(sentence)
+            if m and not _MIRROR_NOT_DONE_RE.search(sentence[:m.end()]):
+                return c
+    return None
 
 
 def _check_mirror_tickets(slack_client) -> None:
@@ -4305,7 +4317,7 @@ def _check_mirror_tickets(slack_client) -> None:
         prop = get_issue_property(t['key'], MIRROR_PROPERTY)
         if not prop or prop.get('done') or not prop.get('channel') or not prop.get('ts'):
             continue
-        hit = next((c for c in t['comments'] if _MIRROR_DONE_RE.search(c['body'] or '')), None)
+        hit = _mirror_done_comment(t['comments'])
         if not hit and t['status_category'] != 'done':
             continue
         channel, ts = prop['channel'], prop['ts']
